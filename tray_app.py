@@ -23,6 +23,7 @@ import agent_tasks
 import forecast as forecast_module
 from forecast import Forecast, QuotaHistory, duration_text, reset_distance
 from hover_details import HoverDetails, HoverIcon
+import quota_sources
 from quota_sources import (
     mimo_snapshot,
     mimo_tracker,
@@ -50,6 +51,7 @@ from tray_icons import (  # noqa: F401  (re-exported for callers and tests)
     icon_windows, make_display_icon, make_provider_icon, make_tps_icon, pace_marker, quota_exhausted,
     stale_note, usable_again_at)
 from tps_sources import PERFORMANCE_PATH, TpsMonitor, performance_signature, save_performance
+from usage_store import UsageStore, insights as usage_insights
 
 
 APP_NAME = "CodexQuotaTray"
@@ -239,7 +241,8 @@ class QuotaTray:
         self.wake = threading.Event()
         self.history = QuotaHistory()
         self.scheduler = RefreshScheduler(PROVIDERS, time.time())
-        self.tps_monitor = TpsMonitor()
+        self.usage = UsageStore()
+        self.tps_monitor = TpsMonitor(store=self.usage)
         self.apply_preferences(load_preferences())
         self.performance = self.tps_monitor.snapshot(time.time())
         self.agents: list[dict] = []
@@ -357,7 +360,7 @@ class QuotaTray:
         text, _ = self.headline_forecast(provider)
         return f"预测：{text}" if text else ""
 
-    CHART_VIEW_MAX = 30 * 60         # The solid line is only the last 30 minutes.
+    CHART_VIEW_MAX = 5 * 3600        # The solid line: the live window, at most its last 5 hours.
     CHART_POINTS = 160
     CHART_RECENT_SECONDS = 30 * 60  # keep completed work visible long enough to inspect its trend
     CHART_MIN_SPAN = 120.0          # only a lone fresh reading leaves the axis this narrow
@@ -481,20 +484,24 @@ class QuotaTray:
                 if key == "gemini" and snapshot.pools and len(snapshot.pools) > 1:
                     if snapshot.pools[slot].get("key") not in allowed:
                         continue  # do not infer an active model pool from old quota consumption
-                samples = max((forecast_module.current_window(self.history.samples(name), resets_at) for name in names), key=len)
+                recorded = max((self.history.samples(name) for name in names),
+                               key=lambda items: len(forecast_module.current_window(items, resets_at)))
+                samples = forecast_module.current_window(recorded, resets_at)
                 outlook = forecast_module.forecast(samples, now, remaining, resets_at)
                 rate = outlook.rate_per_hour
                 if key == "mimo":
                     view = mimo_tracker().view(now)
                     rate = view.pace_daily / view.total * 100 / 24 if view.pace_daily and view.total else rate
-                floor = max(resets_at - minutes * 60 if resets_at and minutes else 0, now - self.CHART_VIEW_MAX)
-                points = [(s.at, 100.0 - s.used) for s in samples if floor <= s.at <= now]
+                # The last hours across resets: the saved history before a reset
+                # (or a restart) stays on screen, stepping back up at the reset.
+                points, steps = forecast_module.history_curve(recorded, now - self.CHART_VIEW_MAX, now, minutes)
                 updated = snapshot.updated_at
                 if not points or (updated and points[-1][0] + 1 < updated <= now):
                     points.append((float(min(now, updated or now)), float(remaining)))
                 if len(points) > self.CHART_POINTS:
                     stride = len(points) / self.CHART_POINTS
-                    points = [points[int(i * stride)] for i in range(self.CHART_POINTS - 1)] + [points[-1]]
+                    keep = sorted(steps | {int(i * stride) for i in range(self.CHART_POINTS - 1 - len(steps))} | {len(points) - 1})
+                    points = [points[i] for i in keep]
                 name = "Gemini" if key == "gemini" else provider_registry.get(key).label
                 chart_label = name if label == name else f"{name} · {label}"
                 if quota_mode:
@@ -731,25 +738,43 @@ class QuotaTray:
             return "更新时间：未知"
         return "更新时间：" + datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M:%S")
 
-    def open_details(self, provider: str) -> None:
+    def detail_sections(self, provider: str) -> list[tuple[str, list[str]]]:
+        """The quota details as (group title, "标题：内容" lines): one tile
+        each on the settings window's detail page, and the tray's 额度详情 box."""
         snapshot = self.snapshots[provider]
-        lines = [quota_line(snapshot)] + (pool_lines(snapshot) if snapshot.pools and len(snapshot.pools) > 1 else [])
+        quota = [quota_line(snapshot)] + (pool_lines(snapshot) if snapshot.pools and len(snapshot.pools) > 1 else [])
         for label, item in self.forecasts(provider):
-            lines.append(f"预测{f'（{label}）' if label else ''}：{item.text}")
-        lines += (["", self.performance_line(provider), self.output_rate_line(provider)] if provider != "gemini" else [])
-        lines += ["", self.menu_reset(provider), self.menu_countdown(provider)]
+            quota.append(f"预测{f'（{label}）' if label else ''}：{item.text}")
+        sections = [("额度", quota)]
+        if provider != "gemini":
+            sections.append(("速度", [*self.performance_line(provider).split("\n"), self.output_rate_line(provider)]))
+        resets = [self.menu_reset(provider), self.menu_countdown(provider)]
         if snapshot.secondary_resets_at:
-            lines.append(f"{window_label(snapshot.secondary_window_minutes)}重置：{reset_text(snapshot.secondary_resets_at)}")
-        lines += ["", self.menu_updated(provider)]
+            resets.append(f"{window_label(snapshot.secondary_window_minutes)}重置：{reset_text(snapshot.secondary_resets_at)}")
+        sections.append(("重置", resets))
+        usage = getattr(self, "usage", None)
+        if usage is not None:
+            samples = self.history.samples(provider) if self.history is not None else []
+            window = window_label(snapshot.window_minutes) if snapshot.window_minutes else ""
+            sections.append(("用量", usage_insights(usage, provider, time.time(), samples, f"{window}额度" if window else "")))
+        reads = [self.menu_updated(provider)]
         if self.scheduler:
-            lines.append(self.scheduler.describe(provider, time.time()))
+            reads.append("刷新计划：" + self.scheduler.describe(provider, time.time()))
         if snapshot.error:
-            lines.extend(("", "读取状态：" + snapshot.error))
+            reads.append("读取状态：" + snapshot.error)
+        sections.append(("读取", reads))
+        return sections
+
+    def open_details(self, provider: str) -> None:
+        text = "\n\n".join("\n".join(lines) for _title, lines in self.detail_sections(provider))
         threading.Thread(
             target=ctypes.windll.user32.MessageBoxW,
-            args=(None, "\n".join(lines), f"{snapshot.label} · 额度详情", 0),
+            args=(None, text, f"{self.snapshots[provider].label} · 额度详情", 0),
             daemon=True,
         ).start()
+
+    def preference(self, name: str, default=None):
+        return load_preferences().get(name, default)
 
     def performance_line(self, provider: str) -> str:
         data = self.performance["providers"][provider]
@@ -951,10 +976,16 @@ class QuotaTray:
         """Live state for the refresh cadence: generating or a live agent of
         the source (active), and the pointer on its icon or panel (hover)."""
         moved = False
-        for provider, icon in (getattr(self, "icons", None) or {}).items():
+        icons = getattr(self, "icons", None) or {}
+        pointed = {provider for provider, icon in icons.items()
+                   if getattr(icon, "details_visible", False) or getattr(icon, "hover_open", False)}
+        if pointed:
+            # The panel charts every source in use, so those are being looked at too.
+            pointed |= set(self.active_sources(now))
+        quota_sources.WATCHED = frozenset(pointed)
+        for provider in icons:
             if provider in self.scheduler.providers:
-                pointed = bool(getattr(icon, "details_visible", False) or getattr(icon, "hover_open", False))
-                moved |= self.scheduler.hover(provider, pointed, now)
+                moved |= self.scheduler.hover(provider, provider in pointed, now)
         for provider in self.scheduler.providers:
             data = performance["providers"].get(provider)
             if data is None:
@@ -1467,6 +1498,8 @@ class QuotaTray:
     def exit_app(self, _icon=None, _item=None) -> None:
         self.stop_event.set()
         self.wake.set()
+        if getattr(self, "usage", None) is not None:
+            self.usage.save(force=True)
         if getattr(self, "settings_ui", None):
             self.settings_ui.close()
         for icon in self.icons.values():

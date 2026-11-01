@@ -220,7 +220,8 @@ class MenuState:
 
     def tps_loop(self):
         try:
-            self.monitor = TpsMonitor()
+            from usage_store import UsageStore
+            self.monitor = TpsMonitor(store=UsageStore())
         except Exception:
             log.exception("mac TPS monitor could not start")
             return

@@ -61,7 +61,10 @@ class SettingsViewTests(unittest.TestCase):
         self.assertIsNotNone(view.source_card(paid, None, 1.25))
         now = time.time()
         events = [SimpleNamespace(ended_at=now - 100, provider="gemini", output_tokens=500, count_in_rate=True)]
-        self.assertEqual((652, 150), view.activity_chart(events, now, {"gemini": "G"}).size)
+        chart = view.activity(events, now, 30, ["gemini"])
+        self.assertEqual((652, 150), view.activity_chart(chart, {"gemini": "G"}).size)
+        self.assertEqual((978, 225), view.activity_chart(chart, {"gemini": "G"}, 1.5, hover=29, grow=.4).size)
+        self.assertEqual((360, view.CARD_H), view.source_card(card, None, 1.0, width=360).size)
         agents = [{"key": "a", "provider": "gemini", "title": "补测试", "live": True, "doing": "运行测试", "tps": 50.0, "pane": "w1:p1"}]
         self.assertGreater(view.agent_rows(agents, {"gemini": "G"}).size[1], 60)
 
@@ -112,6 +115,183 @@ class SettingsViewTests(unittest.TestCase):
         self.assertFalse(any(line.endswith(("Stu", "LiveBe")) for line in lines))   # a Latin word moves whole
         self.assertEqual(settings_window.PAGE_ALIASES["mimo"], "sources")
         self.assertEqual({key for key, _ in settings_window.PAGES}, {"overview", "sources", "iq", "tasks", "general"})
+
+    def test_chart_bars_start_on_round_clock_times(self):
+        now = time.mktime((2026, 10, 31, 14, 37, 20, 0, 0, -1))
+        events = [SimpleNamespace(ended_at=now - 60, provider="codex", output_tokens=300, count_in_rate=True),
+                  SimpleNamespace(ended_at=now - 5, provider="claude", output_tokens=200, count_in_rate=True),
+                  SimpleNamespace(ended_at=now - 5, provider="codex", output_tokens=99, count_in_rate=False),
+                  SimpleNamespace(ended_at=now - 7300, provider="codex", output_tokens=1, count_in_rate=True)]
+        for minutes, step in view.CHART_RANGES.items():
+            chart = view.activity(events, now, minutes, ["codex", "claude"])
+            self.assertEqual(chart.step, step)
+            self.assertEqual(len(chart.buckets), minutes * 60 // step)
+            self.assertEqual(time.localtime(chart.start).tm_sec, 0)
+            self.assertEqual((chart.start + time.localtime(now).tm_gmtoff) % step, 0)    # bars on round times
+            self.assertTrue(chart.start + (len(chart.buckets) - 1) * chart.step <= now < chart.start + len(chart.buckets) * chart.step)
+        two_hours = view.activity(events, now, 120, ["codex", "claude"])
+        self.assertEqual(two_hours.totals, (300, 200))                  # not the uncounted copy, not the old one
+        self.assertEqual(two_hours.buckets[-1], (300, 200))             # 14:35–14:40 holds both
+        self.assertEqual(time.strftime("%H:%M", time.localtime(two_hours.bar_span(len(two_hours.buckets) - 1)[0])), "14:35")
+        ticks = [label for _stamp, label in view.time_ticks(two_hours)]
+        self.assertIn("14:20", ticks)
+        self.assertTrue(all(label.endswith(("00", "20", "40")) for label in ticks))
+        day = view.activity(events, now, 1440, ["codex"])
+        self.assertIn("11/1" if time.localtime(now).tm_mon == 11 else "10/31", [label for _s, label in view.time_ticks(day)])
+
+    def test_chart_zooms_in_on_a_fast_run_and_draws_its_slope(self):
+        import settings_window
+        now = time.mktime((2026, 10, 31, 14, 37, 20, 0, 0, -1))
+        out = lambda ago, tokens, provider="codex": SimpleNamespace(  # noqa: E731
+            ended_at=now - ago, provider=provider, output_tokens=tokens, count_in_rate=True)
+        trickle = [out(3600 + 60 * k, 200) for k in range(10)]               # slow work an hour ago
+        ramp = [out(380 - 60 * k, 600 + 600 * k) for k in range(7)]        # 14:31 on, climbing to 4200/min
+        run = view.burst(trickle + ramp, now, ["codex"])
+        self.assertEqual(time.strftime("%H:%M:%S", time.localtime(run.start)), "14:31:00")
+        self.assertEqual(run.rate, 4200 / 60)
+        self.assertIsNone(view.burst(trickle, now, ["codex"]))                # slow output never zooms
+        self.assertIsNone(view.burst(trickle + ramp, now, ["claude"]))        # another source's run
+        self.assertIsNone(view.burst([out(185, 9000)], now, ["codex"]))       # over for three minutes
+        self.assertIsNotNone(view.burst([out(140, 9000)], now, ["codex"]))    # between replies: held
+        # The shortest window under the picked range that holds the run and its lead-in.
+        self.assertEqual([view.zoom_minutes(run, chosen, now) for chosen in view.CHART_RANGES], [10, 10, 10, 10, 10])
+        long_run = view.Burst(now - 40 * 60, 50)
+        self.assertEqual([view.zoom_minutes(long_run, chosen, now) for chosen in view.CHART_RANGES], [None, None, 120, 120, 120])
+        self.assertIsNone(view.zoom_minutes(None, 1440, now))
+
+        zoomed = view.activity(trickle + ramp, now, 10, ["codex"])
+        self.assertEqual((zoomed.step, len(zoomed.buckets)), (15, 40))
+        self.assertEqual(view._span_text(*zoomed.bar_span(0), zoomed.step).count(":"), 4)    # seconds shown
+        self.assertEqual(settings_window.step_text(15), "15 秒")
+        frame = view.chart_frame(652, 172, len(zoomed.buckets))
+        points = view.trend_points(zoomed, frame, view.nice_ceiling(4200))
+        self.assertEqual(len(points), len(zoomed.buckets) - [sum(b) > 0 for b in zoomed.buckets].index(True))
+        self.assertLess(points[-1][1], points[0][1])                          # climbing: the line rises
+        self.assertEqual(view.activity_chart(zoomed, {"codex": "C"}, 1.5, trend=True, hover=20).size, (978, 225))
+
+        # The window zooms for the run until the user zooms back out of it.
+        window = SimpleNamespace(zoom_dismissed=None, chart_minutes=120)
+        chart = {"zoom": None, "burst": None}
+        span = lambda: settings_window.SettingsWindow._chart_span(window, chart, trickle + ramp, now, ["codex"])  # noqa: E731
+        self.assertEqual(span(), 10)
+        zoom_out = SimpleNamespace(charts={"overview": chart}, zoom_dismissed=None)
+        settings_window.SettingsWindow._dismiss_burst(zoom_out)
+        self.assertEqual(zoom_out.zoom_dismissed, run.start)
+        window.zoom_dismissed = zoom_out.zoom_dismissed
+        self.assertEqual((span(), chart["zoom"]), (120, None))
+        window.zoom_dismissed = run.start - 3600                               # an earlier run's dismissal
+        self.assertEqual(span(), 10)
+
+    def test_chart_hover_hit_testing_and_labels(self):
+        left, right, _top, _bottom, slot = view.chart_frame(652, 172, 30)
+        self.assertIsNone(view.chart_index(left - 1, 652, 172, 30))
+        self.assertEqual(view.chart_index(left + 0.5, 652, 172, 30), 0)
+        self.assertEqual(view.chart_index(right - 0.5, 652, 172, 30), 29)
+        self.assertEqual(view.chart_index(left + slot * 4.5, 652, 172, 30), 4)
+        self.assertEqual([view.tokens_text(v) for v in (950, 1000, 12_340, 4_900_000)], ["950", "1K", "12.3K", "4.9M"])
+        self.assertEqual([view.nice_ceiling(v) for v in (0, 7, 1300, 2600, 6100)], [1.0, 10, 2000, 5000, 10000])
+
+    def test_tiles_keep_their_width_and_wrap_like_windows_settings(self):
+        import settings_window
+        cards = [240] * 5
+        # 3, 4, then all 5 a row as the page widens; the cards never stretch.
+        self.assertEqual([len(row) for row in settings_window.flow_rows(780, cards, 14)], [3, 2])
+        self.assertEqual([len(row) for row in settings_window.flow_rows(1030, cards, 14)], [4, 1])
+        self.assertEqual(settings_window.flow_rows(1256, cards, 14), [[0, 1, 2, 3, 4]])
+        self.assertEqual(settings_window.flow_rows(100, cards[:2], 14), [[0], [1]])     # a row always takes one
+        asked = []
+
+        def heights(rows):
+            asked.append(rows)
+            return [100, 160, 100, 120, 100]
+        rows, spots, total, widest = settings_window.flow_spots(780, cards, heights, 14)
+        self.assertEqual(asked, [rows])
+        self.assertEqual([spot[:2] for spot in spots], [(0, 0), (254, 0), (508, 0), (0, 174), (254, 174)])
+        self.assertTrue(all(spot[2] == 240 for spot in spots))
+        self.assertEqual(total, 160 + 14 + 120)                          # each row as tall as its tallest tile
+        self.assertEqual(widest, 3 * 240 + 2 * 14)                       # the chart below ends with the cards
+        _rows, spots, _total, _widest = settings_window.flow_spots(500, [280, 440], lambda rows: [10, 20], 14)
+        self.assertEqual(spots[1], (0, 24, 440))                         # too narrow: the facts go under the card
+        _rows, spots, _total, _widest = settings_window.flow_spots(300, [440], lambda rows: [10], 14)
+        self.assertEqual(spots[0][2], 300)                               # only narrowed when the page is narrower
+        groups = settings_window.detail_groups([("额度", ["剩余 60%", "  Argon：剩余 40%"]), ("读取", ["", "下次刷新约 3 分钟后"]),
+                                                ("空", [""])])
+        self.assertEqual(groups, [("额度", [("", "剩余 60%", False), ("Argon", "剩余 40%", False)]),
+                                  ("读取", [("", "下次刷新约 3 分钟后", False)])])          # empty groups get no tile
+        import settings_view as view
+        rows = [("重置时间", "10-31 18:20", False), ("距离重置", "3 小时 12 分", False)]
+        tall = view.fact_height(rows, 1.0, view.CARD_W, "重置")
+        self.assertEqual(view.fact_tile("重置", rows, 1.0, view.CARD_W, 200).size, (view.CARD_W, 200))    # matches its row
+        self.assertEqual(view.fact_tile("重置", rows, 1.0, view.CARD_W).size[1], round(tall))
+        self.assertEqual(view.source_card(view.SourceCard("codex", "C", "Codex", "空闲", "idle", (), None, 0, 0, "", "ok"),
+                                          None, 1.0, slots=1, height=220).size, (view.CARD_W, 220))
+        self.assertEqual(settings_window.step_text(300), "5 分钟")
+        self.assertEqual(settings_window.step_text(1800), "30 分钟")
+
+    def test_tweens_retarget_from_where_they_are(self):
+        import ui_motion
+        jobs = []
+        root = SimpleNamespace(after=lambda ms, fn: jobs.append(fn) or len(jobs))
+        motion = ui_motion.Motion(root, enabled=True)
+        seen = []
+        with patch.object(ui_motion.time, "perf_counter", side_effect=[0.0, 0.05, 0.05, 0.10, 0.5, 0.5]):
+            motion.to("x", 0.0, 100.0, .2, seen.append)
+            jobs.pop(0)()                       # t = 0.05: a quarter of the way in time
+            moved = seen[-1]
+            self.assertTrue(0 < moved < 100)
+            motion.to("x", 0.0, 0.0, .2, seen.append)   # turn around: starts from where it is, not from 0
+            jobs.pop(0)()                       # t = 0.5: finished
+        self.assertEqual(seen[-1], 0.0)
+        self.assertFalse(motion.busy("x"))
+        instant = ui_motion.Motion(root, enabled=False)
+        instant.to("y", 0, 5, 1.0, seen.append)
+        self.assertEqual(seen[-1], 5)
+        self.assertEqual(ui_motion.blend("#000000", "#ffffff", .5), "#808080")
+        widths = ui_motion.CharWidths(SimpleNamespace(measure=lambda char: 2 if ord(char) > 127 else 1))
+        self.assertEqual(widths("ab额度"), 6)
+
+    def test_throttle_runs_first_call_and_the_last(self):
+        import ui_motion
+        jobs, calls = [], []
+        root = SimpleNamespace(after=lambda ms, fn: jobs.append(fn) or len(jobs))
+        throttle = ui_motion.Throttle(root, 50, lambda: calls.append(len(calls)))
+        throttle(); throttle(); throttle()
+        self.assertEqual(len(calls), 1)
+        jobs.pop(0)()                           # the gap passes: the held-back call runs once
+        self.assertEqual(len(calls), 2)
+        jobs.pop(0)()
+        self.assertEqual(len(calls), 2)
+
+    def test_detail_sections_feed_the_window_and_the_tray_box(self):
+        import tray_app
+        from unittest.mock import Mock
+        snap = snapshot(provider="codex", label="Codex", secondary_window_minutes=10080, secondary_remaining_percent=30,
+                        secondary_resets_at=int(time.time() + 86400), error="读取超时")
+        tray = SimpleNamespace(snapshots={"codex": snap}, forecasts=lambda p: [],
+                               performance_line=lambda p: "最近生成 TPS：80.0 tok/s（14:00:00）\n来源：会话",
+                               output_rate_line=lambda p: "最近60秒输出速率：1.0 tok/s（60 输出tokens）",
+                               menu_reset=lambda p: "重置时间：18:00", menu_countdown=lambda p: "距离重置：3 小时",
+                               menu_updated=lambda p: "更新时间：未知",
+                               scheduler=SimpleNamespace(describe=lambda p, now: "下次刷新约 3 分钟后（空闲）"))
+        sections = tray_app.QuotaTray.detail_sections(tray, "codex")
+        self.assertEqual([title for title, _lines in sections], ["额度", "速度", "重置", "读取"])
+        self.assertIn("来源：会话", sections[1][1])
+        self.assertIn("刷新计划：下次刷新约 3 分钟后（空闲）", sections[3][1])
+        self.assertEqual(sections[3][1][-1], "读取状态：读取超时")
+        import settings_window
+        groups = settings_window.detail_groups(sections)
+        self.assertEqual(groups[3][1][-1], ("读取状态", "读取超时", True))         # a read error reads as a warning
+        self.assertEqual(groups[0][1][0][0], "")                                 # the quota line has no title of its own
+        tray.detail_sections = lambda p: tray_app.QuotaTray.detail_sections(tray, p)
+        with patch.object(tray_app.threading, "Thread") as thread, patch.object(tray_app, "ctypes", Mock()):
+            tray_app.QuotaTray.open_details(tray, "codex")
+        self.assertIn("\n\n重置时间：18:00", thread.call_args.kwargs["args"][1])
+        # With the saved output records, a usage tile sits before 读取.
+        from usage_store import UsageStore
+        tray.usage, tray.history = UsageStore(Path(tempfile.mkdtemp()) / "usage.json.gz"), None
+        sections = tray_app.QuotaTray.detail_sections(tray, "codex")
+        self.assertEqual([title for title, _lines in sections], ["额度", "速度", "重置", "用量", "读取"])
+        self.assertIn("暂无输出", sections[3][1][0])
 
     def test_preferences_round_trip_and_apply(self):
         import tray_app

@@ -293,6 +293,12 @@ def get_gemini_quota() -> QuotaSnapshot:
 CLAUDE_NATIVE_FRESH_SECONDS = 600
 # At most one hidden /usage session this often; reads in between reuse it.
 CLAUDE_PROBE_GAP_SECONDS = 120
+# While someone looks at Claude (hover), a status-line reading older than this
+# no longer counts as current: Desktop and web use never reach the status line.
+CLAUDE_HOVER_FRESH_SECONDS = 45
+CLAUDE_HOVER_PROBE_GAP_SECONDS = 30
+# Sources whose icon or panel is being looked at (set by the tray).
+WATCHED: frozenset[str] = frozenset()
 _CLAUDE_PROBE: dict[str, Any] = {}
 _CLAUDE_PROBE_LOCK = threading.Lock()
 
@@ -322,23 +328,27 @@ def _claude_probe() -> QuotaSnapshot:
         return _unknown("claude", "Claude", 300, f"读取 /usage 失败：{type(exc).__name__}: {exc}")
 
 
-def _claude_probe_cached() -> QuotaSnapshot:
+def _claude_probe_cached(gap: float = CLAUDE_PROBE_GAP_SECONDS) -> QuotaSnapshot:
     with _CLAUDE_PROBE_LOCK:
         cached = _CLAUDE_PROBE.get("snapshot")
-        if cached is None or time.time() - _CLAUDE_PROBE["at"] >= CLAUDE_PROBE_GAP_SECONDS:
+        if cached is None or time.time() - _CLAUDE_PROBE["at"] >= gap:
             cached = _claude_probe()
             _CLAUDE_PROBE.update(snapshot=cached, at=time.time())
         return cached
 
 
 def get_claude_quota() -> QuotaSnapshot:
-    """The status line while a CLI session keeps it live, else `/usage`."""
+    """The status line while a CLI session keeps it live, else `/usage`.
+    While the icon or panel is hovered, a status line older than
+    CLAUDE_HOVER_FRESH_SECONDS is checked against `/usage` too."""
     import claude_status
     report = claude_status.latest()
     native = _claude_native(report) if report else None
-    if native is not None and not native.stale:
+    watched = "claude" in WATCHED
+    if native is not None and not native.stale and not (
+            watched and time.time() - (native.updated_at or 0) > CLAUDE_HOVER_FRESH_SECONDS):
         return native
-    probed = _claude_probe_cached()
+    probed = _claude_probe_cached(CLAUDE_HOVER_PROBE_GAP_SECONDS if watched else CLAUDE_PROBE_GAP_SECONDS)
     if probed.error is None:
         if native is None or (probed.updated_at or 0) >= (native.updated_at or 0):
             return probed

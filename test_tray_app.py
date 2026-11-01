@@ -502,6 +502,7 @@ class RefreshCadenceTests(unittest.TestCase):
                       "grok": SimpleNamespace(details_visible=False, hover_open=False)}
         tray.performance = {"providers": {"codex": {}, "grok": {}}}
         tray.agents = [{"provider": "grok", "live": True}]
+        tray.snapshots = {"codex": object(), "grok": object()}
         tray.last_samples = {}
         tray.wake = threading.Event()
         return tray
@@ -512,7 +513,8 @@ class RefreshCadenceTests(unittest.TestCase):
         self.assertTrue(tray.scheduler.hovered["codex"])
         self.assertEqual((tray.scheduler.due["codex"], tray.scheduler.reason["codex"]), (100, "悬停"))
         self.assertTrue(tray.scheduler.active["grok"])            # a live grok agent, not only generation
-        self.assertFalse(tray.scheduler.hovered["grok"])
+        self.assertTrue(tray.scheduler.hovered["grok"])           # in use, so its curve is in the open panel
+        self.assertEqual(tray_app.quota_sources.WATCHED, {"codex", "grok"})
         self.assertTrue(tray.wake.is_set())
         tray.icons["codex"].hover_open, tray.icons["grok"].details_visible = False, True   # panel open on Grok
         tray.feed_scheduler(tray.performance, 200)
@@ -581,7 +583,7 @@ class AgentPanelTests(unittest.TestCase):
         self.tray.history = None
         self.assertIsNone(self.tray.burn_chart("codex", now))
 
-    def test_chart_focuses_on_recent_history_without_zooming_out_to_far_forecasts(self):
+    def test_chart_shows_the_live_window_from_its_start_without_zooming_out_to_far_forecasts(self):
         from pathlib import Path
         from forecast import QuotaHistory
         now = time.time()
@@ -592,12 +594,50 @@ class AgentPanelTests(unittest.TestCase):
         self.tray.history = history
         self.tray.snapshots['codex'] = QuotaSnapshot('codex','Codex',300,12,88,reset,now,False,None)
         chart = self.tray.burn_chart('codex',now)
-        times = [t for t, _ in chart.series[0].points]
-        self.assertAlmostEqual(min(times), now - 1200, delta=0.1)          # 20 minutes stays
-        self.assertGreaterEqual(min(times), now - 30 * 60 - 0.1)           # 40 minutes and older are dropped
-        self.assertGreaterEqual(chart.start, now - 30 * 60 - 0.1)
-        self.assertLessEqual(chart.end, now + 0.6 * 30 * 60 + 1)           # projection stays scaled to that span
-        self.assertEqual(chart.series[0].points[-1][1],88)
+        points = chart.series[0].points
+        begun = reset - 5 * 3600                                            # this 5-hour window began 2 h ago
+        self.assertEqual(points[0], (round(begun, 1), 100.0))               # unused at its start: the curve begins there
+        self.assertEqual([round(now - t) for t, _ in points[1:]], [2400, 1200, 0])   # every reading in the window stays
+        self.assertGreaterEqual(chart.start, begun - 0.1)                   # yesterday's reading is another window
+        self.assertLessEqual(chart.end, now + 0.6 * (now - begun) + 1)      # projection stays scaled to that span
+        self.assertEqual(points[-1][1], 88)
+
+    def test_chart_keeps_the_curve_from_before_a_reset_and_a_restart(self):
+        from pathlib import Path
+        from forecast import QuotaHistory
+        now = time.time()
+        old_reset, new_reset = int(now - 3600), int(now + 4 * 3600 + 1200)   # reset an hour ago; used again 40 min ago
+        path = Path(self.folder.name) / 'across-reset.json'
+        history = QuotaHistory(path)
+        for ago, used in ((4 * 3600, 20), (3 * 3600, 45), (7200, 70)):
+            history.add('claude', now - ago, used, old_reset)
+        for ago, used in ((1800, 5), (0, 12)):
+            history.add('claude', now - ago, used, new_reset)
+        history.save()
+        self.tray.history = QuotaHistory(path)                                  # as after a restart
+        self.tray.snapshots['claude'] = QuotaSnapshot('claude', 'Claude Code', 300, 12, 88, new_reset, now, False, None)
+        self.tray.performance['providers']['claude'] = {'active_sessions': 1}
+        chart = self.tray.burn_chart('claude', now)
+        points = next(s for s in chart.series if s.label.startswith('Claude')).points
+        self.assertEqual([(round((now - t) / 60), r) for t, r in points],      # (minutes ago, % left)
+                         [(240, 80), (180, 55), (120, 30),                       # the earlier window, as recorded
+                          (60, 30), (60, 100),                                   # its reset steps back up to 100 %
+                          (40, 100),                                             # the new window began unused
+                          (30, 95), (0, 88)])
+        self.assertLessEqual(chart.start, now - 4 * 3600 + 1)
+
+    def test_quota_history_folds_repeated_readings_so_the_curve_is_kept(self):
+        from pathlib import Path
+        from forecast import KEEP_SAMPLES, QuotaHistory
+        history = QuotaHistory(Path(self.folder.name) / 'folded.json')
+        start = 1_000_000.0
+        for index in range(5000):                       # a reading every 5 s for ~7 h, mostly unchanged
+            history.add('claude', start + index * 5, 10 + index // 500, 9_999_999)
+        samples = history.samples('claude')
+        self.assertLess(len(samples), 40)                                  # two per level, not 5000
+        self.assertLess(len(samples), KEEP_SAMPLES)
+        self.assertEqual((samples[0].at, samples[-1].at), (start, start + 4999 * 5))   # the whole span is kept
+        self.assertEqual([s.used for s in samples[:3]], [10, 10, 11])      # each level's first and latest reading
 
     def test_stale_source_names_when_and_why_in_the_panel(self):
         now = time.time()

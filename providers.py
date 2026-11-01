@@ -148,19 +148,19 @@ class ProviderSpec:
 SPECS: tuple[ProviderSpec, ...] = (
     ProviderSpec(
         "codex", "C", "Codex", None, (126, 201, 166, 255), 2 * 60, 30, 5,
-        ("aumid", lambda: "OpenAI.Codex_2p2nqsd0c76g0!App"), hover_seconds=10,
+        ("aumid", lambda: "OpenAI.Codex_2p2nqsd0c76g0!App"), hover_seconds=5,
         source_note="Codex App Server account/rateLimits/read（5 小时 + 每周）",
     ),
     ProviderSpec(
         # Each read opens a whole Grok CLI session (up to ~35 s): widest intervals.
         "grok", "X", "Grok", 10080, (203, 208, 216, 255), 10 * 60, 2 * 60, 20,
-        ("cli", lambda: Path.home() / ".grok/bin/grok.exe"), hover_seconds=45,
+        ("cli", lambda: Path.home() / ".grok/bin/grok.exe"), hover_seconds=30,
         source_note="Grok CLI /usage（每周）",
         exhausted_seconds=3 * 3600,
     ),
     ProviderSpec(
         "gemini", "G", "Gemini（5 小时）", 300, (164, 176, 245, 255), 2 * 60, 45, 8,
-        ("gui", lambda: _local_appdata() / "Programs/antigravity/Antigravity.exe"), hover_seconds=15,
+        ("gui", lambda: _local_appdata() / "Programs/antigravity/Antigravity.exe"), hover_seconds=10,
         source_note="agy --print /usage（Argon > Claude/GPT > Gemini 额度池）",
     ),
     ProviderSpec(
@@ -178,7 +178,7 @@ SPECS: tuple[ProviderSpec, ...] = (
         # annual plans).  The console read is a cheap HTTPS call; local token
         # records move the figure in between (see mimo_usage.py).
         "mimo", "M", "Xiaomi MiMo", None, (255, 112, 30, 255), 5 * 60, 60, 30,
-        ("url", lambda: "https://platform.xiaomimimo.com/console/plan-manage"), hover_seconds=15,
+        ("url", lambda: "https://platform.xiaomimimo.com/console/plan-manage"), hover_seconds=10,
         default=False, detect=_mimo_used,
         source_note="MiMo 控制台套餐用量（登录后只读）+ 本机 Codex / Claude Code / MiMo Code 记录折算用量",
     ),
