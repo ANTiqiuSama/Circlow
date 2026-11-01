@@ -1042,8 +1042,8 @@ def _clock(moment: float, now: float) -> str:
 BURN_SPANS = (10, 30, 60, 120, 300)      # minutes of history the chart may show
 BURN_CHANGE = 3.0         # % of a quota a span must see used to be worth showing
 BURN_HOLD = .6            # the span on screen stays while it still sees this share of that
-BURN_FUTURE = .18         # a narrow forecast strip keeps most width for measured use
-BURN_MIN_FUTURE = 2 * 60   # but show at least a couple of minutes of dashed trend
+BURN_FUTURE = .10         # the forecast strip takes about a tenth of the chart
+BURN_MIN_FUTURE = 60      # retain one minute of visible dashed trend in close-up
 BURN_TICKS_EVERY = {10: 2, 30: 5, 60: 15, 120: 30, 300: 60}   # span -> minutes between clock labels
 # A close-up eases out to this span once the pointer has rested a moment.
 BURN_DWELL_SPAN, BURN_DWELL_DELAY, BURN_DWELL_EASE = 30, 2.5, 1.2    # minutes, seconds, seconds

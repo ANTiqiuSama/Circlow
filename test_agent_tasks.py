@@ -609,7 +609,7 @@ class SteadyBubbleTests(unittest.TestCase):
         _, projection, exhausts = agent_panel.burn_points(distant, closeup)
         self.assertEqual(projection[-1][0], 1200)   # line stays within the view
         self.assertGreater(exhausts, closeup.end)   # text can still name the later estimate
-        self.assertEqual(agent_panel.burn_future(600), 120)  # 10 min history, 2 min dashed future
+        self.assertEqual(agent_panel.burn_future(600), 60)  # 10 min history, 1 min dashed future
         for chart in (chart, Chart(0, 5 * 3600, 3600, (fast, slow)), None, Chart(0, 10, 5, (Series("x", 0, ((5, 50),)),))):
             for scale in (1.0, 1.5):
                 colors = tuple(agent_panel.accent("G") for _ in (chart.series if chart else ()))
