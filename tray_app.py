@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import itertools
 import json
 import logging
@@ -363,7 +364,6 @@ class QuotaTray:
     CHART_VIEW_MAX = 5 * 3600        # The solid line: the live window, at most its last 5 hours.
     CHART_POINTS = 160
     CHART_RECENT_SECONDS = 30 * 60  # keep completed work visible long enough to inspect its trend
-    CHART_MIN_SPAN = 120.0          # only a lone fresh reading leaves the axis this narrow
 
     def quota_windows(self, provider: str) -> list[tuple]:
         """(label, remaining, resets_at, window minutes, history names) in the
@@ -494,14 +494,10 @@ class QuotaTray:
                     rate = view.pace_daily / view.total * 100 / 24 if view.pace_daily and view.total else rate
                 # The last hours across resets: the saved history before a reset
                 # (or a restart) stays on screen, stepping back up at the reset.
-                points, steps = forecast_module.history_curve(recorded, now - self.CHART_VIEW_MAX, now, minutes)
+                points, _steps = forecast_module.history_curve(recorded, now - self.CHART_VIEW_MAX, now, minutes)
                 updated = snapshot.updated_at
                 if not points or (updated and points[-1][0] + 1 < updated <= now):
                     points.append((float(min(now, updated or now)), float(remaining)))
-                if len(points) > self.CHART_POINTS:
-                    stride = len(points) / self.CHART_POINTS
-                    keep = sorted(steps | {int(i * stride) for i in range(self.CHART_POINTS - 1 - len(steps))} | {len(points) - 1})
-                    points = [points[i] for i in keep]
                 name = "Gemini" if key == "gemini" else provider_registry.get(key).label
                 chart_label = name if label == name else f"{name} · {label}"
                 if quota_mode:
@@ -513,17 +509,35 @@ class QuotaTray:
                 candidates.append((series, outlook))
         if not candidates:
             return None
-        series = tuple(item[0] for item in candidates)
-        # Start at the first measured reading: no blank stretch for time before
-        # anything was recorded. A far-away exhaustion remains in the forecast
-        # text instead of expanding this axis.
-        back = max(self.CHART_MIN_SPAN, now - min(s.points[0][0] for s in series))
-        start, end = now - back, now + 0.6 * back
-        near = [s.reset_at for s in series if s.reset_at and (s.reset_at <= end or s.reset_at - now <= 1.2 * back)]
-        if near:
-            end = max(now + 0.2 * back, max(near))          # a reset is near: show it
-        # Quantised "now": the cached chart is redrawn every 30 s, not every frame.
-        return agent_panel.BurnChart(float(start), float(end), float(round(now / 30) * 30), series)
+        # How far back: a close-up while quota drops fast, longer for slow use
+        # (agent_panel.burn_span). The forecast gets a fixed share to the right
+        # of now; a far exhaustion or reset stays in the text, not on the axis.
+        minutes = agent_panel.burn_span([series.points for series, _ in candidates], now, getattr(self, "burn_minutes", None))
+        self.burn_minutes = minutes
+        back = minutes * 60
+        # Quantised "now": the cached chart is redrawn every few seconds, not
+        # every frame: every 5 s in a 5-minute view, at most every 30 s.
+        step = max(5.0, min(30.0, back / 60))
+        shown = float(round(now / step) * step)
+        start, end = shown - back, shown + agent_panel.BURN_FUTURE * back
+        # Readings for at least the 30 minutes a close-up widens to while hovered.
+        keep = shown - max(back, agent_panel.BURN_DWELL_SPAN * 60)
+        series = tuple(self._fit_points(item[0], keep) for item in candidates)
+        return agent_panel.BurnChart(float(start), float(end), shown, series)
+
+    def _fit_points(self, series: "agent_panel.BurnSeries", start: float) -> "agent_panel.BurnSeries":
+        """Readings from just before the view on, thinned to CHART_POINTS
+        evenly over the view; reset steps and the latest reading stay."""
+        points = list(series.points)
+        before = [index for index, (t, _r) in enumerate(points) if t < start]
+        points = points[before[-1]:] if before else points
+        if len(points) > self.CHART_POINTS:
+            steps = {i for i in range(1, len(points)) if points[i][1] > points[i - 1][1] + 1}
+            steps |= {i - 1 for i in steps}
+            stride = len(points) / self.CHART_POINTS
+            keep = sorted(steps | {int(i * stride) for i in range(self.CHART_POINTS - 1 - len(steps))} | {len(points) - 1})
+            points = [points[i] for i in keep]
+        return dataclasses.replace(series, points=tuple(points))
 
     def hover_text(self, provider: str) -> str:
         snapshot = self.snapshots[provider]
@@ -982,6 +996,8 @@ class QuotaTray:
         if pointed:
             # The panel charts every source in use, so those are being looked at too.
             pointed |= set(self.active_sources(now))
+        for provider in pointed - quota_sources.WATCHED:
+            quota_sources.HOVER_STARTED[provider] = now          # a new look: its first read is a real check
         quota_sources.WATCHED = frozenset(pointed)
         for provider in icons:
             if provider in self.scheduler.providers:

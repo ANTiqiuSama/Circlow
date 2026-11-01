@@ -12,6 +12,7 @@ anywhere; hover_details feeds it the pointer and presents its frames.
 from __future__ import annotations
 
 import math
+import time
 import random
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -78,6 +79,7 @@ class BurnChart:
     end: float
     now: float
     series: tuple[BurnSeries, ...]
+    axis: "BurnScale | None" = None          # set while a zoom eases between two views' scales
 
 
 # Reset notices: a quiet steel blue that sits with the panel's muted palette
@@ -135,9 +137,10 @@ class PanelModel:
 
 METER_TOP = PAD + 32        # Top of the quota / TPS row.
 FOOTER = 40                 # Two forecast lines plus a separate settings button.
-CHART = 80                  # Burn chart under the task field.
+CHART_AXIS = 11             # Clock row under the plot.
+CHART = 80 + CHART_AXIS     # Burn chart under the task field.
 CHART_TOP = 16              # Field bottom to chart sprite; the two plates keep an 8 px gap.
-CHART_H = 64                # Chart sprite: label row and plot.
+CHART_H = 64 + CHART_AXIS   # Chart sprite: label row, plot and clock row.
 CHART_LABEL = 15            # Label row inside the sprite.
 GEAR_RADIUS = 7.5
 GEAR_HIT = 17.0
@@ -618,7 +621,7 @@ class Scene:
     def animating(self) -> bool:
         """Something is moving: draw every frame until it rests."""
         return bool(self.dragging or self.ghosts or self.ripples or not self.field.settled or not self.rate.settled
-                    or not self.gear.settled or not self.today_usage.settled or self.chart_progress < 1
+                    or not self.gear.settled or not self.today_usage.settled or self.chart_progress < 1 or self.chart_zooming
                     or any(not spring.settled for spring in self.meters)
                     or any(not spring.settled for body in self.bodies.values() for spring in body.springs))
 
@@ -759,9 +762,19 @@ class Scene:
     def chart_progress(self) -> float:
         return ease_out_cubic((self.time_since(self.opened) - self.CHART_DELAY) / self.CHART_REVEAL)
 
+    @property
+    def chart_zooming(self) -> bool:
+        """The close-up is easing out to BURN_DWELL_SPAN right now."""
+        chart = self.model.burn if self.model is not None else None
+        if chart is None or (chart.now - chart.start) / 60 >= BURN_DWELL_SPAN - 1e-6:
+            return False
+        rested = self.time_since(self.opened)
+        return BURN_DWELL_DELAY <= rested <= BURN_DWELL_DELAY + BURN_DWELL_EASE + .05
+
     def _chart(self, frame, model, field_h, scale, at):
-        """Burn chart below the task field; the plot draws itself left to right on opening."""
-        chart = model.burn
+        """Burn chart below the task field; the plot draws itself left to right
+        on opening, and a close-up widens to 30 minutes once the pointer rests."""
+        chart = burn_dwell(model.burn, self.time_since(self.opened))
         colors = tuple(quota_shade(s.letter or model.letter, s.slot, s.points[-1][1] if s.points else None,
                                   s.pooled if s.letter else pooled(model))
                        for s in chart.series) if chart else ()
@@ -1026,15 +1039,118 @@ def _clock(moment: float, now: float) -> str:
     return stamp.strftime("%H:%M" if same_day else "%m-%d %H:%M")
 
 
+BURN_SPANS = (10, 30, 60, 120, 300)      # minutes of history the chart may show
+BURN_CHANGE = 3.0         # % of a quota a span must see used to be worth showing
+BURN_HOLD = .6            # the span on screen stays while it still sees this share of that
+BURN_FUTURE = .25         # room right of "now" for the forecast, as a share of the span
+BURN_TICKS_EVERY = {10: 2, 30: 5, 60: 15, 120: 30, 300: 60}   # span -> minutes between clock labels
+# A close-up eases out to this span once the pointer has rested a moment.
+BURN_DWELL_SPAN, BURN_DWELL_DELAY, BURN_DWELL_EASE = 30, 2.5, 1.2    # minutes, seconds, seconds
+
+
+def smootherstep(t: float) -> float:
+    """0..1 with zero speed and zero acceleration at both ends (Perlin's
+    quintic), so a motion neither jolts into start nor snaps to rest."""
+    t = min(1.0, max(0.0, t))
+    return t * t * t * (t * (6 * t - 15) + 10)
+
+
+def burn_view(chart: BurnChart, minutes: float) -> BurnChart:
+    """The same chart showing `minutes` of history before now, and a quarter
+    of that for the forecast."""
+    back = minutes * 60
+    return replace(chart, start=chart.now - back, end=chart.now + BURN_FUTURE * back)
+
+
+@lru_cache(maxsize=8)
+def burn_axis(chart: BurnChart) -> "BurnScale":
+    """The %-axis the chart would pick for itself (see burn_sprite)."""
+    return burn_scale([value for _, value in burn_points(series, chart)[0]] for series in chart.series)
+
+
+def burn_dwell(chart: BurnChart | None, rested: float) -> BurnChart | None:
+    """The view after the pointer rested `rested` seconds: a span under
+    BURN_DWELL_SPAN widens to it over BURN_DWELL_EASE. The span grows by a
+    constant ratio per step of the smootherstep curve, so the zoom looks
+    even rather than rushing at first; the %-axis eases between the two
+    views' own scales on the same curve, so it never jumps mid-zoom."""
+    if chart is None:
+        return None
+    base = (chart.now - chart.start) / 60
+    p = smootherstep((rested - BURN_DWELL_DELAY) / BURN_DWELL_EASE)
+    if base >= BURN_DWELL_SPAN - 1e-6 or p <= 0:
+        return chart
+    view = burn_view(chart, base * (BURN_DWELL_SPAN / base) ** p)
+    if p >= 1:
+        return view
+    a, b = burn_axis(chart), burn_axis(burn_view(chart, BURN_DWELL_SPAN))
+    axis = BurnScale(a.top + (b.top - a.top) * p, a.width * (b.width / a.width) ** p)
+    return replace(view, axis=axis)
+
+
+def burn_time_ticks(chart: BurnChart) -> list[float]:
+    """Round clock times inside the view, up to "now" (which has its own label)."""
+    minutes = (chart.now - chart.start) / 60
+    # Mid-zoom spans use the steps of the next span up, so labels do not reshuffle every frame.
+    every = BURN_TICKS_EVERY[next((span for span in BURN_SPANS if span >= minutes - 1e-6), BURN_SPANS[-1])] * 60
+    offset = time.localtime(chart.now).tm_gmtoff or 0
+    stamp = math.ceil((chart.start + offset) / every) * every - offset
+    ticks = []
+    while stamp < chart.now - max(every * .3, 60):       # never the minute "now" already names
+        ticks.append(float(stamp))
+        stamp += every
+    return ticks
+
+
+def burn_used(points, start: float, end: float) -> float:
+    """Percentage points used between start and end: the drops only (a reset
+    stepping back up to 100% is not use), each prorated by how much of the
+    time between its two readings falls inside the span."""
+    used = 0.0
+    for (t0, r0), (t1, r1) in zip(points, points[1:]):
+        if r1 >= r0 or t1 < start or t0 > end:
+            continue
+        if t1 <= t0:
+            used += r0 - r1 if start <= t1 <= end else 0.0
+        else:
+            used += (r0 - r1) * max(0.0, min(end, t1) - max(start, t0)) / (t1 - t0)
+    return used
+
+
+def burn_span(curves, now: float, previous: int | None = None) -> int:
+    """Minutes of history to show: the shortest span in which some quota
+    dropped by BURN_CHANGE, so heavy use gets a close-up of its slope (5 or 10
+    minutes) and slow use a longer view; with no clear use, everything
+    recorded, up to 5 hours. The span on screen is kept while it still shows
+    most of that change, so the axis does not flick between neighbours."""
+    def shows(minutes, need):
+        return any(burn_used(points, now - minutes * 60, now) >= need for points in curves)
+    best = next((minutes for minutes in BURN_SPANS if shows(minutes, BURN_CHANGE)), None)
+    if best is None:
+        first = min((points[0][0] for points in curves if points), default=now)
+        best = next((minutes for minutes in BURN_SPANS if minutes * 60 >= now - first), BURN_SPANS[-1])
+    if (previous in BURN_SPANS and previous != best and abs(BURN_SPANS.index(previous) - BURN_SPANS.index(best)) == 1
+            and shows(previous, BURN_CHANGE * BURN_HOLD)):
+        return previous
+    return best
+
+
 def burn_points(series: BurnSeries, chart: BurnChart) -> tuple[list[tuple[float, float]], list[tuple[float, float]], float | None]:
     """(history, projection, exhausts_at) of one series in data space. The
-    projection runs from the last reading at `rate` until the quota reaches
-    zero, the window resets, or the view ends."""
+    history enters at the left edge at the level it had then; the projection
+    runs from the last reading at `rate` until the quota reaches zero, the
+    window resets, or the view ends."""
     history = [(t, max(0.0, min(100.0, r))) for t, r in series.points if chart.start <= t <= chart.end]
+    earlier = [(t, max(0.0, min(100.0, r))) for t, r in series.points if t < chart.start]
+    if earlier and (not history or history[0][0] > chart.start):
+        t0, r0 = earlier[-1]
+        if history:
+            t1, r1 = history[0]
+            r0 = r0 + (r1 - r0) * (chart.start - t0) / max(1e-9, t1 - t0)
+        history.insert(0, (chart.start, r0))
     if not history or not series.rate or series.rate <= 0:
         return history, [], None
-    t0, r0 = history[-1]
-    t0 = max(t0, min(chart.now, chart.end))
+    t0, r0 = history[-1]            # from the last reading, so no gap opens before "now"
     exhausts = t0 + r0 / series.rate * 3600
     limit = min(chart.end, series.reset_at or chart.end)
     stop = min(limit, exhausts)
@@ -1246,7 +1362,7 @@ def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.I
         last_x = x + draw.textlength(text, font=small) + px(12)
     resets = sorted(s.reset_at for s in chart.series if s.reset_at)
     drawn = [(series, color, *burn_points(series, chart)) for series, color in zip(chart.series, colors)]
-    axis = burn_scale([value for _, value in history] for _, _, history, _, _ in drawn)
+    axis = chart.axis or burn_scale([value for _, value in history] for _, _, history, _, _ in drawn)
     ticks = burn_ticks(axis, (value for _, _, history, _, _ in drawn for _, value in history))
     exhausting = [(exhausts, series, color) for series, color, _, _, exhausts in drawn if exhausts is not None]
     first = min(exhausting, key=lambda item: item[0]) if exhausting else None
@@ -1265,7 +1381,7 @@ def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.I
             draw.text((tag_right, row), tag, font=small, fill=MUTED_TEXT, anchor="rm")
 
     k = SUPERSAMPLE
-    left, top, right, bottom = 34, CHART_LABEL + extra + 4, CHART_WIDTH - 10, CHART_H + extra - 6
+    left, top, right, bottom = 34, CHART_LABEL + extra + 4, CHART_WIDTH - 10, CHART_H + extra - 6 - CHART_AXIS
     big = Image.new("RGBA", (width * k, height * k), (0, 0, 0, 0))
     pen = ImageDraw.Draw(big)
     X = lambda t: (left + (right - left) * (t - chart.start) / span) * scale * k  # noqa: E731
@@ -1304,9 +1420,12 @@ def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.I
     image.alpha_composite(big.resize((width, height), Image.LANCZOS))
     draw = ImageDraw.Draw(image)
     for level in ticks:
-        draw.text((px(left-5), Y(level)/k), f"{level:g}%", font=ui_font(px(8)), fill=MUTED_TEXT, anchor="rm")
+        # Mid-zoom the top edge sits between two round levels: name it to the whole percent.
+        text = f"{level:g}%" if level in BURN_TICKS or level in BURN_TOPS or not level else f"{round(level)}%"
+        draw.text((px(left-5), Y(level)/k), text, font=ui_font(px(8)), fill=MUTED_TEXT, anchor="rm")
     if all(len(history) < 2 for _, _, history, _, _ in drawn):
         draw.text((width / 2, px((top + bottom) / 2)), "正在积累用量记录", font=small, fill=MUTED_TEXT, anchor="mm")
+    _burn_axis(draw, chart, X, k, px, left, right, bottom, scale)
     base, ceiling = px(bottom), px(top)
     for series, color, history, _, exhausts in drawn:
         if exhausts is not None:
@@ -1317,6 +1436,30 @@ def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.I
         for y in range(round(ceiling), round(base), max(2, px(4))):
             draw.line((ex, y, ex, min(base, y + px(2))), fill=_with_alpha(color, 140), width=max(1, round(scale)))
     return image
+
+
+def _burn_axis(draw, chart: BurnChart, X, k, px, left, right, bottom, scale) -> None:
+    """Clock row: round times at even steps (every minute in a 5-minute view,
+    every hour in a 5-hour one) and "now" at its mark, brighter."""
+    face = ui_font(px(8))
+    y = px(bottom + 3 + CHART_AXIS / 2)
+    hair = max(1, round(scale))
+    now_x = X(min(chart.now, chart.end)) / k
+    now_text = _clock(chart.now, chart.now)
+    now_w = draw.textlength(now_text, font=face)
+    now_left = min(now_x - now_w / 2, px(right) - now_w)
+    draw.line((now_x, px(bottom), now_x, px(bottom + 2.5)), fill=_with_alpha(SECONDARY_TEXT, 160), width=hair)
+    draw.text((now_left, y), now_text, font=face, fill=SECONDARY_TEXT, anchor="lm")
+    edge = px(left) - px(10)                 # labels may reach a little under the % column
+    for stamp in burn_time_ticks(chart):
+        x = X(stamp) / k
+        text = _clock(stamp, chart.now)
+        half = draw.textlength(text, font=face) / 2
+        if x - half < edge or x + half > now_left - px(6):
+            continue
+        draw.line((x, px(bottom), x, px(bottom + 2)), fill=_with_alpha(MUTED_TEXT, 120), width=hair)
+        draw.text((x, y), text, font=face, fill=MUTED_TEXT, anchor="mm")
+        edge = x + half + px(6)
 
 
 def forecast_text(text: str, limit: float, face, probe) -> str:

@@ -133,9 +133,13 @@ class ClaudeStatusTests(unittest.TestCase):
                 again = quota_sources.get_claude_quota()
                 quota_sources._CLAUDE_PROBE['at'] -= quota_sources.CLAUDE_HOVER_PROBE_GAP_SECONDS
                 quota_sources.get_claude_quota()
+                quota_sources._CLAUDE_PROBE['at'] -= 5                      # checked 5 s ago, inside the gap...
+                with patch.dict(quota_sources.HOVER_STARTED, {'claude': time.time() - 1}):
+                    quota_sources.get_claude_quota()                        # ...but a new hover checks at once
+                    quota_sources.get_claude_quota()                        # its later reads reuse that
         self.assertEqual((looked.remaining_percent, looked.secondary_remaining_percent), (74, 69))   # Desktop use shows
         self.assertIs(again, looked)                                        # one /usage session per hover gap
-        self.assertEqual(cli.call_count, 2)
+        self.assertEqual(cli.call_count, 3)
         quota_sources._CLAUDE_PROBE.clear()
 
     def test_failed_usage_read_keeps_last_native_numbers_marked_stale(self):
