@@ -68,6 +68,36 @@ class ForecastTests(unittest.TestCase):
         self.assertEqual(forecast([], now, None, None).tone, "unknown")
         self.assertEqual(forecast([], now, 0, int(now + 60)).tone, "danger")
 
+    def test_sustained_short_burst_predicts_before_ten_minutes(self):
+        now = 1_000_000.0
+        reset = int(now + 4 * HOUR)
+        samples = self.series(now, [0, 4, 9, 15, 20], step=75, resets_at=reset)
+        result = forecast(samples, now, 80, reset)
+        self.assertTrue(result.before_reset)
+        self.assertIn("近期较快用量", result.text)
+        self.assertLess(result.exhausts_at - now, HOUR)
+        # A single jump or an old burst cannot stand in for ongoing demand.
+        self.assertEqual(forecast([samples[0], samples[-1]], now, 80, reset).tone, "unknown")
+        self.assertEqual(forecast(samples, now + 5 * 60, 80, reset).tone, "unknown")
+
+    def test_recent_acceleration_overrides_slow_long_term_pace(self):
+        now = 1_000_000.0
+        reset = int(now + 3 * HOUR)
+        slow = self.series(now - 5 * 60, [10, 11, 12], step=30 * 60, resets_at=reset)
+        burst = self.series(now, [12, 16, 22, 28], step=90, resets_at=reset)
+        result = forecast(slow + burst, now, 72, reset)
+        self.assertTrue(result.before_reset)
+        self.assertIn("近期较快用量", result.text)
+
+    def test_near_zero_spare_before_reset_is_warned_not_called_enough(self):
+        now = 1_000_000.0
+        reset = int(now + 10 * HOUR)
+        samples = self.series(now, [50, 52, 54], step=HOUR, resets_at=reset)
+        result = forecast(samples, now, 24, reset)
+        self.assertEqual(result.tone, "warn")
+        self.assertFalse(result.before_reset)
+        self.assertIn("接近用尽", result.text)
+
     def test_duration_text_uses_days_for_weekly_windows(self):
         self.assertEqual(duration_text(2 * 86400 + 5 * 3600), "2 天")      # days only past a day
         self.assertEqual(duration_text(86400 + 3600), "1 天")

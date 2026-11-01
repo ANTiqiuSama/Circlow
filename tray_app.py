@@ -519,7 +519,7 @@ class QuotaTray:
         # every frame: every 5 s in a 5-minute view, at most every 30 s.
         step = max(5.0, min(30.0, back / 60))
         shown = float(round(now / step) * step)
-        start, end = shown - back, shown + agent_panel.BURN_FUTURE * back
+        start, end = shown - back, shown + agent_panel.burn_future(back)
         # Readings for at least the 30 minutes a close-up widens to while hovered.
         keep = shown - max(back, agent_panel.BURN_DWELL_SPAN * 60)
         series = tuple(self._fit_points(item[0], keep) for item in candidates)

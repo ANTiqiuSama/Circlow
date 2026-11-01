@@ -18,6 +18,11 @@ KEEP_SECONDS = 8 * 86400        # Longer than the longest (weekly) window.
 KEEP_SAMPLES = 2000             # Per window key; repeated readings are folded (see add), so this spans the week.
 LOOKBACK_SECONDS = 3 * 3600     # Recent pace matters more than the whole window.
 MIN_SPAN_SECONDS = 10 * 60      # Do not extrapolate from a few seconds.
+FAST_LOOKBACK_SECONDS = 20 * 60 # A sustained burst can justify an earlier, conditional forecast.
+FAST_MIN_SPAN_SECONDS = 60
+FAST_MIN_SPEND = 3.0             # percentage points, across at least three readings
+FAST_MAX_AGE_SECONDS = 120
+LOW_SPARE_PERCENT = 5.0
 RESET_TOLERANCE = 180           # Reset timestamps jitter a little between reads.
 IDLE_RATE = 0.05                # %/hour treated as "no measurable use".
 
@@ -141,21 +146,33 @@ def forecast(samples: Iterable[Sample], now: float, remaining: float | None, res
     recent = [s for s in window if s.at >= now - LOOKBACK_SECONDS]
     if len(recent) < 2 or recent[-1].at - recent[0].at < MIN_SPAN_SECONDS:
         recent = window  # Fall back to the whole window when recent data is thin.
-    if len(recent) < 2 or recent[-1].at - recent[0].at < MIN_SPAN_SECONDS:
+    regular = len(recent) >= 2 and recent[-1].at - recent[0].at >= MIN_SPAN_SECONDS
+    fast = [s for s in window if s.at >= now - FAST_LOOKBACK_SECONDS]
+    fast_ready = (len(fast) >= 3 and fast[-1].at - fast[0].at >= FAST_MIN_SPAN_SECONDS
+                  and fast[-1].used - fast[0].used >= FAST_MIN_SPEND
+                  and now - fast[-1].at <= FAST_MAX_AGE_SECONDS
+                  and all(right.used >= left.used - 0.1 for left, right in zip(fast, fast[1:])))
+    if not regular and not fast_ready:
         return Forecast("unknown", "正在积累用量记录，稍后给出预测")
-    rate = slope_per_hour(recent)
+    regular_rate = slope_per_hour(recent) if regular else 0.0
+    fast_rate = slope_per_hour(fast) if fast_ready else 0.0
+    short_pace = fast_ready and fast_rate > regular_rate * 1.2
+    rate = fast_rate if short_pace else regular_rate
+    pace = "按近期较快用量估算，" if short_pace else "按当前速度"
     if rate < IDLE_RATE:
         return Forecast("idle", "近期几乎没有消耗，重置前够用", rate)
     exhausts_at = now + remaining / rate * 3600
     if resets_at and resets_at > now and exhausts_at >= resets_at:
         spare = remaining - rate * (resets_at - now) / 3600
-        return Forecast("ok", f"按当前速度重置前够用，约剩 {spare:.0f}%", rate, exhausts_at, False)
+        if spare <= LOW_SPARE_PERCENT:
+            return Forecast("warn", f"{pace}重置前可能接近用尽，预计剩余 {max(0, spare):.0f}%", rate, exhausts_at, False)
+        return Forecast("ok", f"{pace}重置前够用，约剩 {spare:.0f}%", rate, exhausts_at, False)
     left = exhausts_at - now
     if resets_at and resets_at > now:
         gap = resets_at - exhausts_at
         tone = "danger" if left < 3600 else "warn"
-        return Forecast(tone, f"按当前速度约 {duration_text(left)}后用完，早于重置 {duration_text(gap)}", rate, exhausts_at, True)
-    return Forecast("warn" if left < 3 * 3600 else "ok", f"按当前速度约 {duration_text(left)}后用完", rate, exhausts_at, None)
+        return Forecast(tone, f"{pace}约 {duration_text(left)}后用完，早于重置 {duration_text(gap)}", rate, exhausts_at, True)
+    return Forecast("warn" if left < 3 * 3600 else "ok", f"{pace}约 {duration_text(left)}后用完", rate, exhausts_at, None)
 
 
 class QuotaHistory:

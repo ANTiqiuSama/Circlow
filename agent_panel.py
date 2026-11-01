@@ -1043,6 +1043,7 @@ BURN_SPANS = (10, 30, 60, 120, 300)      # minutes of history the chart may show
 BURN_CHANGE = 3.0         # % of a quota a span must see used to be worth showing
 BURN_HOLD = .6            # the span on screen stays while it still sees this share of that
 BURN_FUTURE = .25         # room right of "now" for the forecast, as a share of the span
+BURN_MIN_FUTURE = 10 * 60  # visible dashed segment even when the chart zooms to 10 minutes
 BURN_TICKS_EVERY = {10: 2, 30: 5, 60: 15, 120: 30, 300: 60}   # span -> minutes between clock labels
 # A close-up eases out to this span once the pointer has rested a moment.
 BURN_DWELL_SPAN, BURN_DWELL_DELAY, BURN_DWELL_EASE = 30, 2.5, 1.2    # minutes, seconds, seconds
@@ -1056,10 +1057,14 @@ def smootherstep(t: float) -> float:
 
 
 def burn_view(chart: BurnChart, minutes: float) -> BurnChart:
-    """The same chart showing `minutes` of history before now, and a quarter
-    of that for the forecast."""
+    """The same chart showing `minutes` of history and room for the forecast."""
     back = minutes * 60
-    return replace(chart, start=chart.now - back, end=chart.now + BURN_FUTURE * back)
+    return replace(chart, start=chart.now - back, end=chart.now + burn_future(back))
+
+
+def burn_future(back: float) -> float:
+    """Give a close-up enough future space without shrinking its history away."""
+    return max(BURN_FUTURE * back, min(back, BURN_MIN_FUTURE))
 
 
 @lru_cache(maxsize=8)
@@ -1154,7 +1159,7 @@ def burn_points(series: BurnSeries, chart: BurnChart) -> tuple[list[tuple[float,
     exhausts = t0 + r0 / series.rate * 3600
     limit = min(chart.end, series.reset_at or chart.end)
     stop = min(limit, exhausts)
-    seen = exhausts if exhausts <= limit else None
+    seen = exhausts if series.reset_at is None or exhausts <= series.reset_at else None
     if stop <= t0:
         return history, [], seen
     return history, [(t0, r0), (stop, max(0.0, r0 - series.rate * (stop - t0) / 3600))], seen
@@ -1274,71 +1279,10 @@ def chart_extra(chart: BurnChart | None) -> float:
     return legend[-1][2] * CHART_LABEL if legend else 0
 
 
-# End of each quota line. Zero sides is a disc. Gemini's three pools share the
-# square; their colours already keep the lines apart.
-LINE_END_SIDES = {"A": 0, "C": 6, "X": 5, "G": 4, "M": 3}
-LINE_END_BODY = 3.0          # Coloured radius of the old endpoint dot, px(3).
-LINE_END_HALO = 1.5          # Dark plate past that edge, the old px(1.5) ring.
-LINE_END_INK = (36, 35, 32, 255)
-
-
-def line_end_sides(letter: str) -> int:
-    return LINE_END_SIDES.get(letter, 0)
-
-
-def line_end_radius(sides: int, body: float) -> float:
-    """Circumradius. `body` is the disc radius; a polygon keeps about the same area."""
-    if sides < 3:
-        return body
-    return body * math.sqrt(2 * math.pi / (sides * math.sin(2 * math.pi / sides)))
-
-
-def line_end_rotation(sides: int) -> float:
-    """Point up for a triangle or pentagon; flat sides for a square or hexagon."""
-    if sides == 4:
-        return math.pi / 4
-    if sides == 6:
-        return math.pi / 6
-    return -math.pi / 2
-
-
-def line_end_polygon(cx: float, cy: float, radius: float, sides: int) -> list[tuple[float, float]]:
-    rotation = line_end_rotation(sides)
-    step = 2 * math.pi / sides
-    return [(cx + radius * math.cos(rotation + index * step),
-             cy + radius * math.sin(rotation + index * step))
-            for index in range(sides)]
-
-
-def line_end_boundary(sides: int, radius: float, angle: float) -> float:
-    """Distance from the centre to the edge along `angle` (0 is east, y grows down)."""
-    if sides < 3:
-        return radius
-    period = 2 * math.pi / sides
-    normal = line_end_rotation(sides) + math.pi / sides
-    delta = (angle - normal + math.pi) % (2 * math.pi) - math.pi
-    delta = (delta + period / 2) % period - period / 2
-    return radius * math.cos(math.pi / sides) / math.cos(delta)
-
-
-def draw_line_end(draw: ImageDraw.ImageDraw, cx: float, cy: float, radius: float,
-                  sides: int, color, halo: float) -> None:
-    """Line cap filled with the line colour, on a dark plate of the same shape."""
-    plate = radius + halo
-    if sides < 3:
-        draw.ellipse((cx - plate, cy - plate, cx + plate, cy + plate), fill=LINE_END_INK)
-        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=color)
-        return
-    draw.polygon(line_end_polygon(cx, cy, plate, sides), fill=LINE_END_INK)
-    draw.polygon(line_end_polygon(cx, cy, radius, sides), fill=color)
-
-
 @lru_cache(maxsize=8)
 def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.Image:
     """Burn-down chart: remaining % of each quota window in use, each in the
-    colour of its header bar. The solid line ends in that source's glyph
-    (disc, hexagon, pentagon, square, or triangle) filled with the same colour.
-    The forecast is a dashed line, resets are faint dashed markers."""
+    colour of its header bar. The forecast is dashed, resets are faint markers."""
     px = lambda value: round(value * scale)  # noqa: E731
     extra = chart_extra(chart)
     width, height = px(CHART_WIDTH), px(CHART_H + extra)
@@ -1409,14 +1353,6 @@ def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.I
         if projection:
             _dashed_curve(pen, [(X(t), Y(r)) for t, r in burn_projection_curve(projection)],
                           _with_alpha(color, 200), max(2, round(1.3 * scale * k)), 5 * scale * k, 4 * scale * k)
-    # Caps sit on the supersampled plate so a hexagon stays a hexagon after scaling.
-    body = LINE_END_BODY * scale * k
-    halo = LINE_END_HALO * scale * k
-    for series, color, history, _, _ in drawn:
-        if history:
-            sides = line_end_sides(series.letter)
-            draw_line_end(pen, X(history[-1][0]), Y(history[-1][1]),
-                          line_end_radius(sides, body), sides, color, halo)
     image.alpha_composite(big.resize((width, height), Image.LANCZOS))
     draw = ImageDraw.Draw(image)
     for level in ticks:
@@ -1427,11 +1363,7 @@ def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.I
         draw.text((width / 2, px((top + bottom) / 2)), "正在积累用量记录", font=small, fill=MUTED_TEXT, anchor="mm")
     _burn_axis(draw, chart, X, k, px, left, right, bottom, scale)
     base, ceiling = px(bottom), px(top)
-    for series, color, history, _, exhausts in drawn:
-        if exhausts is not None:
-            ex = X(exhausts) / k
-            draw.ellipse((ex - px(3), base - px(3), ex + px(3), base + px(3)), fill=color)
-    if first is not None:
+    if first is not None and chart.start <= first[0] <= chart.end:
         ex, color = X(first[0]) / k, first[2]
         for y in range(round(ceiling), round(base), max(2, px(4))):
             draw.line((ex, y, ex, min(base, y + px(2))), fill=_with_alpha(color, 140), width=max(1, round(scale)))
