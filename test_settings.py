@@ -19,6 +19,12 @@ def snapshot(**extra):
 
 
 class SettingsViewTests(unittest.TestCase):
+    def test_dark_title_bar_is_left_alone_off_windows(self):
+        import ui_motion
+        with patch.object(ui_motion.sys, 'platform', 'darwin'):
+            self.assertFalse(ui_motion.dark_title_bar(object(), '#000000', '#ffffff', '#202020'))
+            self.assertFalse(ui_motion.keep_unchanged_widgets(object()))
+
     def test_gemini_panel_uses_full_width_for_quota_without_tps(self):
         import agent_panel
         model = agent_panel.PanelModel('gemini', 'G', 'Gemini', '空闲',
