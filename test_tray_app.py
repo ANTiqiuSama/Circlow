@@ -684,7 +684,7 @@ class AgentPanelTests(unittest.TestCase):
         self.assertEqual(agent_panel.burn_sprite(agent_panel.burn_dwell(close_up, delay + ease / 2),
                                                  (agent_panel.accent('C'),), 1.0).height, agent_panel.CHART_H)
         wide = agent_panel.burn_dwell(close, 60)
-        self.assertEqual(wide.end - wide.now, 600)                           # at least 10 min for a visible dashed forecast
+        self.assertAlmostEqual(wide.end - wide.now, 324)                    # a narrow forecast strip
         long_view = agent_panel.BurnChart(now - 7200, now + 1800, now, ())
         self.assertIs(agent_panel.burn_dwell(long_view, 60), long_view)      # already 30 min or more: unchanged
         self.assertIsNone(agent_panel.burn_dwell(None, 60))
@@ -703,7 +703,7 @@ class AgentPanelTests(unittest.TestCase):
         self.tray.history = history
         self.tray.snapshots['codex'] = QuotaSnapshot('codex', 'Codex', 300, 50, 50, reset, now, False, None)
         chart = self.tray.burn_chart('codex', now)
-        self.assertEqual((chart.now - chart.start, chart.end - chart.now), (600, 600))  # 10 min back and ahead
+        self.assertEqual((chart.now - chart.start, chart.end - chart.now), (600, 120))  # 10 min back, 2 min ahead
         history_points, projection, _ = agent_panel.burn_points(chart.series[0], chart)
         self.assertEqual(history_points[0][0], chart.start)                          # no gap at the left edge
         self.assertEqual(len(chart.series[0].points), 42)                            # all 20 min (hovering widens to 30) + the window start
