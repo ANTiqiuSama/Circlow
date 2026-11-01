@@ -533,6 +533,34 @@ class RefreshCadenceTests(unittest.TestCase):
 
 
 class CodexLocalLimitTests(unittest.TestCase):
+    def test_rejected_claude_status_is_not_reprocessed_every_second(self):
+        now = time.time()
+        old = QuotaSnapshot("claude", "Claude Code", 300, 80, 20, int(now + 3600), now - 60,
+                            False, None, 10080, 83, 17, int(now + 7200))
+        suspect = QuotaSnapshot("claude", "Claude Code", 300, 30, 70, old.resets_at, now,
+                                False, None, 10080, 71, 29, old.secondary_resets_at)
+        tray = QuotaTray.__new__(QuotaTray)
+        tray.snapshots = {"claude": old}
+        tray.history = None
+        with patch("claude_status.latest", return_value={"updated_at": now, "observed_at": now}), \
+                patch.object(tray_app, "get_claude_quota", return_value=suspect) as read:
+            tray.update_claude_locally(now)
+            tray.update_claude_locally(now + 1)
+        read.assert_called_once()
+        self.assertEqual(tray.snapshots["claude"].remaining_percent, 20)
+        self.assertEqual(tray.claude_rejected_seen, now)
+
+    def test_claude_reset_notice_requires_at_least_ninety_five_percent_remaining(self):
+        now = time.time()
+        old = QuotaSnapshot("claude", "Claude Code", 300, 80, 20, int(now + 3600), now - 60,
+                            False, None, 10080, 83, 17, int(now + 7200))
+        partial = QuotaSnapshot("claude", "Claude Code", 300, 30, 70, int(now + 5 * 3600), now,
+                                False, None, 10080, 71, 29, int(now + 7 * 86400))
+        self.assertEqual(tray_app.reset_changes(old, partial, now), [])
+        full = QuotaSnapshot("claude", "Claude Code", 300, 3, 97, int(now + 5 * 3600), now,
+                             False, None, 10080, 83, 17, int(now + 7200))
+        self.assertEqual(len(tray_app.reset_changes(old, full, now)), 1)
+
     def test_session_record_replaces_older_snapshot_and_limit_error_requests_refresh(self):
         tray = QuotaTray.__new__(QuotaTray)
         old = QuotaSnapshot("codex", "Codex", 300, 20.0, 80.0, 5000, 100.0, False, None)
@@ -684,7 +712,7 @@ class AgentPanelTests(unittest.TestCase):
         self.assertEqual(agent_panel.burn_sprite(agent_panel.burn_dwell(close_up, delay + ease / 2),
                                                  (agent_panel.accent('C'),), 1.0).height, agent_panel.CHART_H)
         wide = agent_panel.burn_dwell(close, 60)
-        self.assertEqual(wide.end - wide.now, 450)                           # the forecast keeps its quarter
+        self.assertAlmostEqual(wide.end - wide.now, 180)                    # a narrow forecast strip
         long_view = agent_panel.BurnChart(now - 7200, now + 1800, now, ())
         self.assertIs(agent_panel.burn_dwell(long_view, 60), long_view)      # already 30 min or more: unchanged
         self.assertIsNone(agent_panel.burn_dwell(None, 60))
@@ -692,7 +720,7 @@ class AgentPanelTests(unittest.TestCase):
         ticks = [time.strftime('%M', time.localtime(t)) for t in agent_panel.burn_time_ticks(middle)]
         self.assertTrue(all(int(m) % 5 == 0 for m in ticks))                 # mid-zoom labels use the 30-min steps
 
-    def test_chart_axis_is_the_span_plus_a_quarter_for_the_forecast(self):
+    def test_chart_axis_keeps_a_visible_short_term_forecast(self):
         from pathlib import Path
         from forecast import QuotaHistory
         now = time.time()
@@ -703,7 +731,7 @@ class AgentPanelTests(unittest.TestCase):
         self.tray.history = history
         self.tray.snapshots['codex'] = QuotaSnapshot('codex', 'Codex', 300, 50, 50, reset, now, False, None)
         chart = self.tray.burn_chart('codex', now)
-        self.assertEqual((chart.now - chart.start, chart.end - chart.now), (600, 150))  # 10 min back, 2.5 min ahead
+        self.assertEqual((chart.now - chart.start, chart.end - chart.now), (600, 60))  # 10 min back, 1 min ahead
         history_points, projection, _ = agent_panel.burn_points(chart.series[0], chart)
         self.assertEqual(history_points[0][0], chart.start)                          # no gap at the left edge
         self.assertEqual(len(chart.series[0].points), 42)                            # all 20 min (hovering widens to 30) + the window start
