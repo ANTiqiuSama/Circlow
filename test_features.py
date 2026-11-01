@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import quota_sources
-from forecast import QuotaHistory, Sample, current_window, duration_text, forecast
+from forecast import QuotaHistory, Sample, current_window, duration_text, forecast, history_curve
 from refresh_scheduler import DURATION_GAP, HOVER, ACTIVE, IDLE, RETRY, SETTLE, RefreshScheduler
 
 HOUR = 3600
@@ -138,6 +138,13 @@ class ForecastTests(unittest.TestCase):
             self.assertEqual([row.used for row in fresh.samples("claude")], [80])
             self.assertEqual([row.used for row in fresh.samples("claude:secondary")], [83])
             self.assertTrue(fresh.add("claude", 1120, 4, reset))  # a real >=95% recovery is retained
+
+    def test_confirmed_full_recovery_is_drawn_as_a_step(self):
+        reset = 2_000_000
+        points, steps = history_curve([Sample(1000, 80, reset), Sample(1060, 4, reset)], 900, 1100)
+        self.assertIn((1060, 20.0), points)
+        self.assertIn((1060, 96.0), points)
+        self.assertTrue(steps)
 
 
 class SchedulerTests(unittest.TestCase):

@@ -118,6 +118,13 @@ def history_curve(samples: Iterable[Sample], floor: float, now: float,
                 steps.update((len(points), len(points) + 1))
                 points += [(float(last.resets_at), 100.0 - last.used), (float(last.resets_at), 100.0)]
                 after = last.resets_at
+            elif same_window(last.resets_at, first.resets_at) and last.used - first.used >= CLAUDE_DROP_TOLERANCE \
+                    and first.used <= 5:
+                # Claude may report a genuine full recovery before it updates
+                # the reset timestamp. Draw a step only at >=95% remaining.
+                steps.update((len(points), len(points) + 1))
+                points += [(first.at, 100.0 - last.used), (first.at, 100.0 - first.used)]
+                after = first.at
         begun = first.resets_at - minutes * 60 if first.resets_at and minutes else None
         if begun and after < begun < first.at:
             steps.add(len(points))
