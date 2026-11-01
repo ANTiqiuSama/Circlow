@@ -29,14 +29,19 @@ if sys.platform == "darwin":
              str(Path.home() / ".grok/bin")]
     os.environ["PATH"] = os.pathsep.join(dict.fromkeys(os.environ.get("PATH", "").split(os.pathsep) + extra))
 
+import herdr_source
 import mimo_usage
 import providers
-from icon_art import live_icon, quota_icon
+from agent_panel import compact_usage
+from forecast import reset_distance
 from quota_sources import QuotaSnapshot, collect, load_cached_snapshots, mimo_snapshot, mimo_tracker, placeholder, save_cached_snapshots
 from refresh_scheduler import RefreshScheduler
 from tps_sources import TpsMonitor, save_performance
+from tray_icons import make_display_icon, quota_exhausted, stale_note
 
 
+# Sources whose "打开来源" starts the agent in a new Herdr workspace.
+HERDR_AGENTS = {"claude", "grok"}
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "Library/Application Support")) / APP_NAME
 log = logging.getLogger(APP_NAME)
 
@@ -52,21 +57,30 @@ def window_name(minutes: int | None) -> str:
 
 
 def countdown(timestamp: int | None, now: float | None = None) -> str:
+    """Same wording as the Windows panel's column titles ("4小时32分钟后重置")."""
     if not timestamp:
         return "重置时间未知"
-    left = max(0, int(timestamp - (now if now is not None else time.time())))
-    days, remainder = divmod(left, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes = remainder // 60
-    if not left:
-        return "等待重置生效"
-    return f"{days} 天 {hours} 小时" if days else f"{hours} 小时 {minutes} 分"
+    distance = reset_distance(timestamp, now if now is not None else time.time())
+    return f"{distance}后重置" if distance else "等待重置生效"
+
+
+def paid_text(snapshot: QuotaSnapshot) -> str:
+    """Codex used up but running on purchased credits: show what is left."""
+    balance = snapshot.credits_balance
+    if balance == float("inf"):
+        return "购买额度 无限"
+    number, unit = compact_usage(balance)
+    return f"购买额度 {number}{unit}"
 
 
 def quota_rows(snapshot: QuotaSnapshot, now: float | None = None) -> list[str]:
     """Menu details: every known window/pool, without stale account data reuse."""
+    paid = (snapshot.provider == "codex" and snapshot.credits_balance is not None and snapshot.credits_balance > 0)
+
     def row(label: str, remaining: float | None, reset: int | None) -> str:
         value = "未知" if remaining is None else f"剩余 {remaining:.0f}%"
+        if paid and quota_exhausted(remaining, snapshot.provider):
+            value = f"已用完 · {paid_text(snapshot)}"
         return f"{label} · {value} · {countdown(reset, now)}"
 
     if snapshot.pools:
@@ -95,7 +109,8 @@ def menu_model(provider: str, snapshot: QuotaSnapshot, performance: dict, refres
     summary = f"{snapshot.label} · " + (f"剩余 {snapshot.display_remaining:.0f}%" if snapshot.display_remaining is not None else "额度未知")
     if snapshot.stale:
         summary += " · 旧数据"
-    error = (snapshot.error or "")[:150]
+    # A stale source says when its figures are from and why (the amber dot).
+    error = stale_note(snapshot, now) if snapshot.stale else (snapshot.error or "")[:150]
     if provider == "mimo" and snapshot.today_used is not None:
         today = datetime.fromtimestamp(now).astimezone().date().isoformat()
         if snapshot.today_date == today:
@@ -106,10 +121,25 @@ def menu_model(provider: str, snapshot: QuotaSnapshot, performance: dict, refres
 
 
 def status_image(snapshot: QuotaSnapshot, letter: str, performance: dict):
-    if performance.get("active_sessions", 0) and performance.get("display_tps") is not None:
-        return live_icon(round(float(performance["display_tps"]), 1), letter)
-    return quota_icon(None if snapshot.display_remaining is None else round(snapshot.display_remaining, 1),
-                      letter, stale=snapshot.stale)
+    """The Windows tray icon: split ring, Gemini pool thirds, countdown or TPS."""
+    return make_display_icon(snapshot, letter, performance)
+
+
+def bar_order(keys: list[str]) -> list[str]:
+    """Creation order for status items. macOS places each new item to the
+    left of the existing ones, so create right-to-left to read Claude, Codex,
+    Gemini, Grok, MiMo from left to right, like the Windows tray."""
+    rank = {key: index for index, key in enumerate(providers.TRAY_POSITIONS)}
+    return sorted(keys, key=lambda key: rank.get(key, len(rank)), reverse=True)
+
+
+def open_cli(key: str, popen=subprocess.Popen) -> bool:
+    """Claude Code / Grok without Herdr: the CLI itself in a new Terminal window."""
+    path = providers.find_claude() if key == "claude" else shutil.which("grok")
+    if not path:
+        return False
+    popen(herdr_source.terminal_script([str(path)]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
 
 
 class MenuState:
@@ -125,6 +155,36 @@ class MenuState:
         self.monitor: TpsMonitor | None = None
         self.last_samples: dict[str, float | None] = {}
         self.mimo_ingested = 0
+        self.herdr_opening: set[str] = set()
+
+    def hover(self, provider: str | None, on: bool):
+        """An open status menu reads its source at the hover rate, like the
+        pointer resting on a Windows tray icon."""
+        if provider in self.keys and self.scheduler.hover(provider, on, time.time()):
+            self.wake.set()
+
+    def open_in_herdr(self, provider: str, start=None) -> bool:
+        """Claude Code / Grok in a new focused Herdr workspace; returns False
+        when a click for this source is already being handled."""
+        with self.lock:
+            if provider in self.herdr_opening:
+                return False
+            self.herdr_opening.add(provider)
+
+        def run():
+            try:
+                name = (start or herdr_source.start_agent)(provider)
+                log.info("opened %s in herdr as %s", provider, name)
+            except herdr_source.AgentSlow as slow:
+                log.info("opened %s in herdr: %s", provider, slow)
+            except (OSError, subprocess.SubprocessError) as error:
+                log.warning("could not open %s in herdr: %s", provider, error)
+            finally:
+                with self.lock:
+                    self.herdr_opening.discard(provider)
+                herdr_source.raise_client()
+        threading.Thread(target=run, name="herdr-open", daemon=True).start()
+        return True
 
     def request(self, provider: str | None = None):
         self.scheduler.request([provider] if provider else None, time.time())
@@ -160,7 +220,8 @@ class MenuState:
 
     def tps_loop(self):
         try:
-            self.monitor = TpsMonitor()
+            from usage_store import UsageStore
+            self.monitor = TpsMonitor(store=UsageStore())
         except Exception:
             log.exception("mac TPS monitor could not start")
             return
@@ -246,10 +307,11 @@ def run_mac() -> int:
             self.items = {}
             self.menus = {}
             bar = NSStatusBar.systemStatusBar()
-            for key in state.keys:
+            for key in bar_order(state.keys):
                 item = bar.statusItemWithLength_(NSVariableStatusItemLength)
-                menu = NSMenu.alloc().init()
+                menu = NSMenu.alloc().initWithTitle_(key)   # the title names the source for the delegate
                 menu.setAutoenablesItems_(False)
+                menu.setDelegate_(self)          # open menu = hover: fastest refresh tier
                 parts = {}
                 for name, title in (("summary", key), ("quota0", ""), ("quota1", ""), ("quota2", ""),
                                     ("speed", ""), ("updated", ""), ("error", "")):
@@ -296,6 +358,12 @@ def run_mac() -> int:
                     line.setTitle_(value)
                     line.setHidden_(not bool(value))
 
+        def menuWillOpen_(self, menu):
+            state.hover(str(menu.title()), True)
+
+        def menuDidClose_(self, menu):
+            state.hover(str(menu.title()), False)
+
         def refreshOne_(self, sender):
             state.request(str(sender.representedObject()))
 
@@ -306,11 +374,10 @@ def run_mac() -> int:
             elif key in ("codex", "gemini"):
                 name = "Codex" if key == "codex" else "Antigravity"
                 subprocess.Popen(["open", "-a", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif key in HERDR_AGENTS and herdr_source.find_exe():
+                state.open_in_herdr(key)
             else:
-                path = providers.find_claude() if key == "claude" else shutil.which("grok")
-                if path:
-                    subprocess.Popen(["open", "-a", "Terminal", str(Path(path).parent)],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                open_cli(key)
 
         def quitApp_(self, _sender):
             state.stop.set()

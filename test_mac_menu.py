@@ -74,6 +74,81 @@ class MacMenuTests(unittest.TestCase):
             quota_sources.get_mimo_quota()
         self.assertIs(tracker.refresh.call_args.args[0], mac_menu.mimo_usage.manual_plan)
 
+    def test_status_item_matches_the_windows_tray_icon(self):
+        import tray_icons
+        snap = self.snapshot(secondary_window_minutes=10080, secondary_remaining_percent=12.0, secondary_resets_at=3000)
+        for performance in ({}, {"active_sessions": 1, "display_tps": 40.0}):
+            self.assertEqual(mac_menu.status_image(snap, "C", performance).tobytes(),
+                             tray_icons.make_display_icon(snap, "C", performance).tobytes())
+
+    def test_status_items_read_in_tray_order_left_to_right(self):
+        # macOS puts each new item to the left, so creation runs right to left.
+        created = mac_menu.bar_order(["mimo", "codex", "grok", "claude", "gemini"])
+        self.assertEqual(list(reversed(created)), ["claude", "codex", "gemini", "grok", "mimo"])
+
+    def test_rows_use_reset_distance_and_codex_credits(self):
+        now = 1_800_000_000
+        snap = self.snapshot(remaining_percent=0.0, used_percent=100.0, resets_at=now + 4 * 3600 + 32 * 60,
+                             credits_balance=59_800.0)
+        rows = mac_menu.quota_rows(snap, now)
+        self.assertEqual(rows[0], "5 小时 · 已用完 · 购买额度 59.8K · 4小时32分钟后重置")
+        self.assertIn("等待重置生效", mac_menu.quota_rows(self.snapshot(resets_at=now - 5), now)[0])
+
+    def test_stale_menu_line_says_when_and_why(self):
+        now = time.time()
+        snap = self.snapshot(provider="grok", updated_at=now - 600, stale=True,
+                             error="读取 /usage 失败：RuntimeError: Grok 官方额度服务出错，暂时读不到额度")
+        model = mac_menu.menu_model("grok", snap, {}, "空闲", now=now)
+        self.assertTrue(model["error"].startswith("显示 "))
+        self.assertTrue(model["error"].endswith("Grok 官方额度服务出错，暂时读不到额度"))
+
+    def test_open_menu_reads_at_the_hover_rate(self):
+        state = mac_menu.MenuState.__new__(mac_menu.MenuState)
+        state.keys, state.scheduler, state.wake = ["claude"], Mock(), Mock()
+        state.scheduler.hover.return_value = True
+        state.hover("claude", True)
+        state.scheduler.hover.assert_called_once()
+        state.wake.set.assert_called_once()
+        state.hover("not-a-source", True)                  # a menu without a source title
+        self.assertEqual(state.scheduler.hover.call_count, 1)
+
+    def test_claude_and_grok_open_in_herdr_once_per_click(self):
+        import threading
+        state = mac_menu.MenuState.__new__(mac_menu.MenuState)
+        state.lock, state.herdr_opening = threading.RLock(), set()
+        release, started = threading.Event(), []
+
+        def start(kind):
+            started.append(kind)
+            release.wait(5)
+            return kind
+        with patch.object(mac_menu.herdr_source, "raise_client") as raise_client:
+            self.assertTrue(state.open_in_herdr("grok", start))
+            self.assertFalse(state.open_in_herdr("grok", start))          # still starting
+            release.set()
+            for _ in range(100):
+                if not state.herdr_opening:
+                    break
+                time.sleep(0.01)
+        self.assertEqual(started, ["grok"])
+        raise_client.assert_called_once()
+
+    def test_herdr_on_macos_runs_in_terminal_and_raises_its_app(self):
+        import herdr_source
+        from types import SimpleNamespace
+        opened = []
+        with patch.object(herdr_source.sys, "platform", "darwin"), patch.dict("os.environ", {"CODEX_QUOTA_HERDR_SESSION": ""}):
+            herdr_source.open_window("/opt/homebrew/bin/herdr", lambda args, **_: opened.append(args))
+        self.assertEqual(opened[0][:2], ["osascript", "-e"])
+        self.assertIn('do script "/opt/homebrew/bin/herdr"', opened[0][2])
+        terminal = SimpleNamespace(pid=2, exe=lambda: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")
+        client = SimpleNamespace(pid=3, info={"name": "herdr", "cmdline": ["/opt/homebrew/bin/herdr"]},
+                                 exe=lambda: "/opt/homebrew/bin/herdr", parents=lambda: [terminal])
+        with patch.dict("os.environ", {"CODEX_QUOTA_HERDR_SESSION": ""}):
+            self.assertEqual(herdr_source.client_app([client]), "/System/Applications/Utilities/Terminal.app")
+        self.assertEqual(herdr_source.terminal_script(['/a b/say "hi"'])[2],
+                         'tell application "Terminal" to do script "\'/a b/say \\"hi\\"\'"')
+
     @unittest.skipUnless(sys.platform == "darwin", "requires the macOS PTY")
     def test_macos_temporary_cli_usage_reaches_prompt_and_parses_reset(self):
         with tempfile.TemporaryDirectory() as folder:

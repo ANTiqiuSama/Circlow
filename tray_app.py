@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import itertools
 import json
 import logging
 import logging.handlers
-import math
 import os
 import re
 import subprocess
@@ -24,7 +24,7 @@ import agent_tasks
 import forecast as forecast_module
 from forecast import Forecast, QuotaHistory, duration_text, reset_distance
 from hover_details import HoverDetails, HoverIcon
-from icon_art import live_icon, ring_icon, waiting_icon
+import quota_sources
 from quota_sources import (
     mimo_snapshot,
     mimo_tracker,
@@ -47,7 +47,12 @@ import model_iq
 import grok_iq
 import reset_watch
 from refresh_scheduler import RefreshScheduler
+from tray_icons import (  # noqa: F401  (re-exported for callers and tests)
+    EXHAUSTED_REMAINING, ERROR_PREFIX_RE, PACED_PROVIDERS, _rounded, countdown_value, exhaustion_threshold,
+    icon_windows, make_display_icon, make_provider_icon, make_tps_icon, pace_marker, quota_exhausted,
+    stale_note, usable_again_at)
 from tps_sources import PERFORMANCE_PATH, TpsMonitor, performance_signature, save_performance
+from usage_store import UsageStore, insights as usage_insights
 
 
 APP_NAME = "CodexQuotaTray"
@@ -59,140 +64,7 @@ PROVIDERS = {key: provider_registry.get(key).letter for key in provider_registry
 LAUNCHERS = {spec.key: spec.launch for spec in provider_registry.SPECS}
 # Sources whose click opens a new Herdr tab running that agent (herdr --kind).
 HERDR_AGENTS = {"claude", "grok"}
-PACED_PROVIDERS = {"mimo"}
 log = logging.getLogger(APP_NAME)
-
-
-def pace_marker(snapshot: QuotaSnapshot, now: float | None = None) -> float | None:
-    """For pooled plans (MiMo): where the binding ring should end if Credits
-    were spent evenly - the share of its window that is still ahead."""
-    if snapshot.provider not in PACED_PROVIDERS or snapshot.display_remaining is None:
-        return None
-    now = now or time.time()
-    use_secondary = (snapshot.secondary_remaining_percent is not None and
-                     (snapshot.remaining_percent is None or snapshot.secondary_remaining_percent <= snapshot.remaining_percent))
-    minutes = snapshot.secondary_window_minutes if use_secondary else snapshot.window_minutes
-    ends = snapshot.secondary_resets_at if use_secondary else snapshot.resets_at
-    if not minutes or not ends:
-        return None
-    return max(0.0, min(100.0, 100.0 * (ends - now) / (minutes * 60)))
-
-
-def _rounded(value, digits=1):
-    return None if value is None else round(float(value), digits)
-
-
-def icon_windows(snapshot: QuotaSnapshot, letter: str) -> tuple[tuple, tuple | None]:
-    """(values, colours) of the ring: left half the short window, right half
-    the long one. Model pools (Gemini) show every pool in panel order, each in
-    the colour of its panel column: three pools split the ring into equal
-    120-degree thirds (Argon top-left, Claude/GPT bottom, Gemini top-right),
-    two pools into halves."""
-    if snapshot.provider == "mimo":
-        return (snapshot.display_remaining,), None
-    pools = snapshot.pools or []
-    if len(pools) >= 3:
-        shown = list(enumerate(pools[:3]))
-        if all(pool.get("remaining_percent") is None for _, pool in shown):
-            return (None,), None
-        values = tuple(pool.get("remaining_percent") for _, pool in shown)
-        return values, tuple(agent_panel.quota_shade(letter, index, value, True) for index, value in enumerate(values))
-    if len(pools) > 1:
-        known = [(index, pool) for index, pool in enumerate(pools[:3]) if pool.get("remaining_percent") is not None]
-        tight = sorted(sorted(known, key=lambda item: item[1]["remaining_percent"])[:2], key=lambda item: item[0])
-        if not tight:
-            return (None,), None
-        values = tuple(pool["remaining_percent"] for _, pool in tight)
-        if len(tight) == 1:
-            return values, None
-        return values, tuple(agent_panel.quota_shade(letter, index, pool["remaining_percent"], True) for index, pool in tight)
-    if snapshot.secondary_remaining_percent is not None:
-        return (snapshot.remaining_percent, snapshot.secondary_remaining_percent), None
-    return (snapshot.remaining_percent,), None
-
-
-EXHAUSTED_REMAINING = 5.0  # User treats 95% used as exhausted for display.
-
-
-def exhaustion_threshold(provider: str) -> float:
-    return 10.0 if provider in ("codex", "grok") else EXHAUSTED_REMAINING
-
-
-def quota_exhausted(value: float | None, provider: str = "") -> bool:
-    return value is not None and value <= exhaustion_threshold(provider)
-
-
-def countdown_value(seconds: float) -> tuple[int, str]:
-    """A compact time unit, rounded up so it never suggests an early reset."""
-    if seconds >= 86400:
-        return math.ceil(seconds / 86400), "d"
-    if seconds >= 3600:
-        return math.ceil(seconds / 3600), "h"
-    return max(1, math.ceil(seconds / 60)), "m"
-
-
-ERROR_PREFIX_RE = re.compile(r"^(?:读取 /usage 失败：)?(?:\w+(?:Error|Exception): )*")
-
-
-def stale_note(snapshot: QuotaSnapshot, now: float) -> str:
-    """Why a source shows old figures (its amber corner dot), for the panel."""
-    error = ERROR_PREFIX_RE.sub("", snapshot.error or "").strip()
-    if not error:
-        reason = "未能读取最新额度"
-    elif "Timeout" in (snapshot.error or "") or "秒内未" in error:
-        reason = "读取超时"
-    else:
-        reason = error if len(error) <= 24 else error[:23] + "…"
-    if not snapshot.updated_at:
-        return reason
-    moment = datetime.fromtimestamp(snapshot.updated_at)
-    when = moment.strftime("%H:%M" if moment.date() == datetime.fromtimestamp(now).date() else "%m-%d %H:%M")
-    return f"显示 {when} 的读数；{reason}"
-
-
-def usable_again_at(snapshot: QuotaSnapshot, now: float) -> float | None:
-    """When a used-up source can run again: the last reset among its empty
-    windows (all must recover), or the first pool to come back for model
-    pools. None while it still has quota or the time is unknown."""
-    if snapshot.pools and len(snapshot.pools) > 1:
-        known = [(p.get("remaining_percent"), p.get("resets_at")) for p in snapshot.pools if p.get("remaining_percent") is not None]
-        if not known or len(known) != len(snapshot.pools) or any(not quota_exhausted(value, snapshot.provider) for value, _ in known):
-            return None
-        stamps = [stamp for _, stamp in known if stamp and stamp > now]
-        return float(min(stamps)) if stamps else None
-    empty = [(value, stamp) for value, stamp in ((snapshot.remaining_percent, snapshot.resets_at),
-                                                  (snapshot.secondary_remaining_percent, snapshot.secondary_resets_at))
-             if quota_exhausted(value, snapshot.provider)]
-    if not empty or any(not stamp or stamp <= now for _, stamp in empty):
-        return None
-    return float(max(stamp for _, stamp in empty))
-
-
-def make_provider_icon(snapshot: QuotaSnapshot, letter: str, reset_hint: bool = False, now: float | None = None) -> Image.Image:
-    # Icons are cached in icon_art and shared: never draw on them afterwards.
-    now = now or time.time()
-    until = usable_again_at(snapshot, now)
-    if until is not None:
-        amount, unit = countdown_value(until - now)
-        return waiting_icon(amount, letter, bool(reset_hint), bool(snapshot.stale), unit)
-    values, colors = icon_windows(snapshot, letter)
-    return ring_icon(tuple(_rounded(value) for value in values), letter, bool(snapshot.stale),
-                     _rounded(pace_marker(snapshot)), bool(reset_hint), colors)
-
-
-def make_tps_icon(performance: dict, letter: str, reset_hint: bool = False) -> Image.Image:
-    return live_icon(_rounded(performance.get("display_tps", 0) or 0), letter, bool(reset_hint))
-
-
-def make_display_icon(snapshot: QuotaSnapshot, letter: str, performance: dict, reset_hint: bool = False) -> Image.Image:
-    provider = getattr(snapshot, "provider", None)
-    if provider in ("codex", "grok") and usable_again_at(snapshot, time.time()) is not None:
-        return make_provider_icon(snapshot, letter, reset_hint)
-    if provider == "gemini":
-        return make_provider_icon(snapshot, letter, reset_hint)
-    if performance.get("active_sessions", 0) and performance.get("display_tps") is not None:
-        return make_tps_icon(performance, letter, reset_hint)
-    return make_provider_icon(snapshot, letter, reset_hint)
 
 
 def has_panel(provider: str, snapshot: QuotaSnapshot | None) -> bool:
@@ -370,7 +242,8 @@ class QuotaTray:
         self.wake = threading.Event()
         self.history = QuotaHistory()
         self.scheduler = RefreshScheduler(PROVIDERS, time.time())
-        self.tps_monitor = TpsMonitor()
+        self.usage = UsageStore()
+        self.tps_monitor = TpsMonitor(store=self.usage)
         self.apply_preferences(load_preferences())
         self.performance = self.tps_monitor.snapshot(time.time())
         self.agents: list[dict] = []
@@ -488,10 +361,9 @@ class QuotaTray:
         text, _ = self.headline_forecast(provider)
         return f"预测：{text}" if text else ""
 
-    CHART_VIEW_MAX = 30 * 60         # The solid line is only the last 30 minutes.
+    CHART_VIEW_MAX = 5 * 3600        # The solid line: the live window, at most its last 5 hours.
     CHART_POINTS = 160
     CHART_RECENT_SECONDS = 30 * 60  # keep completed work visible long enough to inspect its trend
-    CHART_MIN_SPAN = 120.0          # only a lone fresh reading leaves the axis this narrow
 
     def quota_windows(self, provider: str) -> list[tuple]:
         """(label, remaining, resets_at, window minutes, history names) in the
@@ -612,20 +484,20 @@ class QuotaTray:
                 if key == "gemini" and snapshot.pools and len(snapshot.pools) > 1:
                     if snapshot.pools[slot].get("key") not in allowed:
                         continue  # do not infer an active model pool from old quota consumption
-                samples = max((forecast_module.current_window(self.history.samples(name), resets_at) for name in names), key=len)
+                recorded = max((self.history.samples(name) for name in names),
+                               key=lambda items: len(forecast_module.current_window(items, resets_at)))
+                samples = forecast_module.current_window(recorded, resets_at)
                 outlook = forecast_module.forecast(samples, now, remaining, resets_at)
                 rate = outlook.rate_per_hour
                 if key == "mimo":
                     view = mimo_tracker().view(now)
                     rate = view.pace_daily / view.total * 100 / 24 if view.pace_daily and view.total else rate
-                floor = max(resets_at - minutes * 60 if resets_at and minutes else 0, now - self.CHART_VIEW_MAX)
-                points = [(s.at, 100.0 - s.used) for s in samples if floor <= s.at <= now]
+                # The last hours across resets: the saved history before a reset
+                # (or a restart) stays on screen, stepping back up at the reset.
+                points, _steps = forecast_module.history_curve(recorded, now - self.CHART_VIEW_MAX, now, minutes)
                 updated = snapshot.updated_at
                 if not points or (updated and points[-1][0] + 1 < updated <= now):
                     points.append((float(min(now, updated or now)), float(remaining)))
-                if len(points) > self.CHART_POINTS:
-                    stride = len(points) / self.CHART_POINTS
-                    points = [points[int(i * stride)] for i in range(self.CHART_POINTS - 1)] + [points[-1]]
                 name = "Gemini" if key == "gemini" else provider_registry.get(key).label
                 chart_label = name if label == name else f"{name} · {label}"
                 if quota_mode:
@@ -637,17 +509,35 @@ class QuotaTray:
                 candidates.append((series, outlook))
         if not candidates:
             return None
-        series = tuple(item[0] for item in candidates)
-        # Start at the first measured reading: no blank stretch for time before
-        # anything was recorded. A far-away exhaustion remains in the forecast
-        # text instead of expanding this axis.
-        back = max(self.CHART_MIN_SPAN, now - min(s.points[0][0] for s in series))
-        start, end = now - back, now + 0.6 * back
-        near = [s.reset_at for s in series if s.reset_at and (s.reset_at <= end or s.reset_at - now <= 1.2 * back)]
-        if near:
-            end = max(now + 0.2 * back, max(near))          # a reset is near: show it
-        # Quantised "now": the cached chart is redrawn every 30 s, not every frame.
-        return agent_panel.BurnChart(float(start), float(end), float(round(now / 30) * 30), series)
+        # How far back: a close-up while quota drops fast, longer for slow use
+        # (agent_panel.burn_span). The forecast gets a fixed share to the right
+        # of now; a far exhaustion or reset stays in the text, not on the axis.
+        minutes = agent_panel.burn_span([series.points for series, _ in candidates], now, getattr(self, "burn_minutes", None))
+        self.burn_minutes = minutes
+        back = minutes * 60
+        # Quantised "now": the cached chart is redrawn every few seconds, not
+        # every frame: every 5 s in a 5-minute view, at most every 30 s.
+        step = max(5.0, min(30.0, back / 60))
+        shown = float(round(now / step) * step)
+        start, end = shown - back, shown + agent_panel.BURN_FUTURE * back
+        # Readings for at least the 30 minutes a close-up widens to while hovered.
+        keep = shown - max(back, agent_panel.BURN_DWELL_SPAN * 60)
+        series = tuple(self._fit_points(item[0], keep) for item in candidates)
+        return agent_panel.BurnChart(float(start), float(end), shown, series)
+
+    def _fit_points(self, series: "agent_panel.BurnSeries", start: float) -> "agent_panel.BurnSeries":
+        """Readings from just before the view on, thinned to CHART_POINTS
+        evenly over the view; reset steps and the latest reading stay."""
+        points = list(series.points)
+        before = [index for index, (t, _r) in enumerate(points) if t < start]
+        points = points[before[-1]:] if before else points
+        if len(points) > self.CHART_POINTS:
+            steps = {i for i in range(1, len(points)) if points[i][1] > points[i - 1][1] + 1}
+            steps |= {i - 1 for i in steps}
+            stride = len(points) / self.CHART_POINTS
+            keep = sorted(steps | {int(i * stride) for i in range(self.CHART_POINTS - 1 - len(steps))} | {len(points) - 1})
+            points = [points[i] for i in keep]
+        return dataclasses.replace(series, points=tuple(points))
 
     def hover_text(self, provider: str) -> str:
         snapshot = self.snapshots[provider]
@@ -862,25 +752,43 @@ class QuotaTray:
             return "更新时间：未知"
         return "更新时间：" + datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M:%S")
 
-    def open_details(self, provider: str) -> None:
+    def detail_sections(self, provider: str) -> list[tuple[str, list[str]]]:
+        """The quota details as (group title, "标题：内容" lines): one tile
+        each on the settings window's detail page, and the tray's 额度详情 box."""
         snapshot = self.snapshots[provider]
-        lines = [quota_line(snapshot)] + (pool_lines(snapshot) if snapshot.pools and len(snapshot.pools) > 1 else [])
+        quota = [quota_line(snapshot)] + (pool_lines(snapshot) if snapshot.pools and len(snapshot.pools) > 1 else [])
         for label, item in self.forecasts(provider):
-            lines.append(f"预测{f'（{label}）' if label else ''}：{item.text}")
-        lines += (["", self.performance_line(provider), self.output_rate_line(provider)] if provider != "gemini" else [])
-        lines += ["", self.menu_reset(provider), self.menu_countdown(provider)]
+            quota.append(f"预测{f'（{label}）' if label else ''}：{item.text}")
+        sections = [("额度", quota)]
+        if provider != "gemini":
+            sections.append(("速度", [*self.performance_line(provider).split("\n"), self.output_rate_line(provider)]))
+        resets = [self.menu_reset(provider), self.menu_countdown(provider)]
         if snapshot.secondary_resets_at:
-            lines.append(f"{window_label(snapshot.secondary_window_minutes)}重置：{reset_text(snapshot.secondary_resets_at)}")
-        lines += ["", self.menu_updated(provider)]
+            resets.append(f"{window_label(snapshot.secondary_window_minutes)}重置：{reset_text(snapshot.secondary_resets_at)}")
+        sections.append(("重置", resets))
+        usage = getattr(self, "usage", None)
+        if usage is not None:
+            samples = self.history.samples(provider) if self.history is not None else []
+            window = window_label(snapshot.window_minutes) if snapshot.window_minutes else ""
+            sections.append(("用量", usage_insights(usage, provider, time.time(), samples, f"{window}额度" if window else "")))
+        reads = [self.menu_updated(provider)]
         if self.scheduler:
-            lines.append(self.scheduler.describe(provider, time.time()))
+            reads.append("刷新计划：" + self.scheduler.describe(provider, time.time()))
         if snapshot.error:
-            lines.extend(("", "读取状态：" + snapshot.error))
+            reads.append("读取状态：" + snapshot.error)
+        sections.append(("读取", reads))
+        return sections
+
+    def open_details(self, provider: str) -> None:
+        text = "\n\n".join("\n".join(lines) for _title, lines in self.detail_sections(provider))
         threading.Thread(
             target=ctypes.windll.user32.MessageBoxW,
-            args=(None, "\n".join(lines), f"{snapshot.label} · 额度详情", 0),
+            args=(None, text, f"{self.snapshots[provider].label} · 额度详情", 0),
             daemon=True,
         ).start()
+
+    def preference(self, name: str, default=None):
+        return load_preferences().get(name, default)
 
     def performance_line(self, provider: str) -> str:
         data = self.performance["providers"][provider]
@@ -1082,10 +990,18 @@ class QuotaTray:
         """Live state for the refresh cadence: generating or a live agent of
         the source (active), and the pointer on its icon or panel (hover)."""
         moved = False
-        for provider, icon in (getattr(self, "icons", None) or {}).items():
+        icons = getattr(self, "icons", None) or {}
+        pointed = {provider for provider, icon in icons.items()
+                   if getattr(icon, "details_visible", False) or getattr(icon, "hover_open", False)}
+        if pointed:
+            # The panel charts every source in use, so those are being looked at too.
+            pointed |= set(self.active_sources(now))
+        for provider in pointed - quota_sources.WATCHED:
+            quota_sources.HOVER_STARTED[provider] = now          # a new look: its first read is a real check
+        quota_sources.WATCHED = frozenset(pointed)
+        for provider in icons:
             if provider in self.scheduler.providers:
-                pointed = bool(getattr(icon, "details_visible", False) or getattr(icon, "hover_open", False))
-                moved |= self.scheduler.hover(provider, pointed, now)
+                moved |= self.scheduler.hover(provider, provider in pointed, now)
         for provider in self.scheduler.providers:
             data = performance["providers"].get(provider)
             if data is None:
@@ -1598,6 +1514,8 @@ class QuotaTray:
     def exit_app(self, _icon=None, _item=None) -> None:
         self.stop_event.set()
         self.wake.set()
+        if getattr(self, "usage", None) is not None:
+            self.usage.save(force=True)
         if getattr(self, "settings_ui", None):
             self.settings_ui.close()
         for icon in self.icons.values():

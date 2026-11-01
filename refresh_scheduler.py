@@ -2,8 +2,9 @@
 
 Triggers, per provider:
 * startup / manual refresh / wake from sleep  -> now
-* the pointer rests on its icon or panel       -> now (if older than HOVER),
-                                                  then every HOVER seconds
+* the pointer comes to its icon or panel        -> now, every time (a read
+                                                  still running is followed by
+                                                  one more), then every HOVER s
 * a generation just finished                   -> after a short settle delay
 * an agent of this source works                -> every ACTIVE seconds
 * the reset time of any window passes          -> a few seconds after it
@@ -37,6 +38,7 @@ GIVE_UP = {spec.key: spec.give_up_seconds for spec in SPECS}
 RETRY = (30, 60, 120, 300)
 GIVE_UP_AFTER = 3            # consecutive failures before GIVE_UP applies
 DURATION_GAP = 2             # a read that took 20 s waits at least 40 s before the next
+HOVER_REPEAT = 3             # pointer out and back within this many seconds: the same look
 # Errors meaning "this account has no such quota": retrying cannot help.
 NO_PLAN_MARKERS = ("未找到订阅额度", "API Key 计费", "未找到 Claude Code", "未登录", "not logged in", "no subscription")
 
@@ -104,6 +106,8 @@ class RefreshScheduler:
         self.duration = {p: 0.0 for p in self.providers}     # how long the last read took
         self.dormant = {p: False for p in self.providers}     # no quota on this account
         self.running: set[str] = set()
+        self.started = {p: 0.0 for p in self.providers}       # when the running read began
+        self.again: set[str] = set()                           # hovered during a read: read once more
 
     def _gap(self, provider: str, interval: float) -> float:
         return max(interval, DURATION_GAP * self.duration[provider])
@@ -136,6 +140,7 @@ class RefreshScheduler:
             ready = [p for p in self.providers if p not in self.running and self.due[p] <= now]
             for provider in ready:
                 self.running.add(provider)
+                self.started[provider] = now
                 self.due[provider] = math.inf
             return ready
 
@@ -174,6 +179,9 @@ class RefreshScheduler:
             for reset in (getattr(snapshot, "resets_at", None), getattr(snapshot, "secondary_resets_at", None)):
                 if reset and reset > now:
                     self._forward(provider, reset + RESET_DELAY, "额度重置")
+            if provider in self.again:
+                self.again.discard(provider)
+                self._forward(provider, now, "悬停")
 
     def activity(self, provider: str, active: bool, finished: bool, now: float) -> bool:
         """Feed live generation state; returns True when a refresh moved earlier."""
@@ -193,14 +201,20 @@ class RefreshScheduler:
             return moved
 
     def hover(self, provider: str, on: bool, now: float) -> bool:
-        """Pointer on this source's icon or panel: read now unless the last read
-        is fresher than the hover interval. Returns True when a read moved earlier."""
+        """Pointer comes to this source's icon or panel: every hover reads now.
+        A read already under way that began before the pointer came is followed
+        by one more; one finished HOVER_REPEAT seconds ago counts as this look.
+        Returns True when a read moved earlier."""
         with self.lock:
             was = self.hovered.get(provider, False)
             self.hovered[provider] = on
             if not on or was or self.dormant[provider]:
                 return False
-            return self._forward(provider, max(now, self.last_done[provider] + self._gap(provider, HOVER[provider])), "悬停")
+            if provider in self.running:
+                if now - self.started[provider] >= HOVER_REPEAT:
+                    self.again.add(provider)
+                return False
+            return self._forward(provider, max(now, self.last_done[provider] + HOVER_REPEAT), "悬停")
 
     def next_wake(self, now: float) -> float:
         with self.lock:

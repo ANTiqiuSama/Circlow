@@ -220,7 +220,7 @@ class JsonlReader:
 
 
 class TpsMonitor:
-    def __init__(self, home: Path | None = None):
+    def __init__(self, home: Path | None = None, store: Any = None):
         self.home = home or Path.home()
         self.codex_root = self.home / ".codex" if home else Path(os.environ.get("CODEX_HOME", self.home / ".codex"))
         self.grok_root = self.home / ".grok" if home else Path(os.environ.get("GROK_HOME", self.home / ".grok"))
@@ -266,6 +266,18 @@ class TpsMonitor:
         self.codex_recurring: dict[str, float] = {}
         # herdr panes group one agent process's sessions; off for test homes.
         self.herdr = Herdr(enabled=False if home is not None else None)
+        # Output records saved before the last exit (usage_store). They start
+        # the day's history; re-read log tails skip them by identity, and they
+        # are not counted in added_total, so ledgers that already took them
+        # (MiMo) do not take them again.
+        self.store = store
+        if store is not None:
+            for observation in store.restore(self.started_at):
+                self.seen.add(observation.identity)
+                self.events.append(observation)
+                pair = (observation.provider, observation.source)
+                if self.source_seen.get(pair, 0.0) < observation.ended_at:
+                    self.source_seen[pair] = observation.ended_at
 
     def add(self, observation: Observation, now: float):
         if observation.identity in self.seen or not now - 86400 <= observation.ended_at <= now + 5:
@@ -275,6 +287,8 @@ class TpsMonitor:
         self.seen.add(observation.identity)
         self.events.append(observation)
         self.added_total += 1
+        if self.store is not None:
+            self.store.note(observation)
         pair = (observation.provider, observation.source)
         if self.source_seen.get(pair, 0.0) < observation.ended_at:
             self.source_seen[pair] = observation.ended_at
@@ -1080,6 +1094,8 @@ class TpsMonitor:
             self.health["Grok 原生速率"] = {"status": "暂不可读取"}
         while self.events and self.events[0].ended_at < now - 86400:
             self.seen.discard(self.events.popleft().identity)
+        if self.store is not None:
+            self.store.save(now)
         self.activity = {s: v for s, v in self.activity.items() if now - v[1] < (3 if v[2] == "刚完成生成" else 600)}
         return self.snapshot(now)
 

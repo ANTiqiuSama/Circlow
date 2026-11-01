@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 HISTORY_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray" / "history.json"
 KEEP_SECONDS = 8 * 86400        # Longer than the longest (weekly) window.
-KEEP_SAMPLES = 400              # Per window key.
+KEEP_SAMPLES = 2000             # Per window key; repeated readings are folded (see add), so this spans the week.
 LOOKBACK_SECONDS = 3 * 3600     # Recent pace matters more than the whole window.
 MIN_SPAN_SECONDS = 10 * 60      # Do not extrapolate from a few seconds.
 RESET_TOLERANCE = 180           # Reset timestamps jitter a little between reads.
@@ -84,6 +84,40 @@ def current_window(samples: Iterable[Sample], resets_at: int | None) -> list[Sam
             window = []  # Usage dropped: a reset happened inside the series.
         window.append(sample)
     return window
+
+
+def history_curve(samples: Iterable[Sample], floor: float, now: float,
+                  minutes: int | None = None) -> tuple[list[tuple[float, float]], set[int]]:
+    """Remaining-% points from `floor` to `now` across windows, and the
+    indices of the reset steps (to keep when thinning). An earlier window runs
+    to its reset, where the line steps back up to 100%; a window of known
+    length also starts at 100% from the moment it began."""
+    ordered = sorted((s for s in samples if floor <= s.at <= now), key=lambda s: s.at)
+    segments: list[list[Sample]] = []
+    for sample in ordered:
+        last = segments[-1][-1] if segments else None
+        if last is None or not same_window(last.resets_at, sample.resets_at) or sample.used < last.used - 1.0:
+            segments.append([sample])
+        else:
+            segments[-1].append(sample)
+    points: list[tuple[float, float]] = []
+    steps: set[int] = set()
+    for index, segment in enumerate(segments):
+        first = segment[0]
+        after = floor
+        if index:
+            last = segments[index - 1][-1]
+            after = last.at
+            if last.resets_at and last.at <= last.resets_at <= first.at:
+                steps.update((len(points), len(points) + 1))
+                points += [(float(last.resets_at), 100.0 - last.used), (float(last.resets_at), 100.0)]
+                after = last.resets_at
+        begun = first.resets_at - minutes * 60 if first.resets_at and minutes else None
+        if begun and after < begun < first.at:
+            steps.add(len(points))
+            points.append((float(begun), 100.0))    # a window starts unused: draw from there
+        points += [(s.at, 100.0 - s.used) for s in segment]
+    return points, steps
 
 
 def slope_per_hour(samples: list[Sample]) -> float:
@@ -159,8 +193,16 @@ class QuotaHistory:
             series = self.series.setdefault(name, [])
             if series and abs(series[-1].at - at) < 1:
                 return False  # Same reading (e.g. stale value carried forward).
-            series.append(Sample(float(at), float(used), resets_at))
-            series.sort(key=lambda s: s.at)
+            sample = Sample(float(at), float(used), resets_at)
+            if len(series) >= 2 and series[-1].at < at and all(
+                    s.used == sample.used and same_window(s.resets_at, resets_at) for s in series[-2:]):
+                # A run of equal readings keeps its first and latest only: hovering
+                # reads every few seconds, and those repeats used to push the
+                # older curve out of the kept samples.
+                series[-1] = sample
+            else:
+                series.append(sample)
+                series.sort(key=lambda s: s.at)
             cutoff = at - KEEP_SECONDS
             self.series[name] = [s for s in series if s.at >= cutoff][-KEEP_SAMPLES:]
         return True

@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -121,40 +122,48 @@ def _session_args() -> list[str]:
     return ["--session", session] if session else []
 
 
-def client_open(processes=None) -> bool:
-    """A Herdr window (the TUI client, `herdr` with no command) is running."""
+HERDR_NAMES = {"herdr.exe", "herdr"}      # Windows, macOS / Linux
+
+
+def _clients(processes=None) -> list:
+    """Herdr windows: TUI clients, `herdr` with no command (for this session)."""
     import psutil
     wanted = _session_args()
+    found = []
     for process in processes if processes is not None else psutil.process_iter(["name", "cmdline"]):
         try:
             info = process.info
-            if (info.get("name") or "").lower() != "herdr.exe":
+            if (info.get("name") or "").lower() not in HERDR_NAMES:
                 continue
             args = list(info.get("cmdline") or [])[1:]
         except (KeyError, AttributeError, TypeError):
             continue
         if args == wanted or (not wanted and not args):
-            return True
-    return False
+            found.append(process)
+    return found
+
+
+def client_open(processes=None) -> bool:
+    """A Herdr window (the TUI client, `herdr` with no command) is running."""
+    return bool(_clients(processes))
+
+
+def _hosts(processes=None) -> list:
+    """Each client and its ancestors, nearest first: the terminal hosting it."""
+    import psutil
+    hosts = []
+    for process in _clients(processes):
+        try:
+            hosts += [process] + list(process.parents())
+        except (AttributeError, psutil.Error):
+            continue
+    return hosts
 
 
 def client_window(processes=None, windows=None) -> int | None:
     """The terminal window hosting a Herdr client: a visible, titled top-level
     window owned by the client or one of its ancestors (Windows Terminal)."""
-    import psutil
-    wanted = _session_args()
-    hosts: list[int] = []
-    for process in processes if processes is not None else psutil.process_iter(["name", "cmdline"]):
-        try:
-            info = process.info
-            if (info.get("name") or "").lower() != "herdr.exe":
-                continue
-            args = list(info.get("cmdline") or [])[1:]
-            if not (args == wanted or (not wanted and not args)):
-                continue
-            hosts += [process.pid] + [parent.pid for parent in process.parents()]
-        except (KeyError, AttributeError, TypeError, psutil.Error):
-            continue
+    hosts = [process.pid for process in _hosts(processes)]
     if not hosts:
         return None
     rows = windows if windows is not None else _top_windows()
@@ -188,10 +197,29 @@ def _top_windows() -> list[tuple[int, int, bool, str]]:
     return rows
 
 
-def raise_client() -> bool:
+def client_app(processes=None) -> str | None:
+    """macOS: the .app bundle of the terminal hosting a Herdr client."""
+    import psutil
+    for process in _hosts(processes):
+        try:
+            path = process.exe()
+        except (AttributeError, psutil.Error):
+            continue
+        marker = path.find(".app/Contents/MacOS/")
+        if marker > 0:
+            return path[:marker + len(".app")]
+    return None
+
+
+def raise_client(popen=subprocess.Popen) -> bool:
     """Restore a minimised Herdr window and bring it to the front. Call it
     from the tray click itself: Windows lets the clicked app take the
     foreground only until the next input."""
+    if sys.platform == "darwin":
+        bundle = client_app()
+        if bundle:
+            popen(["open", bundle], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return bool(bundle)
     hwnd = client_window()
     if hwnd is None or os.name != "nt":
         return False
@@ -214,10 +242,22 @@ def raise_client() -> bool:
             user32.AttachThreadInput(ours, theirs, False)
 
 
+def terminal_script(command: list[str]) -> list[str]:
+    """macOS: osascript arguments that run `command` in a new Terminal window, in front."""
+    import shlex
+    line = shlex.join(command).replace("\\", "\\\\").replace('"', '\\"')
+    return ["osascript", "-e", f'tell application "Terminal" to do script "{line}"',
+            "-e", 'tell application "Terminal" to activate']
+
+
 def open_window(exe: str, popen=subprocess.Popen) -> None:
-    """A new terminal window showing Herdr (Windows Terminal when available)."""
+    """A new terminal window showing Herdr (Windows Terminal when available,
+    Terminal on macOS)."""
     command = [exe] + _session_args()
     home = str(Path.home())
+    if sys.platform == "darwin":
+        popen(terminal_script(command), cwd=home, close_fds=True)
+        return
     terminal = shutil.which("wt") if os.name == "nt" else None
     if terminal:
         popen([terminal, "-w", "new", "-d", home, "--title", "herdr", *command], cwd=home, close_fds=True)

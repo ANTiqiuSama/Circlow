@@ -138,23 +138,29 @@ class SchedulerTests(unittest.TestCase):
                 self.assertLess(ACTIVE[provider], IDLE[provider])
         self.assertEqual(max(IDLE, key=IDLE.get), "grok")        # its reader opens a whole CLI session
 
-    def test_hover_reads_now_then_at_the_hover_interval(self):
+    def test_every_hover_reads_now_then_at_the_hover_interval(self):
+        from refresh_scheduler import HOVER_REPEAT
         scheduler = RefreshScheduler(("codex",), 0)
         scheduler.take_due(0)
         scheduler.completed("codex", self.snapshot(), 100)
         self.assertEqual(scheduler.due["codex"], 100 + IDLE["codex"])
-        self.assertTrue(scheduler.hover("codex", True, 100 + HOVER["codex"] / 2))    # just read: not again at once,
-        self.assertEqual(scheduler.due["codex"], 100 + HOVER["codex"])                # but one hover interval later
-        scheduler.take_due(110)
-        scheduler.hover("codex", False, 111)
-        scheduler.completed("codex", self.snapshot(), 112)          # pointer gone: back to the idle cadence
-        self.assertEqual(scheduler.due["codex"], 112 + IDLE["codex"])
-        back = 112 + IDLE["codex"] // 2
-        self.assertTrue(scheduler.hover("codex", True, back))       # older than the hover interval: now
-        self.assertEqual((scheduler.due["codex"], scheduler.reason["codex"]), (back, "悬停"))
-        scheduler.take_due(back)
-        scheduler.completed("codex", self.snapshot(), back + 2)
-        self.assertEqual(scheduler.due["codex"], back + 2 + HOVER["codex"])
+        self.assertTrue(scheduler.hover("codex", True, 104))        # read 4 s ago, but a new hover: read now
+        self.assertEqual((scheduler.due["codex"], scheduler.reason["codex"]), (104, "悬停"))
+        scheduler.take_due(104)
+        scheduler.completed("codex", self.snapshot(), 105)
+        self.assertEqual(scheduler.due["codex"], 105 + HOVER["codex"])       # then the hover cadence
+        scheduler.hover("codex", False, 106)
+        self.assertTrue(scheduler.hover("codex", True, 106.5))     # out and back at once: the same look,
+        self.assertEqual(scheduler.due["codex"], 105 + HOVER_REPEAT)        # read again only after a moment
+        scheduler.take_due(108)
+        scheduler.hover("codex", False, 109)
+        self.assertFalse(scheduler.hover("codex", True, 112))      # comes back while that read runs
+        scheduler.completed("codex", self.snapshot(), 113)
+        self.assertEqual((scheduler.due["codex"], scheduler.reason["codex"]), (113, "悬停"))   # one more after it
+        scheduler.take_due(113)
+        scheduler.hover("codex", False, 114)
+        scheduler.completed("codex", self.snapshot(), 115)          # pointer gone: back to the idle cadence
+        self.assertEqual(scheduler.due["codex"], 115 + IDLE["codex"])
         scheduler.hover("codex", False, 503)
         scheduler.activity("codex", True, False, 503)
         scheduler.take_due(scheduler.due["codex"])

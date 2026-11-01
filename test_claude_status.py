@@ -114,6 +114,34 @@ class ClaudeStatusTests(unittest.TestCase):
         self.assertEqual((first.remaining_percent, first.secondary_remaining_percent, first.stale), (96, 58, False))
         self.assertIs(second, first)
 
+    def test_hovering_checks_an_older_status_line_against_usage(self):
+        now = time.time()
+        report = {'updated_at': now, 'observed_at': now - 120, 'rate_limits': {   # 2 min old: "fresh" unhovered
+            'five_hour': {'used_percentage': 20, 'resets_at': int(now + 1000)},
+            'seven_day': {'used_percentage': 30, 'resets_at': int(now + 10000)}}}
+        usage = {'window_minutes': 300, 'used_percent': 26, 'remaining_percent': 74, 'resets_at': int(now + 1000),
+                 'secondary_window_minutes': 10080, 'secondary_used_percent': 31,
+                 'secondary_remaining_percent': 69, 'secondary_resets_at': int(now + 10000)}
+        quota_sources._CLAUDE_PROBE.clear()
+        with patch.object(claude_status, 'latest', return_value=report), \
+                patch.object(quota_sources.providers, 'find_claude', return_value=Path('claude.exe')), \
+                patch.object(quota_sources.cli_quota, 'read_usage', return_value=usage) as cli:
+            self.assertEqual(quota_sources.get_claude_quota().remaining_percent, 80)     # not looked at: status line
+            cli.assert_not_called()
+            with patch.object(quota_sources, 'WATCHED', frozenset({'claude'})):
+                looked = quota_sources.get_claude_quota()
+                again = quota_sources.get_claude_quota()
+                quota_sources._CLAUDE_PROBE['at'] -= quota_sources.CLAUDE_HOVER_PROBE_GAP_SECONDS
+                quota_sources.get_claude_quota()
+                quota_sources._CLAUDE_PROBE['at'] -= 5                      # checked 5 s ago, inside the gap...
+                with patch.dict(quota_sources.HOVER_STARTED, {'claude': time.time() - 1}):
+                    quota_sources.get_claude_quota()                        # ...but a new hover checks at once
+                    quota_sources.get_claude_quota()                        # its later reads reuse that
+        self.assertEqual((looked.remaining_percent, looked.secondary_remaining_percent), (74, 69))   # Desktop use shows
+        self.assertIs(again, looked)                                        # one /usage session per hover gap
+        self.assertEqual(cli.call_count, 3)
+        quota_sources._CLAUDE_PROBE.clear()
+
     def test_failed_usage_read_keeps_last_native_numbers_marked_stale(self):
         now = time.time()
         with patch.object(claude_status, 'latest', return_value=self.stale_report(now)),                 patch.object(quota_sources.providers, 'find_claude', return_value=Path('claude.exe')),                 patch.object(quota_sources.cli_quota, 'read_usage', side_effect=RuntimeError('exited')):

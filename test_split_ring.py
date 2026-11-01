@@ -16,6 +16,7 @@ import agent_panel
 import icon_art
 import quota_sources
 import tray_app
+import tray_icons
 from quota_sources import QuotaSnapshot
 
 
@@ -84,7 +85,7 @@ class SplitRingTests(unittest.TestCase):
         self.assertEqual(tray_app.usable_again_at(snapshot(reset=now+3601),now), now+3601)
         self.assertEqual(tray_app.usable_again_at(snapshot(remaining=0,second=0,reset=now+3600,second_reset=now+432000),now),now+432000)
         self.assertIsNone(tray_app.usable_again_at(snapshot(remaining=0,second=0,reset=now+3600,second_reset=None),now))
-        with patch.object(tray_app, 'waiting_icon', return_value='waiting') as icon:
+        with patch.object(tray_icons, 'waiting_icon', return_value='waiting') as icon:
             self.assertEqual(tray_app.make_provider_icon(snapshot(reset=now+3601),'C',now=now),'waiting')
             icon.assert_called_once_with(2,'C',False,False,'h')
 
@@ -99,7 +100,7 @@ class SplitRingTests(unittest.TestCase):
         for remaining in (0, 1, 5):
             value = snapshot('claude', remaining=remaining, reset=now+3601)
             self.assertEqual(tray_app.usable_again_at(value, now), now+3601)
-            with patch.object(tray_app, 'waiting_icon', return_value='waiting') as icon:
+            with patch.object(tray_icons, 'waiting_icon', return_value='waiting') as icon:
                 self.assertEqual(tray_app.make_provider_icon(value, 'A', now=now), 'waiting')
                 icon.assert_called_once_with(2, 'A', False, False, 'h')
             self.assertEqual(value.remaining_percent, remaining)
@@ -113,23 +114,23 @@ class SplitRingTests(unittest.TestCase):
                     value = snapshot(provider, primary, secondary, now+7200, now+10800)
                     expected = now+7200 if primary == 10 else now+10800
                     self.assertEqual(tray_app.usable_again_at(value, now), expected)
-                    with patch.object(tray_app, 'make_provider_icon', return_value='countdown'):
+                    with patch.object(tray_icons, 'make_provider_icon', return_value='countdown'):
                         self.assertEqual(tray_app.make_display_icon(value, 'C', {'active_sessions':1, 'display_tps':25}), 'countdown')
             self.assertIsNone(tray_app.usable_again_at(snapshot(provider, 10.01, 60, now+7200), now))
 
     def test_gemini_icon_never_switches_to_tps(self):
         value = snapshot('gemini', 40, None)
-        with patch.object(tray_app, 'make_provider_icon', return_value='quota'):
+        with patch.object(tray_icons, 'make_provider_icon', return_value='quota'):
             self.assertEqual(tray_app.make_display_icon(value, 'G', {'active_sessions':1, 'display_tps':25}), 'quota')
 
     def test_stale_countdown_and_live_tps_priority(self):
         now = time.time()
         value = snapshot('claude', remaining=1, reset=now+3601)
         value.stale = True
-        with patch.object(tray_app, 'waiting_icon', return_value='waiting') as icon:
+        with patch.object(tray_icons, 'waiting_icon', return_value='waiting') as icon:
             self.assertEqual(tray_app.make_provider_icon(value, 'A', now=now), 'waiting')
             icon.assert_called_once_with(2, 'A', False, True, 'h')
-        with patch.object(tray_app, 'make_tps_icon', return_value='live'):
+        with patch.object(tray_icons, 'make_tps_icon', return_value='live'):
             self.assertEqual(tray_app.make_display_icon(value, 'A', {'active_sessions':1, 'display_tps':12}), 'live')
         self.assertEqual(icon_art.waiting_icon(2, 'A', stale=True, unit='h').tobytes(),
                          icon_art.waiting_icon(2, 'A', stale=False, unit='h').tobytes())
