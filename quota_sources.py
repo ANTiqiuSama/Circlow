@@ -416,6 +416,18 @@ def _reader(provider: str):
 
 def keep_last_good(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaSnapshot:
     """Keep stale figures on failure, except Gemini whose CLI account may have changed."""
+    if snapshot.provider == "claude" and old and not snapshot.error:
+        # Claude statusLine observations can come from another session whose
+        # held account figures suddenly look much less used. In the same
+        # reset window, accept a real recovery to >=95% remaining; a jump
+        # only to 70% is an anomalous reading, not a confirmed reset.
+        windows = ((old.used_percent, snapshot.used_percent, old.resets_at, snapshot.resets_at),
+                   (old.secondary_used_percent, snapshot.secondary_used_percent,
+                    old.secondary_resets_at, snapshot.secondary_resets_at))
+        if any(before is not None and after is not None and old_reset is not None and new_reset is not None
+               and abs(old_reset - new_reset) <= 180 and before - after >= 5 and after > 5
+               for before, after, old_reset, new_reset in windows):
+            snapshot.error = "同一重置窗口的 Claude 额度读数异常回升，等待新的有效读数"
     if snapshot.provider == "gemini" and snapshot.error:
         # CLI logins can change between reads. Without an account identifier
         # in /usage, carrying old quota across a failed read is misleading.

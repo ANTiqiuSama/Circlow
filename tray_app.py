@@ -202,6 +202,8 @@ def reset_changes(old: QuotaSnapshot | None, new: QuotaSnapshot | None, now: flo
              old.secondary_resets_at, new.secondary_resets_at)):
         if before is None or after is None or after - before < RESET_NOTIFY_MIN_GAIN:
             continue
+        if new.provider == "claude" and after < 95:
+            continue
         moved = old_reset is None or new_reset is None or abs(new_reset - old_reset) > 60
         if not moved and after < 95:
             continue
@@ -1303,8 +1305,14 @@ class QuotaTray:
         import claude_status
         record = claude_status.latest(now)
         old = self.snapshots.get("claude")
-        if record and old is not None and record.get("observed_at", record["updated_at"]) > (old.updated_at or 0):
-            fresh = get_claude_quota()
+        seen = record.get("observed_at", record["updated_at"]) if record else 0
+        if record and old is not None and seen > max(old.updated_at or 0, getattr(self, "claude_rejected_seen", 0)):
+            fresh = quota_sources.keep_last_good(get_claude_quota(), old)
+            if fresh.error:
+                self.claude_rejected_seen = seen
+                self.snapshots["claude"] = fresh
+                log.info("claude local quota read held: %s", fresh.error)
+                return
             self.announce_resets("claude", old, fresh, now)
             self.snapshots["claude"] = fresh
             if self.history is not None and self.history.record(fresh):

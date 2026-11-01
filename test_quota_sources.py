@@ -135,6 +135,27 @@ class GrokIsolationTests(unittest.TestCase):
 
 
 class QuotaTests(unittest.TestCase):
+    def test_claude_same_window_drop_is_held_as_stale_not_a_reset(self):
+        now = time.time()
+        reset, week = int(now + 3600), int(now + 7200)
+        old = quota_sources.QuotaSnapshot("claude", "Claude Code", 300, 80, 20, reset, now - 60, False, None,
+                                           10080, 83, 17, week)
+        false = quota_sources.QuotaSnapshot("claude", "Claude Code", 300, 30, 70, reset, now, False, None,
+                                             10080, 71, 29, week)
+        held = quota_sources.keep_last_good(false, old)
+        self.assertEqual((held.remaining_percent, held.secondary_remaining_percent), (20, 17))
+        self.assertTrue(held.stale)
+        self.assertIn("异常回升", held.error)
+        recovered = quota_sources.QuotaSnapshot("claude", "Claude Code", 300, 81, 19, reset, now + 60, False, None,
+                                                 10080, 84, 16, week)
+        self.assertIs(quota_sources.keep_last_good(recovered, old), recovered)
+        full_same_reset = quota_sources.QuotaSnapshot("claude", "Claude Code", 300, 3, 97, reset, now + 60,
+                                                       False, None, 10080, 84, 16, week)
+        self.assertIs(quota_sources.keep_last_good(full_same_reset, old), full_same_reset)
+        changed_reset = quota_sources.QuotaSnapshot("claude", "Claude Code", 300, 0, 100, reset + 5 * 3600, now + 60,
+                                                     False, None, 10080, 84, 16, week)
+        self.assertIs(quota_sources.keep_last_good(changed_reset, old), changed_reset)
+
     def test_gemini_refresh_replaces_old_argon_pools_and_failure_does_not_reuse_them(self):
         def read(groups):
             parsed = parse_agy_usage_json({"command": {"data": {"groups": groups}}})

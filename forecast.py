@@ -23,6 +23,7 @@ FAST_MIN_SPAN_SECONDS = 60
 FAST_MIN_SPEND = 3.0             # percentage points, across at least three readings
 FAST_MAX_AGE_SECONDS = 120
 LOW_SPARE_PERCENT = 5.0
+CLAUDE_DROP_TOLERANCE = 5.0   # same reset: reject partial recovery, retain >=95% full resets
 RESET_TOLERANCE = 180           # Reset timestamps jitter a little between reads.
 IDLE_RATE = 0.05                # %/hour treated as "no measurable use".
 
@@ -188,9 +189,23 @@ class QuotaHistory:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             for name, items in payload.get("series", {}).items():
-                self.series[name] = [Sample(float(i[0]), float(i[1]), None if i[2] is None else int(i[2])) for i in items]
+                readings = [Sample(float(i[0]), float(i[1]), None if i[2] is None else int(i[2])) for i in items]
+                self.series[name] = self._without_false_claude_recoveries(name, readings)
         except (OSError, ValueError, TypeError, KeyError, IndexError):
             self.series = {}
+
+    @staticmethod
+    def _without_false_claude_recoveries(name: str, readings: list[Sample]) -> list[Sample]:
+        """Repair old saved spikes without erasing real new reset windows."""
+        if name not in ("claude", "claude:secondary"):
+            return readings
+        clean: list[Sample] = []
+        for item in sorted(readings, key=lambda row: row.at):
+            if clean and same_window(clean[-1].resets_at, item.resets_at) and \
+                    clean[-1].used - item.used >= CLAUDE_DROP_TOLERANCE and item.used > 5:
+                continue
+            clean.append(item)
+        return clean
 
     def save(self) -> None:
         with self.lock:
@@ -211,6 +226,10 @@ class QuotaHistory:
             if series and abs(series[-1].at - at) < 1:
                 return False  # Same reading (e.g. stale value carried forward).
             sample = Sample(float(at), float(used), resets_at)
+            if name in ("claude", "claude:secondary") and series and \
+                    same_window(series[-1].resets_at, resets_at) and \
+                    series[-1].used - sample.used >= CLAUDE_DROP_TOLERANCE and sample.used > 5:
+                return False
             if len(series) >= 2 and series[-1].at < at and all(
                     s.used == sample.used and same_window(s.resets_at, resets_at) for s in series[-2:]):
                 # A run of equal readings keeps its first and latest only: hovering

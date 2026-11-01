@@ -122,6 +122,23 @@ class ForecastTests(unittest.TestCase):
             self.assertEqual(loaded.samples("codex"), [Sample(1_000_000, 20, 2_000_000)])
             self.assertEqual(loaded.samples("codex:secondary"), [Sample(1_000_000, 30, 2_500_000)])
 
+    def test_claude_history_repairs_false_peak_with_unchanged_reset(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "history.json"
+            reset = 2_000_000
+            path.write_text('{"series":{"claude":[[1000,80,2000000],[1060,30,2000000],'
+                            '[1120,30,2000000],[1180,81,2000000],[1240,0,2018000]]}}', encoding="utf-8")
+            history = QuotaHistory(path)
+            self.assertEqual([row.used for row in history.samples("claude")], [80, 81, 0])
+            fresh = QuotaHistory(Path(folder) / "fresh.json")
+            fresh.add("claude", 1000, 80, reset)
+            fresh.add("claude:secondary", 1000, 83, reset)
+            self.assertFalse(fresh.add("claude", 1060, 30, reset))
+            self.assertFalse(fresh.add("claude:secondary", 1060, 71, reset))
+            self.assertEqual([row.used for row in fresh.samples("claude")], [80])
+            self.assertEqual([row.used for row in fresh.samples("claude:secondary")], [83])
+            self.assertTrue(fresh.add("claude", 1120, 4, reset))  # a real >=95% recovery is retained
+
 
 class SchedulerTests(unittest.TestCase):
     def snapshot(self, error=None, resets_at=None, secondary=None):
