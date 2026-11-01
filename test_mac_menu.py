@@ -43,6 +43,10 @@ class MacMenuTests(unittest.TestCase):
         self.assertIn("Gemini", model["quota"][0])
         self.assertIn("Claude/GPT", model["quota"][1])
         self.assertNotIn("Argon", " ".join(model["quota"]))
+        active = mac_menu.menu_model("gemini", snap, {"active_sessions": 1, "display_tps": 72.5}, "空闲", now=1000)
+        self.assertEqual(active["speed"], "")
+        self.assertFalse(active["live"])
+        self.assertIsNone(active["tps"])
 
     def test_mimo_today_credit_line_and_old_data(self):
         snap = self.snapshot(provider="mimo", label="Xiaomi MiMo", window_minutes=525600,

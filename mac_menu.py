@@ -102,8 +102,9 @@ def menu_model(provider: str, snapshot: QuotaSnapshot, performance: dict, refres
     quota = quota_rows(snapshot, now)
     tps = performance.get("display_tps")
     active = bool(performance.get("active_sessions", 0))
-    speed = (f"生成 TPS {float(tps):.1f}" if active and tps is not None
-             else f"最近 TPS {float(tps):.1f}" if tps is not None else "TPS 暂无样本")
+    speed = ("" if provider == "gemini" else
+             f"生成 TPS {float(tps):.1f}" if active and tps is not None else
+             f"最近 TPS {float(tps):.1f}" if tps is not None else "TPS 暂无样本")
     updated = (datetime.fromtimestamp(snapshot.updated_at).astimezone().strftime("%m-%d %H:%M")
                if snapshot.updated_at else "尚未读取")
     summary = f"{snapshot.label} · " + (f"剩余 {snapshot.display_remaining:.0f}%" if snapshot.display_remaining is not None else "额度未知")
@@ -117,7 +118,8 @@ def menu_model(provider: str, snapshot: QuotaSnapshot, performance: dict, refres
             quota.append(f"今日用量 {mimo_usage.credits_text(snapshot.today_used)}")
     return {"summary": summary, "quota": quota, "speed": speed,
             "updated": f"更新 {updated} · {refresh}", "error": error,
-            "live": active and tps is not None, "tps": tps}
+            "live": provider != "gemini" and active and tps is not None,
+            "tps": None if provider == "gemini" else tps}
 
 
 def status_image(snapshot: QuotaSnapshot, letter: str, performance: dict):
@@ -346,7 +348,7 @@ def run_mac() -> int:
                 native.setSize_((20, 20))
                 button = self.items[key].button()
                 button.setImage_(native)
-                button.setToolTip_(model["summary"] + "\n" + model["speed"])
+                button.setToolTip_("\n".join(part for part in (model["summary"], model["speed"]) if part))
                 rows = model["quota"][:3]
                 for name, value in (("summary", model["summary"]), ("speed", model["speed"]),
                                     ("updated", model["updated"]), ("error", model["error"])):
@@ -398,10 +400,32 @@ def run_mac() -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--smoke-menu":
+        return smoke_menu()
     if len(sys.argv) == 4 and sys.argv[1] in ("--grok-quota-worker", "--claude-quota-worker"):
         import cli_quota
         return cli_quota.worker(sys.argv[2], sys.argv[3], "grok" if sys.argv[1] == "--grok-quota-worker" else "claude")
     return run_mac()
+
+
+def smoke_menu() -> int:
+    """Exercise the packaged AppKit status item without starting quota readers."""
+    if sys.platform != "darwin":
+        raise RuntimeError("macOS 菜单栏检查只能在 macOS 运行")
+    from Cocoa import NSApplication, NSApplicationActivationPolicyAccessory, NSMenu, NSStatusBar, NSVariableStatusItemLength
+
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    bar = NSStatusBar.systemStatusBar()
+    item = bar.statusItemWithLength_(NSVariableStatusItemLength)
+    try:
+        menu = NSMenu.alloc().initWithTitle_("CodexQuotaTray smoke")
+        item.setMenu_(menu)
+        assert item.button() is not None and str(item.menu().title()) == "CodexQuotaTray smoke"
+    finally:
+        bar.removeStatusItem_(item)
+    print("macOS menu bar AppKit smoke passed")
+    return 0
 
 
 if __name__ == "__main__":

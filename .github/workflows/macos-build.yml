@@ -83,6 +83,7 @@ jobs:
         run: |
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' dist-macos/CodexQuotaTray.app/Contents/Info.plist)" = true
           file dist-macos/CodexQuotaTray.app/Contents/MacOS/CodexQuotaTray
+          dist-macos/CodexQuotaTray.app/Contents/MacOS/CodexQuotaTray --smoke-menu
       - name: Package app
         run: ditto -c -k --sequesterRsrc --keepParent dist-macos/CodexQuotaTray.app "CodexQuotaTray-macos-${{ matrix.arch }}.zip"
       - uses: actions/upload-artifact@v4
