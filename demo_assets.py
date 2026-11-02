@@ -19,10 +19,13 @@ def demo_models() -> tuple[ap.PanelModel, ...]:
          bubble("b", "补齐测试", "运行测试", "C", True),
          bubble("d", "README 文档", "刚完成", "G", False)),
         "paid", "Codex 重置 22%",
-        "5 小时额度已用完，正在用购买的额度；2小时13分钟后恢复", "warn", quota_tones=("paid", ""))
-    idle = ap.PanelModel("grok", "X", "Grok", "空闲", (("2 小时", 100.0, "已到重置时间"),), None, (), "idle")
+        "5 小时额度已用完，正在用购买的额度；2小时13分钟后恢复", "warn", quota_tones=("paid", ""),
+        hint_now="Codex：重构悬停面板；另有 1 个 agent 在工作", hint_next="可先检查测试结果，再决定是否发布")
+    idle = ap.PanelModel("grok", "X", "Grok", "空闲", (("2 小时", 100.0, "已到重置时间"),), None, (), "idle",
+                         hint_now="当前未检测到生成中的 agent", hint_next="可准备下一项任务，或查看刚完成的结果")
     mimo = ap.PanelModel("mimo", "M", "Xiaomi MiMo", "空闲", (("套餐额度", 96.9, ""),), 0, (), "idle",
-                         forecast="按近期速度可用到到期，预计剩余 82%", forecast_tone="ok", today_used=1.53e9)
+                         forecast="按近期速度可用到到期，预计剩余 82%", forecast_tone="ok", today_used=1.53e9,
+                         hint_now="正在核对本机任务状态", hint_next="可整理下一步的验收项")
     return busy, idle, mimo
 
 
