@@ -118,6 +118,8 @@ class PanelModel:
     quota_tones: tuple[str, ...] = ()            # per column: "" | "active" (pool in use) | "paid" | "blocked"
     quota_figures: tuple = ()                    # per column: (number, unit) shown instead of the %, e.g. Codex credits
     column_iq: tuple = ()                       # spare header slot, Grok only: (label, figure, caption, unit)
+    hint_now: str = ""                          # MiMo or local summary of current agent work
+    hint_next: str = ""                         # one optional next action
 
     def figure_of(self, slot: int) -> tuple[str, str] | None:
         return self.quota_figures[slot] if slot < len(self.quota_figures) else None
@@ -143,6 +145,7 @@ CHART = 80 + CHART_AXIS     # Burn chart under the task field.
 CHART_TOP = 16              # Field bottom to chart sprite; the two plates keep an 8 px gap.
 CHART_H = 64 + CHART_AXIS   # Chart sprite: label row, plot and clock row.
 CHART_LABEL = 15            # Label row inside the sprite.
+HINT_H = 42                 # Two compact lines between chart and forecast.
 GEAR_RADIUS = 7.5
 GEAR_HIT = 17.0
 
@@ -178,7 +181,7 @@ def chart_extra_for(model: PanelModel) -> float:
 
 
 def footer_middle(model, field_h: float) -> float:
-    return field_top(model) + field_h + CHART + chart_extra_for(model) + 24
+    return field_top(model) + field_h + CHART + chart_extra_for(model) + HINT_H + 24
 
 
 def gear_center(model, field_h: float) -> tuple[float, float]:
@@ -235,7 +238,7 @@ def field_height(bubbles) -> float:
 
 
 def panel_height(model: PanelModel, field: float) -> float:
-    return field_top(model) + field + CHART + chart_extra_for(model) + FOOTER + 8
+    return field_top(model) + field + CHART + chart_extra_for(model) + HINT_H + FOOTER + 8
 
 
 # ----- motion helpers ------------------------------------------------------------
@@ -649,6 +652,7 @@ class Scene:
 
         self._header(frame, model, field_h, scale, at)
         self._chart(frame, model, field_h, scale, at)
+        self._hint(frame, model, field_h, scale, at)
         if not model.bubbles:
             blit(frame, empty_note(scale), at(WIDTH / 2), at(field_top(model) + field_h / 2))
         cx, cy = gear_center(model, field_h)
@@ -791,6 +795,18 @@ class Scene:
         width = round(sprite.width * progress)
         if width > 0:
             frame.alpha_composite(sprite.crop((0, label, width, sprite.height)), (left, top + label))
+
+    def _hint(self, frame, model, field_h, scale, at):
+        """Two short MiMo/local hints; draw them over the cached background."""
+        draw = ImageDraw.Draw(frame)
+        label_font, text_font = ui_font(round(9 * scale), "bold"), ui_font(round(10 * scale))
+        top = chart_top(model, field_h) + CHART_H + chart_extra_for(model) + 14
+        for offset, label, value in ((0, "现在", model.hint_now), (17, "可做", model.hint_next)):
+            y = at(top + offset)
+            draw.text((at(PAD), y), label, font=label_font, fill=accent(model.letter), anchor="lm")
+            left = at(PAD + 32)
+            fitted = forecast_text(value or "—", at(WIDTH - PAD - 8) - left, text_font, draw)
+            draw.text((left, y), fitted, font=text_font, fill=SECONDARY_TEXT, anchor="lm")
 
     def _bubble(self, frame, m: BubbleModel, x, y, r, scale, alpha, label=True, expanded=False, crisp=False):
         layout = round(m.radius * scale)

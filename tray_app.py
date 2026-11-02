@@ -21,6 +21,7 @@ from PIL import Image
 
 import agent_panel
 import agent_tasks
+import agent_hints
 import forecast as forecast_module
 from forecast import Forecast, QuotaHistory, duration_text, reset_distance
 from hover_details import HoverDetails, HoverIcon
@@ -251,6 +252,7 @@ class QuotaTray:
         self.agents: list[dict] = []
         self.agent_groups = agent_tasks.AgentGroups()
         self.summarizer = agent_tasks.Summarizer(agent_tasks.summary_config())
+        self.hint_advisor = agent_hints.HintAdvisor(agent_tasks.summary_config())
         self.settings_requested = threading.Event()
         self.settings_ui = None
         self.clusters: dict[str, agent_tasks.Cluster] = {}
@@ -671,6 +673,9 @@ class QuotaTray:
         running = [data["display_model"]] if data.get("display_tps") is not None and data.get("display_model") else []
         intel, intel_note = self.panel_intel(now, running)
         forecast, forecast_tone = self.headline_forecast(provider)
+        hint_data = agent_hints.context(provider, agents, self.snapshots, self.performance.get("software", []))
+        advisor = getattr(self, "hint_advisor", None)
+        hint_now, hint_next = advisor.lookup(hint_data, getattr(self, "tps_monitor", None)) if advisor is not None else agent_hints.local_hint(hint_data)
         today_used = None
         if provider == "mimo":
             today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
@@ -681,7 +686,8 @@ class QuotaTray:
                                       status, tuple(quota), None if provider == "gemini" else data.get("display_tps") or 0.0, tuple(bubbles[:agent_panel.MAX_BUBBLES]),
                                       tone, banner, forecast, forecast_tone, today_used,
                                       self.burn_chart(provider, now), alert, intel, intel_note,
-                                      quota_tones=tuple(tones), quota_figures=tuple(figures), column_iq=column_iq)
+                                      quota_tones=tuple(tones), quota_figures=tuple(figures), column_iq=column_iq,
+                                      hint_now=hint_now, hint_next=hint_next)
 
     def merge(self, first: str, second: str) -> str | None:
         a, b = self.clusters.get(first), self.clusters.get(second)
@@ -1533,6 +1539,7 @@ class QuotaTray:
         from settings_window import save_summary
         save_summary(config, enabled)
         self.summarizer = agent_tasks.Summarizer(agent_tasks.summary_config())
+        self.hint_advisor = agent_hints.HintAdvisor(agent_tasks.summary_config())
         log.info("agent summary settings applied: enabled=%s", self.summarizer.enabled)
 
     def exit_app(self, _icon=None, _item=None) -> None:
