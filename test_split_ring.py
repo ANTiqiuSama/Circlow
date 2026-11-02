@@ -95,28 +95,46 @@ class SplitRingTests(unittest.TestCase):
                                   (86399,(24,'h')), (86400,(1,'d')), (86401,(2,'d'))):
             self.assertEqual(tray_app.countdown_value(seconds),expected)
 
-    def test_five_percent_remaining_is_treated_as_exhausted_without_changing_data(self):
+    def test_under_fifteen_percent_claude_counts_down_without_changing_data(self):
         now = 1000000
-        for remaining in (0, 1, 5):
+        for remaining in (0, 1, 5, 14.9):
             value = snapshot('claude', remaining=remaining, reset=now+3601)
             self.assertEqual(tray_app.usable_again_at(value, now), now+3601)
             with patch.object(tray_icons, 'waiting_icon', return_value='waiting') as icon:
                 self.assertEqual(tray_app.make_provider_icon(value, 'A', now=now), 'waiting')
                 icon.assert_called_once_with(2, 'A', False, False, 'h')
             self.assertEqual(value.remaining_percent, remaining)
-        self.assertIsNone(tray_app.usable_again_at(snapshot('claude', remaining=5.01, reset=now+3601), now))
+        self.assertIsNone(tray_app.usable_again_at(snapshot('claude', remaining=15, reset=now+3601), now))
+        self.assertEqual(tray_icons.exhaustion_text('claude'), '低于 15%')
+        self.assertEqual(tray_icons.exhaustion_text('mimo'), '不超过 5%')
 
-    def test_codex_and_grok_use_ten_percent_for_both_windows(self):
+    def test_claude_codex_and_grok_count_down_under_fifteen_percent_in_either_window(self):
         now = time.time()
-        for provider in ('codex', 'grok'):
-            for primary, secondary in ((10, 60), (60, 10)):
+        for provider in ('claude', 'codex', 'grok'):
+            for primary, secondary in ((14, 60), (60, 14)):
                 with self.subTest(provider=provider, primary=primary, secondary=secondary):
                     value = snapshot(provider, primary, secondary, now+7200, now+10800)
-                    expected = now+7200 if primary == 10 else now+10800
+                    expected = now+7200 if primary == 14 else now+10800
                     self.assertEqual(tray_app.usable_again_at(value, now), expected)
                     with patch.object(tray_icons, 'make_provider_icon', return_value='countdown'):
+                        # The countdown wins over a live TPS disc, Claude included.
                         self.assertEqual(tray_app.make_display_icon(value, 'C', {'active_sessions':1, 'display_tps':25}), 'countdown')
-            self.assertIsNone(tray_app.usable_again_at(snapshot(provider, 10.01, 60, now+7200), now))
+            self.assertIsNone(tray_app.usable_again_at(snapshot(provider, 15, 60, now+7200), now))
+
+    def test_only_geminis_own_pool_counts_down_under_fifteen_percent(self):
+        now = 1000000
+        def pools(argon, claude_gpt, gemini):
+            return [{'key': 'argon', 'remaining_percent': argon, 'resets_at': now + 7200},
+                    {'key': 'claude_gpt', 'remaining_percent': claude_gpt, 'resets_at': now + 5400},
+                    {'key': 'gemini', 'remaining_percent': gemini, 'resets_at': now + 3600}]
+        value = snapshot('gemini', remaining=60, second=None, pools=pools(60, 80, 12))
+        self.assertEqual(tray_app.usable_again_at(value, now), now + 3600)          # Gemini 12%: its reset
+        value = snapshot('gemini', remaining=12, second=None, pools=pools(12, 80, 60))
+        self.assertIsNone(tray_app.usable_again_at(value, now))                     # Argon 12%: still the ring
+        value = snapshot('gemini', remaining=4, second=None, pools=pools(4, 5, 15))
+        self.assertIsNone(tray_app.usable_again_at(value, now))                     # Gemini at 15% is not under it
+        value = snapshot('gemini', remaining=4, second=None, pools=pools(4, 5, 14))
+        self.assertEqual(tray_app.usable_again_at(value, now), now + 3600)
 
     def test_gemini_icon_never_switches_to_tps(self):
         value = snapshot('gemini', 40, None)
@@ -130,8 +148,11 @@ class SplitRingTests(unittest.TestCase):
         with patch.object(tray_icons, 'waiting_icon', return_value='waiting') as icon:
             self.assertEqual(tray_app.make_provider_icon(value, 'A', now=now), 'waiting')
             icon.assert_called_once_with(2, 'A', False, True, 'h')
+        with patch.object(tray_icons, 'make_provider_icon', return_value='countdown'):
+            self.assertEqual(tray_app.make_display_icon(value, 'A', {'active_sessions':1, 'display_tps':12}), 'countdown')
+        plenty = snapshot('claude', remaining=60, reset=now+3601)
         with patch.object(tray_icons, 'make_tps_icon', return_value='live'):
-            self.assertEqual(tray_app.make_display_icon(value, 'A', {'active_sessions':1, 'display_tps':12}), 'live')
+            self.assertEqual(tray_app.make_display_icon(plenty, 'A', {'active_sessions':1, 'display_tps':12}), 'live')
         self.assertEqual(icon_art.waiting_icon(2, 'A', stale=True, unit='h').tobytes(),
                          icon_art.waiting_icon(2, 'A', stale=False, unit='h').tobytes())
 

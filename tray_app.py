@@ -48,7 +48,7 @@ import grok_iq
 import reset_watch
 from refresh_scheduler import RefreshScheduler
 from tray_icons import (  # noqa: F401  (re-exported for callers and tests)
-    EXHAUSTED_REMAINING, ERROR_PREFIX_RE, PACED_PROVIDERS, _rounded, countdown_value, exhaustion_threshold,
+    EXHAUSTED_REMAINING, ERROR_PREFIX_RE, PACED_PROVIDERS, _rounded, countdown_value, exhaustion_text, exhaustion_threshold,
     icon_windows, make_display_icon, make_provider_icon, make_tps_icon, pace_marker, quota_exhausted,
     stale_note, usable_again_at)
 from tps_sources import PERFORMANCE_PATH, TpsMonitor, performance_signature, save_performance
@@ -313,7 +313,7 @@ class QuotaTray:
             until = usable_again_at(snapshot, now)
             back = f"{reset_distance(until, now)}后恢复" if until else "恢复时间未知"
             if state in ("near", "near_working"):
-                return f"{names}剩余不超过 {exhaustion_threshold(provider):g}%，按耗尽处理；{back}", "warn"
+                return f"{names}剩余{exhaustion_text(provider)}，按耗尽处理；{back}", "warn"
             if state == "paid":
                 using = "正在用购买的额度" if self.source_working(provider) else "可用购买的额度继续"
                 return f"{names}额度已用完，{using}；{back}", "warn"
@@ -363,6 +363,7 @@ class QuotaTray:
         text, _ = self.headline_forecast(provider)
         return f"预测：{text}" if text else ""
 
+    CHART_WEEKLY_BELOW = 10.0       # Codex 5-hour % left at which the chart shows the weekly window
     CHART_VIEW_MAX = 5 * 3600        # The solid line: the live window, at most its last 5 hours.
     CHART_POINTS = 160
     CHART_RECENT_SECONDS = 30 * 60  # keep completed work visible long enough to inspect its trend
@@ -418,7 +419,9 @@ class QuotaTray:
         windows = self.quota_windows("codex")
         five = next((w for w in windows if w[3] == 300 and w[1] is not None), None)
         week = next((w for w in windows if w[3] == 10080 and w[1] is not None), None)
-        return bool(five and quota_exhausted(five[1], "codex") and week)
+        # The chart moves to the weekly curve only once the 5-hour window is
+        # nearly empty, not as early as the icon's 15% countdown.
+        return bool(five and five[1] <= self.CHART_WEEKLY_BELOW and week)
 
     def active_sources(self, now: float) -> dict[str, set[str]]:
         """Sources working now or with real output in the last half hour, and
@@ -459,17 +462,14 @@ class QuotaTray:
         return keys
 
     def burn_chart(self, provider: str, now: float) -> "agent_panel.BurnChart | None":
-        """Global trends of live or recently used sources, identical on every icon."""
+        """Quota trends of every model with a reading, identical on every icon."""
         if self.history is None:
             return None
-        active = self.active_sources(now)
         candidates = []
-        for key, snapshot in self.snapshots.items():
-            if key not in active:
-                continue
-            allowed = set()
-            if key == "gemini" and snapshot.pools and len(snapshot.pools) > 1:
-                allowed = self.pool_keys(active[key])
+        active = self.active_sources(now)
+        for key in provider_registry.tray_positions(self.snapshots):
+            snapshot = self.snapshots[key]
+            pools_in_use = self.pool_keys(active.get(key, ())) if key == "gemini" else set()
             windows = self.quota_windows(key)
             selected = None
             quota_mode = key == "codex" and self.codex_quota_mode()
@@ -483,9 +483,6 @@ class QuotaTray:
                     continue
                 if remaining is None:
                     continue
-                if key == "gemini" and snapshot.pools and len(snapshot.pools) > 1:
-                    if snapshot.pools[slot].get("key") not in allowed:
-                        continue  # do not infer an active model pool from old quota consumption
                 recorded = max((self.history.samples(name) for name in names),
                                key=lambda items: len(forecast_module.current_window(items, resets_at)))
                 samples = forecast_module.current_window(recorded, resets_at)
@@ -500,14 +497,21 @@ class QuotaTray:
                 updated = snapshot.updated_at
                 if not points or (updated and points[-1][0] + 1 < updated <= now):
                     points.append((float(min(now, updated or now)), float(remaining)))
-                name = "Gemini" if key == "gemini" else provider_registry.get(key).label
-                chart_label = name if label == name else f"{name} · {label}"
+                if key == "mimo":
+                    chart_label = "MiMo"
+                elif key == "grok":
+                    chart_label = "Grok"
+                else:
+                    name = "Gemini" if key == "gemini" else provider_registry.get(key).label
+                    chart_label = name if label == name else f"{name} · {label}"
                 if quota_mode:
                     chart_label += "（5 小时已用完）"
+                pooled_models = snapshot.pools and len(snapshot.pools) > 1
+                idle = key not in active or bool(pooled_models and snapshot.pools[slot].get("key") not in pools_in_use)
                 series = agent_panel.BurnSeries(chart_label, slot,
                     tuple((round(t, 1), round(r, 2)) for t, r in points),
                     None if rate is None else round(rate, 3), float(resets_at) if resets_at else None,
-                    provider_letter(key), len(windows) > 1)
+                    provider_letter(key), len(windows) > 1, idle=idle)
                 candidates.append((series, outlook))
         if not candidates:
             return None
@@ -522,8 +526,8 @@ class QuotaTray:
         step = max(5.0, min(30.0, back / 60))
         shown = float(round(now / step) * step)
         start, end = shown - back, shown + agent_panel.burn_future(back)
-        # Readings for at least the 30 minutes a close-up widens to while hovered.
-        keep = shown - max(back, agent_panel.BURN_DWELL_SPAN * 60)
+        # Readings for the furthest span a hover eases out to (30 min, 2 h, then 5 h).
+        keep = shown - max(back, agent_panel.BURN_DWELL_BEATS[-1][0] * 60)
         series = tuple(self._fit_points(item[0], keep) for item in candidates)
         return agent_panel.BurnChart(float(start), float(end), shown, series)
 
@@ -869,6 +873,10 @@ class QuotaTray:
                 ensure = getattr(slot, "ensure_registered", None)
                 if ensure is not None and ensure():
                     log.warning("tray icon %d was missing from the notification area; added again", index)
+                elif getattr(slot, "resend_icon", None) is not None and not getattr(slot, "details_visible", False):
+                    # Every 30 s each slot's picture is sent again: a change the
+                    # Shell dropped can never leave a source showing another's icon.
+                    slot.resend_icon()
 
     def maybe_reorder(self, now: float, force: bool = False) -> bool:
         """Show providers in wanted_order() by assigning them to the existing
@@ -914,7 +922,8 @@ class QuotaTray:
                                       reset_hint=provider == "codex" and self.reset_level() == "high")
             # Icon assignment always sends NIM_MODIFY, even for identical pixels.
             # Avoid needless Shell redraws; hover detail updates use a separate HWND.
-            if icon.icon is not image and icon.icon != image:
+            # A picture the Shell refused is sent again even when unchanged.
+            if (icon.icon is not image and icon.icon != image) or getattr(icon, "icon_failed", False):
                 icon.icon = image
             icon.title = self.tooltip(provider)
 
@@ -1001,6 +1010,7 @@ class QuotaTray:
         for provider in pointed - quota_sources.WATCHED:
             quota_sources.HOVER_STARTED[provider] = now          # a new look: its first read is a real check
         quota_sources.WATCHED = frozenset(pointed)
+        quota_sources.ACTIVE = frozenset(p for p in self.scheduler.providers if self.source_working(p))
         for provider in icons:
             if provider in self.scheduler.providers:
                 moved |= self.scheduler.hover(provider, provider in pointed, now)
@@ -1307,7 +1317,13 @@ class QuotaTray:
         old = self.snapshots.get("claude")
         seen = record.get("observed_at", record["updated_at"]) if record else 0
         if record and old is not None and seen > max(old.updated_at or 0, getattr(self, "claude_rejected_seen", 0)):
-            fresh = quota_sources.keep_last_good(get_claude_quota(), old)
+            # The status line only, never /usage: this runs on the 1 s TPS loop.
+            # A reading behind what is shown (another session's older figure,
+            # or less than the last /usage check) is not taken.
+            native = quota_sources.native_claude_quota(record)
+            if not old.stale and quota_sources.claude_newer(native, old) is old:
+                return
+            fresh = quota_sources.keep_last_good(native, old)
             if fresh.error:
                 self.claude_rejected_seen = seen
                 self.snapshots["claude"] = fresh

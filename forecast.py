@@ -92,6 +92,51 @@ def current_window(samples: Iterable[Sample], resets_at: int | None) -> list[Sam
     return window
 
 
+BLIP_POINTS = 5.0        # a reading this far off both neighbours, which agree, is a glitch
+BLIP_RUN = 3             # at most this many such readings in a row
+
+
+def _far(sample: Sample, reference: Sample) -> bool:
+    return abs(sample.used - reference.used) >= BLIP_POINTS or not same_window(sample.resets_at, reference.resets_at)
+
+
+def _backwards(sample: Sample, reference: Sample) -> bool:
+    """Another window than `reference`, or BLIP_POINTS less used in the same
+    one, which use within a window cannot do."""
+    return not same_window(sample.resets_at, reference.resets_at) or sample.used < reference.used - BLIP_POINTS
+
+
+def without_blips(samples: Iterable[Sample]) -> list[Sample]:
+    """Readings with one-off glitches taken out. A glitch is up to BLIP_RUN
+    readings in a row that went backwards from the reading before them (see
+    _backwards) and are BLIP_POINTS off the reading after them, while those
+    two agree (same window, use not going back); or a single reading that
+    jumped BLIP_POINTS above both of its agreeing neighbours. A Claude status
+    line from an idle session, or a /usage read that caught another window,
+    shows up like this; a real reset does not, because the readings after it
+    stay in the new window. The latest reading is not judged until the next."""
+    out = sorted(samples, key=lambda s: s.at)
+    index = 1
+    while index < len(out) - 1:
+        before = out[index - 1]
+        end = index
+        while end < len(out) and end - index < BLIP_RUN and _backwards(out[end], before):
+            end += 1
+        if index < end < len(out):
+            after = out[end]
+            if same_window(before.resets_at, after.resets_at) and after.used >= before.used - 1.0 \
+                    and all(_far(item, after) for item in out[index:end]):
+                del out[index:end]
+                continue
+        item, after = out[index], out[index + 1]
+        if same_window(before.resets_at, after.resets_at) and same_window(item.resets_at, before.resets_at) \
+                and after.used >= before.used - 1.0 and item.used >= max(before.used, after.used) + BLIP_POINTS:
+            del out[index]
+            continue
+        index += 1
+    return out
+
+
 def history_curve(samples: Iterable[Sample], floor: float, now: float,
                   minutes: int | None = None) -> tuple[list[tuple[float, float]], set[int]]:
     """Remaining-% points from `floor` to `now` across windows, and the
@@ -197,7 +242,9 @@ class QuotaHistory:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             for name, items in payload.get("series", {}).items():
                 readings = [Sample(float(i[0]), float(i[1]), None if i[2] is None else int(i[2])) for i in items]
-                self.series[name] = self._without_false_claude_recoveries(name, readings)
+                # Glitches saved by earlier versions are dropped here, and stay
+                # out of the file from the next save on.
+                self.series[name] = without_blips(self._without_false_claude_recoveries(name, readings))
         except (OSError, ValueError, TypeError, KeyError, IndexError):
             self.series = {}
 
@@ -273,8 +320,9 @@ class QuotaHistory:
         return changed
 
     def samples(self, name: str) -> list[Sample]:
+        """Saved readings without one-off glitches (see without_blips)."""
         with self.lock:
-            return list(self.series.get(name, []))
+            return without_blips(self.series.get(name, []))
 
     def forecast_for(self, snapshot: Any, now: float, secondary: bool = False) -> Forecast:
         if secondary:

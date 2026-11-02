@@ -181,11 +181,49 @@ class HoverTests(unittest.TestCase):
         for slot in tray.slots:
             slot.ensure_registered.assert_called_once()
 
+    def test_a_picture_the_shell_refused_is_sent_again(self):
+        icon = HoverIcon("hover-resend-test", Image.new("RGBA", (16, 16)))
+        icon._hwnd = 123
+        with patch.object(icon, "_message", return_value=False), patch.object(icon, "_assert_icon_handle"), \
+                self.assertLogs("hover_details", "INFO"):
+            icon._update_icon()                        # Explorer busy: NIM_MODIFY fails
+        self.assertTrue(icon.icon_failed)
+        with patch.object(HoverIcon, "visible", True), patch.object(icon, "_message", return_value=True) as send, \
+                patch.object(icon, "_assert_icon_handle"):
+            self.assertTrue(icon.resend_icon())
+        self.assertFalse(icon.icon_failed)
+        import hover_details
+        self.assertEqual(send.call_args.args[0], hover_details.win32.NIM_MODIFY)
+        icon._hwnd = None
+        # The tray assigns the same picture again while the last one was refused...
+        tray = QuotaTray.__new__(QuotaTray)
+        tray.ui_lock = threading.RLock()
+        same = Image.new("RGBA", (16, 16))
+        tray.snapshots, tray.performance = {"codex": None}, {"providers": {"codex": {}}}
+        tray.tooltip = lambda provider: "Codex"
+        tray.reset_level = lambda: "low"
+        assigned = []
+        slot_type = type("Slot", (), {"icon": property(lambda s: same, lambda s, value: assigned.append(value))})
+        live = slot_type()
+        live.icon_failed, live.title, live.details_visible = True, "", False
+        tray.icons = {"codex": live}
+        with patch.object(tray_app, "make_display_icon", return_value=same):
+            tray.update_icon("codex", "C")
+            live.icon_failed = False
+            tray.update_icon("codex", "C")             # ...but not when the Shell took it
+        self.assertEqual(assigned, [same])
+        # ...and every slot's picture is sent again on the 30 s check, except one under the pointer.
+        tray.slots = [Mock(ensure_registered=Mock(return_value=False), details_visible=False),
+                      Mock(ensure_registered=Mock(return_value=False), details_visible=True)]
+        tray.ensure_icons_registered()
+        tray.slots[0].resend_icon.assert_called_once()
+        tray.slots[1].resend_icon.assert_not_called()
+
     def test_unchanged_pixels_do_not_rebuild_native_icons(self):
         tray = QuotaTray.__new__(QuotaTray)
         image = Image.new("RGBA", (64, 64), "green")
         icon = Mock()
-        icon.details_visible = False
+        icon.details_visible = icon.icon_failed = False
         icon.icon = image
         tray.icons = {"codex": icon}
         tray.snapshots = {"codex": None}
@@ -533,22 +571,27 @@ class RefreshCadenceTests(unittest.TestCase):
 
 
 class CodexLocalLimitTests(unittest.TestCase):
-    def test_rejected_claude_status_is_not_reprocessed_every_second(self):
+    def test_status_line_behind_the_shown_quota_is_ignored_on_the_tps_loop(self):
         now = time.time()
         old = QuotaSnapshot("claude", "Claude Code", 300, 80, 20, int(now + 3600), now - 60,
                             False, None, 10080, 83, 17, int(now + 7200))
-        suspect = QuotaSnapshot("claude", "Claude Code", 300, 30, 70, old.resets_at, now,
-                                False, None, 10080, 71, 29, old.secondary_resets_at)
+        behind = QuotaSnapshot("claude", "Claude Code", 300, 30, 70, old.resets_at, now,
+                               False, None, 10080, 71, 29, old.secondary_resets_at)    # an idle session's old figure
+        ahead = QuotaSnapshot("claude", "Claude Code", 300, 82, 18, old.resets_at, now + 2,
+                              False, None, 10080, 84, 16, old.secondary_resets_at)
         tray = QuotaTray.__new__(QuotaTray)
         tray.snapshots = {"claude": old}
         tray.history = None
         with patch("claude_status.latest", return_value={"updated_at": now, "observed_at": now}), \
-                patch.object(tray_app, "get_claude_quota", return_value=suspect) as read:
+                patch.object(tray_app, "get_claude_quota") as usage, \
+                patch.object(tray_app.quota_sources, "native_claude_quota", return_value=behind):
             tray.update_claude_locally(now)
-            tray.update_claude_locally(now + 1)
-        read.assert_called_once()
-        self.assertEqual(tray.snapshots["claude"].remaining_percent, 20)
-        self.assertEqual(tray.claude_rejected_seen, now)
+            self.assertIs(tray.snapshots["claude"], old)                     # not taken, not marked doubtful
+            with patch.object(tray_app.quota_sources, "native_claude_quota", return_value=ahead), \
+                    patch("claude_status.latest", return_value={"updated_at": now + 2, "observed_at": now + 2}):
+                tray.update_claude_locally(now + 2)
+        usage.assert_not_called()                                            # never the 7 s /usage on this loop
+        self.assertEqual(tray.snapshots["claude"].remaining_percent, 18)
 
     def test_claude_reset_notice_requires_at_least_ninety_five_percent_remaining(self):
         now = time.time()
@@ -682,43 +725,112 @@ class AgentPanelTests(unittest.TestCase):
         self.assertEqual(clock(Chart(now - 18000, now + 4500, now, ())), ['10:00', '11:00', '12:00', '13:00'])   # 14:00 would crowd "now"
         self.assertEqual(clock(Chart(now - 600, now + 150, now, ())), ['14:00', '14:02', '14:04', '14:06'])  # 14:08 is "now"
 
-    def test_a_close_up_eases_out_to_thirty_minutes_while_hovered(self):
+    def test_hover_zooms_at_once_then_out_to_two_hours_and_five(self):
         now = 1_800_000_000.0
         close = agent_panel.BurnChart(now - 600, now + 150, now, ())
         span = lambda rested: round((agent_panel.burn_dwell(close, rested).now - agent_panel.burn_dwell(close, rested).start) / 60, 2)  # noqa: E731
-        delay, ease = agent_panel.BURN_DWELL_DELAY, agent_panel.BURN_DWELL_EASE
+        (to_30, delay1, ease1), (to_2h, delay2, ease2), (to_5h, delay3, ease3) = agent_panel.BURN_DWELL_BEATS
+        self.assertEqual((to_30, delay1, to_2h, to_5h), (30, 0.0, 120, 300))
+        at_30 = delay1 + ease1
+        at_2h = at_30 + delay2 + ease2
+        at_5h = at_2h + delay3 + ease3
+        middle = lambda origin, target: round(origin * (target / origin) ** 0.5, 2)  # noqa: E731
         self.assertEqual(span(0), 10)                                        # opens on the close-up
-        self.assertEqual(span(delay), 10)                                    # still, until the pointer has rested
-        self.assertEqual(span(delay + ease / 2), round(10 * 3 ** .5, 2))     # halfway: the geometric middle
-        self.assertEqual(span(delay + ease), 30)
-        self.assertEqual(span(60), 30)                                       # and stays there
-        steps = [span(delay + ease * i / 40) for i in range(41)]
-        self.assertEqual(steps, sorted(steps))                               # only ever widens
-        ratios = [b / a for a, b in zip(steps, steps[1:])]
-        self.assertLess(ratios[0], ratios[20])                               # starts gently...
-        self.assertLess(ratios[-1], ratios[20])                              # ...and settles gently
-        self.assertLess(ratios[1] - ratios[0], .002)                         # no jolt: speed builds smoothly
+        self.assertEqual(span(ease1 / 2), middle(10, 30))                    # and is already moving: no lead-in wait
+        self.assertEqual(span(at_30), 30)
+        self.assertEqual(span(at_30 + delay2), 30)                           # holds there through the rest
+        self.assertEqual(span(at_30 + delay2 + ease2 / 2), middle(30, 120))
+        self.assertEqual(span(at_2h), 120)
+        self.assertEqual(span(at_2h + delay3), 120)                          # holds 2 h, then the second zoom
+        self.assertEqual(span(at_2h + delay3 + ease3 / 2), middle(120, 300))
+        self.assertEqual(span(at_5h), 300)
+        self.assertEqual(span(60), 300)
+        for start, ease in ((delay1, ease1), (at_30 + delay2, ease2), (at_2h + delay3, ease3)):
+            steps = [span(start + ease * i / 40) for i in range(41)]
+            self.assertEqual(steps, sorted(steps))                           # only ever widens
+            ratios = [b / a for a, b in zip(steps, steps[1:])]
+            self.assertLess(ratios[0], ratios[20])                           # starts gently...
+            self.assertLess(ratios[-1], ratios[20])                          # ...and settles gently
+            self.assertLess(ratios[1] - ratios[0], .002)                     # no jolt: speed builds smoothly
         series = agent_panel.BurnSeries('Codex', 0, tuple((now - 1800 + 60 * i, 95 - (i if i < 25 else 25 + 3 * (i - 25)))
                                                           for i in range(31)), 40.0, now + 3600, 'C')
         close_up = agent_panel.BurnChart(now - 600, now + 150, now, (series,))
         near = agent_panel.burn_axis(close_up)
         far = agent_panel.burn_axis(agent_panel.burn_view(close_up, 30))
         self.assertNotEqual(near, far)                                       # the two views pick different scales
-        first = agent_panel.burn_dwell(close_up, delay + ease * .02).axis
-        middle = agent_panel.burn_dwell(close_up, delay + ease / 2).axis
+        first = agent_panel.burn_dwell(close_up, ease1 * .02).axis
+        halfway = agent_panel.burn_dwell(close_up, ease1 / 2).axis
         self.assertAlmostEqual(first.top, near.top, delta=abs(far.top - near.top) * .01 + 1e-9)   # no jump at the start
-        self.assertTrue(min(near.top, far.top) <= middle.top <= max(near.top, far.top))
-        self.assertIsNone(agent_panel.burn_dwell(close_up, delay + ease).axis)   # at rest: the view's own scale
-        self.assertEqual(agent_panel.burn_sprite(agent_panel.burn_dwell(close_up, delay + ease / 2),
+        self.assertTrue(min(near.top, far.top) <= halfway.top <= max(near.top, far.top))
+        self.assertIsNone(agent_panel.burn_dwell(close_up, at_30).axis)      # at rest: the view's own scale
+        self.assertEqual(agent_panel.burn_sprite(agent_panel.burn_dwell(close_up, ease1 / 2),
                                                  (agent_panel.accent('C'),), 1.0).height, agent_panel.CHART_H)
-        wide = agent_panel.burn_dwell(close, 60)
-        self.assertAlmostEqual(wide.end - wide.now, 180)                    # a narrow forecast strip
-        long_view = agent_panel.BurnChart(now - 7200, now + 1800, now, ())
-        self.assertIs(agent_panel.burn_dwell(long_view, 60), long_view)      # already 30 min or more: unchanged
+        held = agent_panel.burn_dwell(close, at_30)
+        two_hours = agent_panel.burn_dwell(close, at_2h)
+        five = agent_panel.burn_dwell(close, at_5h)
+        self.assertAlmostEqual(held.end - held.now, 180)                     # 30 min keeps a narrow forecast strip
+        self.assertAlmostEqual(two_hours.end - two_hours.now, 720)           # 2 h gives the forecast its tenth
+        self.assertAlmostEqual(five.end - five.now, 1800)                    # and so does 5 h
+        already = agent_panel.BurnChart(now - 5 * 3600, now + 1800, now, ())
+        self.assertIs(agent_panel.burn_dwell(already, 60), already)          # already 5 h: unchanged
+        opened_half = agent_panel.BurnChart(now - 1800, now + 180, now, ())  # opens at 30 min: the 2 h zoom is already moving
+        half = lambda rested: round((agent_panel.burn_dwell(opened_half, rested).now - agent_panel.burn_dwell(opened_half, rested).start) / 60, 2)  # noqa: E731
+        self.assertEqual(half(0), 30)
+        self.assertEqual(half(ease2 / 2), middle(30, 120))
+        self.assertEqual(half(ease2), 120)
+        self.assertEqual(half(ease2 + delay3), 120)                          # rests, then the 5 h zoom
+        self.assertEqual(half(ease2 + delay3 + ease3), 300)
+        self.assertTrue(agent_panel.dwell_easing(30, ease2 * 0.02))
+        self.assertFalse(agent_panel.dwell_easing(30, ease2 + delay3 / 2))
+        opened_wide = agent_panel.BurnChart(now - 7200, now + 720, now, ())
+        self.assertIs(agent_panel.burn_dwell(opened_wide, 0), opened_wide)   # 2 h starts the last zoom at once
+        wide = lambda rested: round((agent_panel.burn_dwell(opened_wide, rested).now - agent_panel.burn_dwell(opened_wide, rested).start) / 60, 2)  # noqa: E731
+        self.assertEqual(wide(ease3 / 2), middle(120, 300))
+        self.assertEqual(agent_panel.burn_dwell(opened_wide, ease3).now
+                         - agent_panel.burn_dwell(opened_wide, ease3).start, 5 * 3600)
+        self.assertTrue(agent_panel.dwell_easing(120, ease3 * 0.02))
+        self.assertFalse(agent_panel.dwell_easing(120, ease3 + 0.1))
         self.assertIsNone(agent_panel.burn_dwell(None, 60))
-        middle = agent_panel.burn_dwell(close, delay + ease / 3)
-        ticks = [time.strftime('%M', time.localtime(t)) for t in agent_panel.burn_time_ticks(middle)]
-        self.assertTrue(all(int(m) % 5 == 0 for m in ticks))                 # mid-zoom labels use the 30-min steps
+        self.assertTrue(agent_panel.dwell_easing(10, ease1 / 2))
+        self.assertFalse(agent_panel.dwell_easing(10, at_30 + delay2 / 2))   # holding 30 min is still
+        self.assertTrue(agent_panel.dwell_easing(10, at_30 + delay2 + ease2 / 2))
+        self.assertFalse(agent_panel.dwell_easing(10, at_2h + delay3 / 2))   # holding 2 h is still
+        self.assertTrue(agent_panel.dwell_easing(10, at_2h + delay3 + ease3 / 2))
+        self.assertFalse(agent_panel.dwell_easing(10, at_5h + 1))
+        self.assertFalse(agent_panel.dwell_easing(300, 60))
+        early = agent_panel.burn_dwell(close, ease1 * 0.25)
+        ticks = [time.strftime('%M', time.localtime(t)) for t in agent_panel.burn_time_ticks(early)]
+        self.assertTrue(ticks and all(int(m) % 5 == 0 for m in ticks))       # still inside 30 min: its 5-min steps
+        second = agent_panel.burn_dwell(close, at_30 + delay2 + ease2 / 2)   # exactly 60 min
+        stamps = agent_panel.burn_time_ticks(second)
+        self.assertGreaterEqual(len(stamps), 2)
+        self.assertEqual(round(stamps[1] - stamps[0]), 15 * 60)
+        third = agent_panel.burn_dwell(close, at_2h + delay3 + ease3 / 2)    # between 2 h and 5 h: hourly steps
+        hours = agent_panel.burn_time_ticks(third)
+        self.assertGreaterEqual(len(hours), 2)
+        self.assertEqual(round(hours[1] - hours[0]), 3600)
+
+    def test_hover_keeps_five_hours_of_readings_for_the_last_zoom(self):
+        from pathlib import Path
+        from forecast import QuotaHistory
+        now = 1_800_000_000.0
+        reset = int(now + 4 * 3600)                                         # the live window began an hour ago
+        history = QuotaHistory(Path(self.folder.name) / 'five-hour-zoom.json')
+        history.add('codex', now - 6 * 3600, 1, reset)                      # older than the chart keeps
+        history.add('codex', now - int(4.5 * 3600), 2, reset)               # inside the 5 h the last zoom shows
+        for index in range(31):                                             # then 1 % every 20 s: a 10 min close-up
+            history.add('codex', now - 600 + index * 20, 10 + index, reset)
+        self.tray.history = history
+        self.tray.snapshots['codex'] = QuotaSnapshot('codex', 'Codex', 300, 40, 60, reset, now, False, None)
+        chart = self.tray.burn_chart('codex', now)
+        self.assertEqual(chart.now - chart.start, 600)                      # the picture still opens on 10 min
+        kept = [round(t, 1) for t, _ in chart.series[0].points]
+        self.assertNotIn(round(now - 6 * 3600, 1), kept)
+        self.assertIn(round(now - 4.5 * 3600, 1), kept)
+        widened = agent_panel.burn_dwell(chart, 60)
+        self.assertEqual(widened.now - widened.start, 5 * 3600)
+        drawn = agent_panel.burn_points(widened.series[0], widened)[0]
+        self.assertTrue(any(abs(t - (now - 4.5 * 3600)) < 1 for t, _ in drawn))  # the 5 h view still has it
 
     def test_chart_axis_keeps_a_visible_short_term_forecast(self):
         from pathlib import Path
@@ -738,6 +850,48 @@ class AgentPanelTests(unittest.TestCase):
         self.assertTrue(projection)
         sprite = agent_panel.burn_sprite(chart, (agent_panel.accent('C'),), 1.0)
         self.assertEqual(sprite.height, agent_panel.CHART_H)
+
+    def test_one_off_glitches_leave_the_curve_but_real_resets_stay(self):
+        from pathlib import Path
+        import json
+        from forecast import QuotaHistory, Sample, without_blips
+        window, other = 1_800_000_000, 1_800_003_060
+        claude = [Sample(0, 6, window), Sample(60, 0, window), Sample(70, 0, window),      # idle session: 100% twice
+                  Sample(71, 7, window), Sample(80, 9, window), Sample(90, 0, window), Sample(91, 16, window)]
+        self.assertEqual([s.at for s in without_blips(claude)], [0, 71, 80, 91])
+        grok = [Sample(0, 55, window), Sample(600, 0, other), Sample(1200, 55, window), Sample(1800, 56, window)]
+        self.assertEqual([s.at for s in without_blips(grok)], [0, 1200, 1800])          # another window, once
+        reset = [Sample(0, 90, window), Sample(60, 0, other), Sample(120, 2, other)]
+        self.assertEqual(without_blips(reset), reset)                                     # the new window stays
+        jump = [Sample(0, 10, window), Sample(60, 20, window), Sample(120, 21, window)]
+        self.assertEqual(without_blips(jump), jump)                                       # a burst of real use stays
+        self.assertEqual(without_blips(claude[:2]), claude[:2])                           # the latest is not judged yet
+        path = Path(self.folder.name) / 'blips.json'
+        path.write_text(json.dumps({"series": {"grok": [[s.at, s.used, s.resets_at] for s in grok]}}), encoding="utf-8")
+        loaded = QuotaHistory(path)
+        self.assertEqual([s.at for s in loaded.series["grok"]], [0, 1200, 1800])        # cleaned on load
+        loaded.save()
+        self.assertEqual(len(json.loads(path.read_text(encoding="utf-8"))["series"]["grok"]), 3)
+
+    def test_idle_sources_are_faint_context_on_one_legend_row(self):
+        series = [agent_panel.BurnSeries('Claude Code · 5 小时', 0, ((0, 60.0), (600, 40.0)), 2.0, None, 'A'),
+                  agent_panel.BurnSeries('Codex · 5 小时', 0, ((0, 100.0), (600, 100.0)), None, None, 'C', idle=True),
+                  agent_panel.BurnSeries('Gemini · Argon', 0, ((0, 100.0),), None, None, 'G', True, idle=True),
+                  agent_panel.BurnSeries('Gemini · Claude/GPT', 1, ((0, 0.0),), None, None, 'G', True, idle=True),
+                  agent_panel.BurnSeries('Gemini · Gemini', 2, ((0, 100.0),), None, None, 'G', True, idle=True),
+                  agent_panel.BurnSeries('Grok', 0, ((0, 44.0),), .7, None, 'X', idle=True),
+                  agent_panel.BurnSeries('Xiaomi MiMo · 套餐额度', 0, ((0, 94.0),), 0.0, None, 'M', idle=True)]
+        chart = agent_panel.BurnChart(0, 660, 600, tuple(series))
+        legend = agent_panel.burn_legend(chart)
+        self.assertEqual(legend[0][3], 'Claude Code · 5 小时')                        # in use first, full name
+        self.assertTrue(all(row == 0 for _, _, row, _ in legend))                    # one row: no second for idle
+        self.assertTrue({'Codex', 'Argon'} <= {text for *_, text in legend})          # idle ones by short name
+        self.assertEqual(agent_panel.chart_extra(chart), 0)
+        self.assertLess(agent_panel.burn_axis(chart).top, 100)                         # scale fits the line in use
+        _, projection, _ = agent_panel.burn_points(series[5], chart)
+        sprite = agent_panel.burn_sprite(chart, tuple(agent_panel.accent(s.letter) for s in series), 1.0)
+        self.assertEqual(sprite.height, agent_panel.CHART_H)
+        self.assertEqual(agent_panel.short_label('Xiaomi MiMo · 套餐额度'), 'Xiaomi MiMo')
 
     def test_quota_history_folds_repeated_readings_so_the_curve_is_kept(self):
         from pathlib import Path
@@ -871,7 +1025,18 @@ class AgentPanelTests(unittest.TestCase):
         self.tray.history = None
         self.assertEqual(self.tray.pool_forecast("gemini", now), ("", "unknown"))
 
-    def test_gemini_pools_in_use_share_the_chart_and_an_idle_one_stays_out(self):
+    def test_mimo_and_grok_chart_labels_are_the_model_name_only(self):
+        from pathlib import Path
+        from forecast import QuotaHistory
+        now = 1_800_000_000.0
+        self.tray.history = QuotaHistory(Path(self.folder.name) / "short-names.json")
+        self.tray.snapshots["mimo"] = QuotaSnapshot("mimo", "Xiaomi MiMo", 525600, 3, 97, int(now + 86400), now, False, None)
+        self.tray.snapshots["grok"] = QuotaSnapshot("grok", "Grok", 10080, 35, 65, int(now + 86400), now, False, None)
+        self.tray.agents = []
+        chart = self.tray.burn_chart("codex", now)
+        self.assertEqual([s.label for s in chart.series], ["Grok", "MiMo"])
+
+    def test_every_gemini_pool_stays_on_the_chart(self):
         from pathlib import Path
         from forecast import QuotaHistory
         now = 1_800_000_000.0
@@ -892,22 +1057,25 @@ class AgentPanelTests(unittest.TestCase):
         self.tray.agents = [{"provider":"gemini", "live":True, "model":"argon"},
                             {"provider":"gemini", "live":True, "model":"gemini-3.8-flash"}]
         chart = self.tray.burn_chart("gemini", now)
-        self.assertEqual([(s.label, s.slot) for s in chart.series], [("Gemini · Argon", 0), ("Gemini", 2)])
-        self.assertEqual([round(s.points[-1][1]) for s in chart.series], [26, 78])
+        self.assertEqual([(s.label, s.slot) for s in chart.series],
+                         [("Gemini · Argon", 0), ("Gemini · Claude/GPT", 1), ("Gemini", 2)])
+        self.assertEqual([round(s.points[-1][1]) for s in chart.series], [26, 80, 78])
         with patch.object(self.tray, "agents", []):
-            self.assertIsNone(self.tray.burn_chart("gemini", now))
+            self.assertEqual([s.label for s in self.tray.burn_chart("gemini", now).series],
+                             ["Gemini · Argon", "Gemini · Claude/GPT", "Gemini"])
         self.tray.agents = [{"provider":"gemini", "live":True, "model":"claude-opus-5-5"}]
-        self.assertEqual([s.label for s in self.tray.burn_chart("codex", now).series], ["Gemini · Claude/GPT"])
+        self.assertEqual([s.label for s in self.tray.burn_chart("codex", now).series],
+                         ["Gemini · Argon", "Gemini · Claude/GPT", "Gemini"])
         # Restore normal bubble records before exercising the complete renderer.
         self.tray.agents = []
         model = self.tray.panel("gemini")
         self.assertEqual([q[2] for q in model.quota], ["Argon", "Claude/GPT", "Gemini"])
-        self.assertIsNone(model.burn)
+        self.assertEqual([s.label for s in model.burn.series], ["Gemini · Argon", "Gemini · Claude/GPT", "Gemini"])
         scene = agent_panel.Scene()
         scene.set_model(model, 0.0)
         self.assertIsNotNone(scene.render(1.25))
 
-    def test_idle_sources_never_fall_back_to_historical_exhaustion(self):
+    def test_idle_source_stays_on_the_chart_on_its_five_hour_window(self):
         from pathlib import Path
         from forecast import QuotaHistory
         now = 1_800_000_000.0
@@ -920,9 +1088,10 @@ class AgentPanelTests(unittest.TestCase):
         self.tray.history = history
         self.tray.agents = []
         chart = self.tray.burn_chart("codex", now)
-        self.assertIsNone(chart)
+        self.assertEqual([s.label for s in chart.series], ["Codex · 5 小时"])   # idle, and still the 5 h window
+        self.assertAlmostEqual(chart.series[0].points[-1][1], 70, delta=0.01)
 
-    def test_global_live_sources_share_one_chart_and_disappear_when_finished(self):
+    def test_every_model_with_a_reading_shares_one_chart(self):
         from pathlib import Path
         from forecast import QuotaHistory
         now = time.time()
@@ -933,13 +1102,11 @@ class AgentPanelTests(unittest.TestCase):
         self.tray.agents = [{'provider':'codex', 'live':False}, {'provider':'claude', 'live':True}]
         self.tray.performance['providers']['grok']['active_sessions'] = 1
         first = self.tray.burn_chart('codex', now)
-        self.assertEqual({s.letter for s in first.series}, {'A', 'X'})
+        self.assertEqual({s.letter for s in first.series}, {'A', 'C', 'X'})
         self.assertEqual(first, self.tray.burn_chart('gemini', now))
-        self.assertNotIn('Codex', ' '.join(s.label for s in first.series))
-        # A cached TPS, quota history and an installed/running client are not live work.
         self.tray.agents = []
         self.tray.performance['providers']['grok']['active_sessions'] = 0
-        self.assertIsNone(self.tray.burn_chart('grok', now))
+        self.assertEqual({s.letter for s in self.tray.burn_chart('grok', now).series}, {'A', 'C', 'X'})
 
     def test_mimo_today_stat_uses_current_cache_and_never_yesterdays_total(self):
         from datetime import datetime
@@ -955,7 +1122,7 @@ class AgentPanelTests(unittest.TestCase):
             tracker.return_value.view.return_value.today_used = 1234
             self.assertEqual(self.tray.panel("mimo").today_used, 1234)
 
-    def test_completed_claude_reply_keeps_its_chart_for_thirty_minutes(self):
+    def test_claude_stays_on_the_chart_after_its_reply(self):
         from pathlib import Path
         from forecast import QuotaHistory
         from tps_sources import Observation
@@ -967,9 +1134,9 @@ class AgentPanelTests(unittest.TestCase):
         chart = self.tray.burn_chart('gemini', now)
         self.assertEqual([s.letter for s in chart.series], ['A'])
         self.assertEqual(chart, self.tray.burn_chart('claude', now))
-        self.assertIsNone(self.tray.burn_chart('claude', now+601))
+        self.assertEqual([s.letter for s in self.tray.burn_chart('claude', now + 601).series], ['A'])
 
-    def test_recent_desktop_consumption_keeps_claude_chart_without_cli_transcript(self):
+    def test_claude_stays_on_the_chart_without_a_recent_desktop_reading(self):
         from pathlib import Path
         from forecast import QuotaHistory
         now = time.time()
@@ -979,7 +1146,7 @@ class AgentPanelTests(unittest.TestCase):
         self.tray.tps_monitor.claude_desktop_last_use = now-20
         self.assertEqual([s.letter for s in self.tray.burn_chart('codex', now).series], ['A'])
         self.tray.tps_monitor.claude_desktop_last_use = 0
-        self.assertIsNone(self.tray.burn_chart('claude', now))
+        self.assertEqual([s.letter for s in self.tray.burn_chart('claude', now).series], ['A'])
 
     def setUp(self):
         import tempfile
