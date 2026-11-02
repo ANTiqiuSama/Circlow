@@ -41,18 +41,19 @@ def _label(value: object, length: int = 48) -> str:
     return agent_tasks.shorten(re.sub(r"\s+", " ", text).strip(), length)
 
 
-def context(provider: str, agents: list[dict], snapshots: dict, software: list[dict]) -> dict:
+def context(agents: list[dict], snapshots: dict, software: list[dict]) -> dict:
     active = [agent for agent in agents if agent.get("live") and not agent.get("schedule")]
     tasks = [{"provider": str(agent.get("provider") or ""),
               "title": _label(agent.get("title") or agent.get("thread_title")),
-              "doing": _label(agent.get("doing"), 32)} for agent in active[:5]]
+              "doing": _label(agent.get("doing"), 32)} for agent in active]
+    tasks = sorted(tasks, key=lambda item: (item["provider"], item["title"], item["doing"]))[:5]
     quotas = {}
     for name, snapshot in snapshots.items():
         value = snapshot.display_remaining if snapshot is not None else None
         if snapshot is not None and not snapshot.stale and not snapshot.error and value is not None:
             quotas[name] = round(float(value) / 5) * 5
     clients = sorted({str(row.get("name")) for row in software if row.get("name") and row.get("processes", 0) > 0})[:8]
-    return {"hovered": provider, "tasks": tasks, "quotas": quotas, "detected_clients": clients}
+    return {"tasks": tasks, "quotas": quotas, "detected_clients": clients}
 
 
 def local_hint(data: dict) -> tuple[str, str]:
@@ -66,9 +67,11 @@ def local_hint(data: dict) -> tuple[str, str]:
         current = "检测到 AI 客户端，暂无可确认的生成任务"
     else:
         current = "当前未检测到生成中的 agent"
-    quota = data["quotas"].get(data["hovered"])
-    if quota is not None and quota <= 15:
-        next_step = "当前额度较低，非紧急任务可留到重置后"
+    active_sources = {task["provider"] for task in tasks}
+    tight = sorted((value, name) for name, value in data["quotas"].items()
+                   if value <= 15 and (not active_sources or name in active_sources))
+    if tight:
+        next_step = f"{tight[0][1]} 额度较低，非紧急任务可留到重置后"
     elif tasks:
         next_step = "可先检查当前任务的结果，再决定下一步"
     else:

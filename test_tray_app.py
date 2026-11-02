@@ -1187,6 +1187,7 @@ class AgentPanelTests(unittest.TestCase):
         other = self.tray.panel("grok")
         self.assertEqual([b.key for b in other.bubbles], [b.key for b in model.bubbles])
         self.assertEqual(agent_panel.field_top(other), agent_panel.field_top(model))
+        self.assertEqual((model.hint_now, model.hint_next), (other.hint_now, other.hint_next))
         self.assertEqual(other.tps, 42.0)
         group = next(bubble for bubble in model.bubbles if bubble.members)
         self.assertEqual(len(group.members), 2)

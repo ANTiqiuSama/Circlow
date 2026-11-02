@@ -23,7 +23,7 @@ class HintTests(unittest.TestCase):
         ]
         snapshots = {"codex": SimpleNamespace(display_remaining=8, stale=False, error=None),
                      "claude": SimpleNamespace(display_remaining=75, stale=True, error=None)}
-        data = agent_hints.context("codex", agents, snapshots,
+        data = agent_hints.context(agents, snapshots,
                                    [{"name": "Codex 引擎", "processes": 2}])
         packed = json.dumps(data, ensure_ascii=False)
         self.assertNotIn("PRIVATE REQUEST", packed)
@@ -31,9 +31,10 @@ class HintTests(unittest.TestCase):
         self.assertNotIn("定时任务", packed)
         self.assertEqual(data["quotas"], {"codex": 10})
         self.assertIn("额度较低", agent_hints.local_hint(data)[1])
+        self.assertNotIn("hovered", data)
 
     def test_idle_process_does_not_claim_active_generation(self):
-        data = agent_hints.context("claude", [], {}, [{"name": "Claude Code", "processes": 3}])
+        data = agent_hints.context([], {}, [{"name": "Claude Code", "processes": 3}])
         self.assertIn("暂无可确认的生成任务", agent_hints.local_hint(data)[0])
 
     def test_mimo_response_is_cached_and_key_is_never_in_prompt(self):
@@ -48,7 +49,7 @@ class HintTests(unittest.TestCase):
 
         advisor = agent_hints.HintAdvisor({"url": "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
                                             "key": "SECRET", "model": "mimo-v2.6-flash"}, opener)
-        data = {"hovered": "codex", "tasks": [{"provider": "codex", "title": "额度预测", "doing": "测试"}],
+        data = {"tasks": [{"provider": "codex", "title": "额度预测", "doing": "测试"}],
                 "quotas": {"codex": 30}, "detected_clients": ["Codex 引擎"]}
         fallback = advisor.lookup(data)
         self.assertIn("额度预测", fallback[0])
@@ -69,7 +70,7 @@ class HintTests(unittest.TestCase):
 
     def test_non_mimo_endpoint_uses_local_hint(self):
         advisor = agent_hints.HintAdvisor({"url": "https://example.com/chat/completions", "key": "x", "model": "m"})
-        data = {"hovered": "codex", "tasks": [], "quotas": {}, "detected_clients": []}
+        data = {"tasks": [], "quotas": {}, "detected_clients": []}
         self.assertEqual(advisor.lookup(data), agent_hints.local_hint(data))
 
     def test_history_samples_codex_claude_and_grok_without_raw_secrets(self):
