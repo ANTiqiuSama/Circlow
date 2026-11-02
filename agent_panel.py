@@ -145,7 +145,7 @@ CHART = 80 + CHART_AXIS     # Burn chart under the task field.
 CHART_TOP = 16              # Field bottom to chart sprite; the two plates keep an 8 px gap.
 CHART_H = 64 + CHART_AXIS   # Chart sprite: label row, plot and clock row.
 CHART_LABEL = 15            # Label row inside the sprite.
-HINT_H = 42                 # Two compact lines between chart and forecast.
+HINT_H = 42                 # One short paragraph, up to two lines, above the forecast.
 GEAR_RADIUS = 7.5
 GEAR_HIT = 17.0
 
@@ -797,16 +797,16 @@ class Scene:
             frame.alpha_composite(sprite.crop((0, label, width, sprite.height)), (left, top + label))
 
     def _hint(self, frame, model, field_h, scale, at):
-        """Two short MiMo/local hints; draw them over the cached background."""
+        """One shared MiMo/local paragraph, drawn over the cached background."""
         draw = ImageDraw.Draw(frame)
-        label_font, text_font = ui_font(round(9 * scale), "bold"), ui_font(round(10 * scale))
+        text_font = ui_font(round(10 * scale))
         top = chart_top(model, field_h) + CHART_H + chart_extra_for(model) + 14
-        for offset, label, value in ((0, "现在", model.hint_now), (17, "可做", model.hint_next)):
-            y = at(top + offset)
-            draw.text((at(PAD), y), label, font=label_font, fill=accent(model.letter), anchor="lm")
-            left = at(PAD + 32)
-            fitted = forecast_text(value or "—", at(WIDTH - PAD - 8) - left, text_font, draw)
-            draw.text((left, y), fitted, font=text_font, fill=SECONDARY_TEXT, anchor="lm")
+        now = model.hint_now.rstrip("。；！ ")
+        idea = model.hint_next.lstrip("。；！ ")
+        paragraph = "。".join(part for part in (now, idea) if part) or "正在整理可做的事项"
+        lines = forecast_lines(paragraph, at(WIDTH - 2 * PAD - 6) - at(0), text_font, draw)
+        for index, line in enumerate(lines):
+            draw.text((at(PAD), at(top + index * 17)), line, font=text_font, fill=SECONDARY_TEXT, anchor="lm")
 
     def _bubble(self, frame, m: BubbleModel, x, y, r, scale, alpha, label=True, expanded=False, crisp=False):
         layout = round(m.radius * scale)
