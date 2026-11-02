@@ -46,6 +46,7 @@ class QuotaSnapshot:
     today_date: str | None = None            # local date; do not reuse yesterday's total
     credits_balance: float | None = None     # Codex purchased credits left; None when not reported
     reset_credits: int | None = None         # Codex free full resets (5 h + weekly) available
+    held: bool = False                       # a doubtful reading set aside (not a failed read)
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -297,11 +298,22 @@ CLAUDE_PROBE_GAP_SECONDS = 120
 # no longer counts as current: Desktop and web use never reach the status line.
 CLAUDE_HOVER_FRESH_SECONDS = 45
 CLAUDE_HOVER_PROBE_GAP_SECONDS = 30
-# Sources whose icon or panel is being looked at, and when each look began (set by the tray).
+# While Claude is in use the status line can still trail the account (it
+# holds each session's last request); /usage checks it at least this often.
+CLAUDE_ACTIVE_VERIFY_SECONDS = 180
+CLAUDE_HELD = "同一重置窗口的 Claude 额度读数异常回升，等待新的有效读数"
+# Sources whose icon or panel is being looked at, and when each look began,
+# and sources in use (all set by the tray).
 WATCHED: frozenset[str] = frozenset()
+ACTIVE: frozenset[str] = frozenset()
 HOVER_STARTED: dict[str, float] = {}
 _CLAUDE_PROBE: dict[str, Any] = {}
 _CLAUDE_PROBE_LOCK = threading.Lock()
+
+
+def native_claude_quota(report: dict) -> QuotaSnapshot:
+    """Claude's quota as the status-line receiver last saw it (no /usage)."""
+    return _claude_native(report)
 
 
 def _claude_native(report: dict) -> QuotaSnapshot:
@@ -338,29 +350,63 @@ def _claude_probe_cached(gap: float = CLAUDE_PROBE_GAP_SECONDS) -> QuotaSnapshot
         return cached
 
 
+def _further(window_a: tuple, window_b: tuple) -> int:
+    """1 when (used, reset) a is further along than b, -1 when b is, else 0:
+    a later reset is a newer window; in one window, more used is newer."""
+    (used_a, reset_a), (used_b, reset_b) = window_a, window_b
+    if used_a is None or used_b is None:
+        return (used_a is not None) - (used_b is not None)
+    if reset_a and reset_b and abs(reset_a - reset_b) > 180:
+        return 1 if reset_a > reset_b else -1
+    return (used_a > used_b) - (used_a < used_b)
+
+
+def claude_newer(probed: QuotaSnapshot, native: QuotaSnapshot) -> QuotaSnapshot:
+    """The reading further along: `/usage` and the status line can each trail
+    the other, but the account's use never goes back within a window."""
+    for pick in ((probed.used_percent, probed.resets_at), (native.used_percent, native.resets_at)), \
+                ((probed.secondary_used_percent, probed.secondary_resets_at),
+                 (native.secondary_used_percent, native.secondary_resets_at)):
+        order = _further(*pick)
+        if order:
+            return probed if order > 0 else native
+    return probed
+
+
 def get_claude_quota() -> QuotaSnapshot:
-    """The status line while a CLI session keeps it live, else `/usage`.
-    While the icon or panel is hovered, a status line older than
-    CLAUDE_HOVER_FRESH_SECONDS is checked against `/usage` too, at once on
-    each new hover."""
+    """The status line while a CLI session keeps it live, checked against
+    `/usage`: at once on each new hover, every CLAUDE_HOVER_PROBE_GAP_SECONDS
+    while hovered once the status line is CLAUDE_HOVER_FRESH_SECONDS old,
+    every CLAUDE_ACTIVE_VERIFY_SECONDS while Claude is in use, right after a
+    doubtful reading was set aside, and whenever the status line went quiet.
+    The reading further along wins."""
     import claude_status
     report = claude_status.latest()
     native = _claude_native(report) if report else None
-    watched = "claude" in WATCHED
-    if native is not None and not native.stale and not (
-            watched and time.time() - (native.updated_at or 0) > CLAUDE_HOVER_FRESH_SECONDS):
-        return native
-    gap = CLAUDE_PROBE_GAP_SECONDS
-    if watched:
-        # The first read of each new hover asks /usage itself; reads during
-        # the same hover reuse it for CLAUDE_HOVER_PROBE_GAP_SECONDS.
-        fresh_look = _CLAUDE_PROBE.get("at", 0.0) < HOVER_STARTED.get("claude", 0.0)
-        gap = 0 if fresh_look else CLAUDE_HOVER_PROBE_GAP_SECONDS
+    watched, active = "claude" in WATCHED, "claude" in ACTIVE
+    verify = _CLAUDE_PROBE.pop("verify", False)
+    now = time.time()
+    checked = now - _CLAUDE_PROBE.get("at", 0.0)
+    fresh_look = watched and _CLAUDE_PROBE.get("at", 0.0) < HOVER_STARTED.get("claude", 0.0)
+    if native is not None and not native.stale and not verify and not fresh_look and not (
+            watched and now - (native.updated_at or 0) > CLAUDE_HOVER_FRESH_SECONDS) and not (
+            active and checked >= CLAUDE_ACTIVE_VERIFY_SECONDS):
+        # Between checks, the last /usage result still counts: a status line
+        # behind it (an idle session's older figure) does not pull it back.
+        last = _CLAUDE_PROBE.get("snapshot")
+        return native if last is None or last.error else claude_newer(native, last)
+    if verify or fresh_look:
+        gap = 0
+    elif watched:
+        gap = CLAUDE_HOVER_PROBE_GAP_SECONDS
+    elif active:
+        gap = CLAUDE_ACTIVE_VERIFY_SECONDS
+    else:
+        gap = CLAUDE_PROBE_GAP_SECONDS
     probed = _claude_probe_cached(gap)
     if probed.error is None:
-        if native is None or (probed.updated_at or 0) >= (native.updated_at or 0):
-            return probed
-        return native
+        # An old status line never outvotes a live /usage check.
+        return probed if native is None or native.stale else claude_newer(probed, native)
     # A failed read keeps the last native numbers (marked stale) on screen.
     return native or probed
 
@@ -427,7 +473,10 @@ def keep_last_good(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaS
         if any(before is not None and after is not None and old_reset is not None and new_reset is not None
                and abs(old_reset - new_reset) <= 180 and before - after >= 5 and after > 5
                for before, after, old_reset, new_reset in windows):
-            snapshot.error = "同一重置窗口的 Claude 额度读数异常回升，等待新的有效读数"
+            # Set aside, not a failed read: the scheduler keeps reading, and
+            # the next read asks /usage at once instead of the status line.
+            snapshot.error, snapshot.held = CLAUDE_HELD, True
+            _CLAUDE_PROBE["verify"] = True
     if snapshot.provider == "gemini" and snapshot.error:
         # CLI logins can change between reads. Without an account identifier
         # in /usage, carrying old quota across a failed read is misleading.

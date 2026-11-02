@@ -642,6 +642,16 @@ class SteadyBubbleTests(unittest.TestCase):
         self.assertEqual(curve[16], (50, 50))
         self.assertGreater(both.position(curve[16][1]), .5)      # projection follows the curve, not an endpoint chord
 
+    def test_legend_lists_the_fuller_quota_first(self):
+        series = (
+            agent_panel.BurnSeries("low", 0, ((0, 90.0), (10, 20.0))),
+            agent_panel.BurnSeries("high", 1, ((0, 40.0), (10, 80.0))),
+            agent_panel.BurnSeries("mid", 2, ((0, 70.0), (10, 50.0))),
+            agent_panel.BurnSeries("also high", 3, ((0, 80.0),)),
+        )
+        chart = agent_panel.BurnChart(0, 20, 10, series)
+        self.assertEqual([text for *_, text in agent_panel.burn_legend(chart)], ["high", "also high", "mid", "low"])
+
     def test_global_chart_legends_wrap_and_keep_the_plot_and_footer_clear(self):
         labels = ('Codex · 5 小时', 'Codex · 每周', 'Claude Code · 5 小时', 'Claude Code · 每周',
                   'Gemini · Argon', 'Gemini · Claude/GPT', 'Xiaomi MiMo · 套餐额度', 'Grok · 每周')
@@ -730,7 +740,8 @@ class SteadyBubbleTests(unittest.TestCase):
         self.assertLess(scene.chart_progress, 1)
         self.assertTrue(scene.animating)
         self.assertIsNotNone(scene.render(1.25))
-        self.run_frames(scene, moment, 240)
+        # A 60 min chart zooms at once to 2 h, rests, then eases out to 5 h (~4.95 s).
+        self.run_frames(scene, moment, 360)
         self.assertEqual(scene.chart_progress, 1)
         self.assertFalse(scene.animating)
 

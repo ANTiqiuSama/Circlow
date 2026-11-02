@@ -80,7 +80,7 @@ def latest(now: float | None = None, folder: Path | None = None) -> dict | None:
     window that has not started yet: nothing used, reset unknown ("idle").
     """
     now = now or time.time()
-    reports, observed = [], {}
+    reports, observed = [], {}          # window -> [(seen, used, reset)] from every session
     try:
         paths = sorted((folder or data_dir() / "claude-status").glob("*.json"),
                        key=lambda path: path.stat().st_mtime, reverse=True)[:128]
@@ -107,14 +107,14 @@ def latest(now: float | None = None, folder: Path | None = None) -> dict | None:
                 if not math.isfinite(used) or not 0 <= used <= 100 or not math.isfinite(seen) or seen > at + 1:
                     continue
                 found = True
-                if name not in observed or seen > observed[name][0]:
-                    observed[name] = (seen, used, reset)
+                observed.setdefault(name, []).append((seen, used, reset))
             if found:
                 reports.append(at)
         except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
             continue
     if not reports:
         return None
+    observed = {name: _furthest(rows) for name, rows in observed.items()}
     windows = {}
     for name in WINDOWS:
         _, used, reset = observed.get(name, (None, None, None))
@@ -126,6 +126,26 @@ def latest(now: float | None = None, folder: Path | None = None) -> dict | None:
     # when Claude Code last actually reported a number.
     seen = max((value[0] for value in observed.values()), default=max(reports))
     return {"updated_at": max(reports), "observed_at": seen, "rate_limits": windows}
+
+
+RESET_JITTER = 180
+
+
+def _furthest(rows: list[tuple[float, float, int | None]]) -> tuple[float, float, int | None]:
+    """The account's figure for one window out of every session's reading.
+
+    A session re-reports the limits from its own last request each time its
+    status line redraws, with a fresh timestamp, so the newest timestamp is
+    often an idle session's old figure. Usage only grows inside a reset
+    window: the newest window wins, and in it the highest figure."""
+    resets = [reset for _, _, reset in rows if reset is not None]
+    if resets:
+        newest = max(resets)
+        rows = [row for row in rows if row[2] is not None and abs(row[2] - newest) <= RESET_JITTER]
+    used = max(row[1] for row in rows)
+    seen = max(row[0] for row in rows if row[1] == used)
+    reset = max((row[2] for row in rows if row[1] == used and row[2] is not None), default=None)
+    return seen, used, reset
 
 
 def desktop_roots() -> list[Path]:

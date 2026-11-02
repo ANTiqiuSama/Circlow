@@ -71,6 +71,7 @@ class BurnSeries:
     reset_at: float | None = None
     letter: str = ""                         # source colour, independent of hovered icon
     pooled: bool = False
+    idle: bool = False                       # not in use: a faint line, no fill or forecast
 
 
 @dataclass(frozen=True)
@@ -764,16 +765,17 @@ class Scene:
 
     @property
     def chart_zooming(self) -> bool:
-        """The close-up is easing out to BURN_DWELL_SPAN right now."""
+        """A dwell zoom is easing right now."""
         chart = self.model.burn if self.model is not None else None
-        if chart is None or (chart.now - chart.start) / 60 >= BURN_DWELL_SPAN - 1e-6:
+        if chart is None:
             return False
-        rested = self.time_since(self.opened)
-        return BURN_DWELL_DELAY <= rested <= BURN_DWELL_DELAY + BURN_DWELL_EASE + .05
+        return dwell_easing((chart.now - chart.start) / 60, self.time_since(self.opened))
 
     def _chart(self, frame, model, field_h, scale, at):
         """Burn chart below the task field; the plot draws itself left to right
-        on opening, and a close-up widens to 30 minutes once the pointer rests."""
+        on opening. The next wider beat starts in the same moment, whatever
+        span opened (30 minutes, then 2 hours, then 5 hours). Each later beat
+        waits out its short rest first."""
         chart = burn_dwell(model.burn, self.time_since(self.opened))
         colors = tuple(quota_shade(s.letter or model.letter, s.slot, s.points[-1][1] if s.points else None,
                                   s.pooled if s.letter else pooled(model))
@@ -1045,8 +1047,11 @@ BURN_HOLD = .6            # the span on screen stays while it still sees this sh
 BURN_FUTURE = .10         # the forecast strip takes about a tenth of the chart
 BURN_MIN_FUTURE = 60      # retain one minute of visible dashed trend in close-up
 BURN_TICKS_EVERY = {10: 2, 30: 5, 60: 15, 120: 30, 300: 60}   # span -> minutes between clock labels
-# A close-up eases out to this span once the pointer has rested a moment.
-BURN_DWELL_SPAN, BURN_DWELL_DELAY, BURN_DWELL_EASE = 30, 2.5, 1.2    # minutes, seconds, seconds
+# Hover zoom, three beats of the same motion: (target minutes, rest, ease).
+# A beat already behind the opened span is skipped. The first beat still
+# ahead starts at once — its rest is not waited — then each later beat
+# keeps its rest: 30 min, 2 h, then 5 h.
+BURN_DWELL_BEATS = ((30, 0.0, 1.2), (120, 2.5, 1.2), (300, 2.5, 1.2))
 
 
 def smootherstep(t: float) -> float:
@@ -1067,30 +1072,78 @@ def burn_future(back: float) -> float:
     return max(BURN_FUTURE * back, min(back, BURN_MIN_FUTURE))
 
 
+IDLE_ALPHA = 110          # an idle source's line and legend swatch
+LONE_TAG_ROOM = 112       # legend space kept for the tag of the one source in use
+
+
+def _axis_values(pairs) -> list[list[float]]:
+    """Values the %-axis is fitted to, from (series, history) pairs: the
+    sources in use, or every source when none is."""
+    live = [history for series, history in pairs if not series.idle]
+    return [[value for _, value in history] for history in (live or [history for _, history in pairs])]
+
+
 @lru_cache(maxsize=8)
 def burn_axis(chart: BurnChart) -> "BurnScale":
     """The %-axis the chart would pick for itself (see burn_sprite)."""
-    return burn_scale([value for _, value in burn_points(series, chart)[0]] for series in chart.series)
+    return burn_scale(_axis_values([(series, burn_points(series, chart)[0]) for series in chart.series]))
+
+
+def _dwell_plan(base: float) -> list[tuple[float, float, float]]:
+    """Beats still wider than `base` minutes. The first of them starts at
+    once, whichever target that is; each later beat keeps its own rest."""
+    plan = []
+    for target, delay, ease in BURN_DWELL_BEATS:
+        if base >= target - 1e-6:
+            continue
+        plan.append((float(target), 0.0 if not plan else float(delay), float(ease)))
+    return plan
+
+
+def dwell_easing(base: float, rested: float, slack: float = 0.05) -> bool:
+    """True while a dwell beat is moving, plus a few frames after it lands
+    so the settled view is drawn. `base` is the chart's own span in minutes.
+    The first beat still ahead of `base` is already moving at rested 0."""
+    for _target, delay, ease in _dwell_plan(base):
+        end = delay + ease
+        if delay <= rested <= end + slack:
+            return True
+        if rested < delay:
+            return False
+        rested -= end
+    return False
+
+
+def _eased_span(chart: BurnChart, origin: float, target: float, p: float) -> BurnChart:
+    """Widen from `origin` minutes to `target` by progress `p`. The span grows
+    by a constant ratio per step of the smootherstep curve, so the zoom looks
+    even rather than rushing at first; the %-axis eases between the two
+    views' own scales on the same curve, so it never jumps mid-zoom."""
+    if p <= 0:
+        return chart
+    view = burn_view(chart, origin * (target / origin) ** p)
+    if p >= 1:
+        return view
+    a, b = burn_axis(chart), burn_axis(burn_view(chart, target))
+    axis = BurnScale(a.top + (b.top - a.top) * p, a.width * (b.width / a.width) ** p)
+    return replace(view, axis=axis)
 
 
 def burn_dwell(chart: BurnChart | None, rested: float) -> BurnChart | None:
-    """The view after the pointer rested `rested` seconds: a span under
-    BURN_DWELL_SPAN widens to it over BURN_DWELL_EASE. The span grows by a
-    constant ratio per step of the smootherstep curve, so the zoom looks
-    even rather than rushing at first; the %-axis eases between the two
-    views' own scales on the same curve, so it never jumps mid-zoom."""
+    """The view after the pointer rested `rested` seconds. Each beat still
+    wider than the opened span eases out to its target. The first of those
+    starts at once; a chart already at 5 hours is unchanged."""
     if chart is None:
         return None
     base = (chart.now - chart.start) / 60
-    p = smootherstep((rested - BURN_DWELL_DELAY) / BURN_DWELL_EASE)
-    if base >= BURN_DWELL_SPAN - 1e-6 or p <= 0:
-        return chart
-    view = burn_view(chart, base * (BURN_DWELL_SPAN / base) ** p)
-    if p >= 1:
-        return view
-    a, b = burn_axis(chart), burn_axis(burn_view(chart, BURN_DWELL_SPAN))
-    axis = BurnScale(a.top + (b.top - a.top) * p, a.width * (b.width / a.width) ** p)
-    return replace(view, axis=axis)
+    for target, delay, ease in _dwell_plan(base):
+        p = smootherstep((rested - delay) / ease) if ease else 1.0
+        if p < 1:
+            return _eased_span(chart, base, float(target), p)
+        chart = burn_view(chart, target)
+        base = target
+        rested -= delay + ease
+    return chart
 
 
 def burn_time_ticks(chart: BurnChart) -> list[float]:
@@ -1257,21 +1310,38 @@ def _dashed_curve(pen, points, color, width, dash, gap):
 
 @lru_cache(maxsize=16)
 def burn_legend(chart: BurnChart | None) -> tuple:
-    """Wrap source/window labels without shrinking the plot or clipping legends."""
+    """Wrap source/window labels without shrinking the plot or clipping legends.
+    Labels run from the fullest current quota to the lowest; a tie keeps
+    the chart's own order. Each entry still carries its series index so the
+    swatch matches that line."""
     if chart is None:
         return ()
     face = ui_font(10)
     probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     x, row, result = 10.0, 0, []
     single = len(chart.series) == 1
-    for index, series in enumerate(chart.series):
-        text = f"{series.label} · 剩余额度" if single else series.label
+    # Sources in use first, fullest first; idle ones after them under a short
+    # name, only while they fit on the row in hand: their faint lines need no
+    # second legend row.
+    ranked = sorted(enumerate(chart.series), key=lambda item: (item[1].idle, -(item[1].points[-1][1] if item[1].points else float("-inf"))))
+    # With one source in use, its "runs out at" / reset tag sits at the row's end.
+    room = CHART_WIDTH - 38 - (LONE_TAG_ROOM if sum(not s.idle for s in chart.series) == 1 else 0)
+    for index, series in ranked:
+        text = f"{series.label} · 剩余额度" if single else (short_label(series.label) if series.idle else series.label)
         width = probe.textlength(text, font=face) + (0 if single else 8)
+        if series.idle and x + width > room:
+            continue
         if x > 10 and x + width > CHART_WIDTH - 38:
             x, row = 10.0, row + 1
         result.append((index, x, row, text))
         x += width + 12
     return tuple(result)
+
+
+def short_label(label: str) -> str:
+    """"Codex · 5 小时" -> "Codex"; "Gemini · Argon" -> "Argon"."""
+    parts = label.split(" · ")
+    return parts[1] if parts[0] == "Gemini" and len(parts) > 1 else parts[0]
 
 
 def chart_extra(chart: BurnChart | None) -> float:
@@ -1281,8 +1351,8 @@ def chart_extra(chart: BurnChart | None) -> float:
 
 @lru_cache(maxsize=8)
 def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.Image:
-    """Burn-down chart: remaining % of each quota window in use, each in the
-    colour of its header bar. The forecast is dashed, resets are faint markers."""
+    """Burn-down chart: remaining % of every model, each in the colour of its
+    header bar. The forecast is dashed, resets are faint markers."""
     px = lambda value: round(value * scale)  # noqa: E731
     extra = chart_extra(chart)
     width, height = px(CHART_WIDTH), px(CHART_H + extra)
@@ -1290,38 +1360,42 @@ def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.I
     draw = ImageDraw.Draw(image)
     small = ui_font(px(10))
     if chart is None or not chart.series:
-        draw.text((width / 2, height / 2), "暂无正在工作或近期使用的 agent", font=small, fill=MUTED_TEXT, anchor="mm")
+        draw.text((width / 2, height / 2), "暂无额度读数", font=small, fill=MUTED_TEXT, anchor="mm")
         return image
     span = max(1.0, chart.end - chart.start)
     # Label row: a legend (one entry per line) and the next reset in view.
     single = len(chart.series) == 1
     last_x = 0
     for index, start_x, legend_row, text in burn_legend(chart):
-        color = colors[index]
+        idle = chart.series[index].idle
+        color = _with_alpha(colors[index], IDLE_ALPHA) if idle else colors[index]
         x, center_y = px(start_x), px(CHART_LABEL / 2 + 1 + legend_row * CHART_LABEL)
         if not single:
             draw.ellipse((x, center_y - px(2.5), x + px(5), center_y + px(2.5)), fill=color)
             x += px(8)
-        draw.text((x, center_y), text, font=small, fill=MUTED_TEXT if single else color, anchor="lm")
+        draw.text((x, center_y), text, font=small, fill=MUTED_TEXT if single or idle else color, anchor="lm")
         last_x = x + draw.textlength(text, font=small) + px(12)
-    resets = sorted(s.reset_at for s in chart.series if s.reset_at)
+    # Idle sources are context only: no reset marker, forecast or exhaustion tag.
+    resets = sorted(s.reset_at for s in chart.series if s.reset_at and not s.idle)
     drawn = [(series, color, *burn_points(series, chart)) for series, color in zip(chart.series, colors)]
-    axis = chart.axis or burn_scale([value for _, value in history] for _, _, history, _, _ in drawn)
-    ticks = burn_ticks(axis, (value for _, _, history, _, _ in drawn for _, value in history))
-    exhausting = [(exhausts, series, color) for series, color, _, _, exhausts in drawn if exhausts is not None]
+    axis = chart.axis or burn_scale(_axis_values([(series, history) for series, _, history, _, _ in drawn]))
+    ticks = burn_ticks(axis, (value for values in _axis_values([(series, history) for series, _, history, _, _ in drawn])
+                              for value in values))
+    exhausting = [(exhausts, series, color) for series, color, _, _, exhausts in drawn
+                  if exhausts is not None and not series.idle]
     first = min(exhausting, key=lambda item: item[0]) if exhausting else None
     row = px(CHART_LABEL / 2 + 1)
     tag_right = width - px(10)
+    lone = sum(not s.idle for s in chart.series) == 1     # idle lines are context, not rivals for the tag
     if first is not None:
         # The earliest exhaustion is named in the label row, where no line runs;
         # the reset stays visible as its blue marker.
-        tag = ("" if single else first[1].label + " ") + f"约 {_clock(first[0], chart.now)} 用完"
-        if single and tag_right - draw.textlength(tag, font=small) > last_x:
+        tag = f"约 {_clock(first[0], chart.now)} 用完"
+        if lone and tag_right - draw.textlength(tag, font=small) > last_x:
             draw.text((tag_right, row), tag, font=small, fill=first[2], anchor="rm")
     elif resets:
-        prefix = "重置" if single else "最近重置"
-        tag = f"{prefix} {_clock(resets[0], chart.now)}"
-        if single and tag_right - draw.textlength(tag, font=small) > last_x:
+        tag = f"重置 {_clock(resets[0], chart.now)}"
+        if lone and tag_right - draw.textlength(tag, font=small) > last_x:
             draw.text((tag_right, row), tag, font=small, fill=MUTED_TEXT, anchor="rm")
 
     k = SUPERSAMPLE
@@ -1337,20 +1411,26 @@ def burn_sprite(chart: BurnChart | None, colors: tuple, scale: float) -> Image.I
         if chart.start <= reset <= chart.end:
             for y in range(round(top*scale*k), round(bottom*scale*k), 4*k):
                 pen.line((X(reset),y,X(reset),min(bottom*scale*k,y+2*k)), fill=(240,238,230,70), width=hair)
-    # Fills first (lighter when several overlap), then every line above all fills.
+    # Fills first, only under sources in use (lighter when several overlap),
+    # then every line above all fills; idle lines thin and faint.
+    filled = sum(1 for series, *_ in drawn if not series.idle)
     for series, color, history, _, _ in drawn:
-        if len(history) >= 2:
+        if len(history) >= 2 and not series.idle:
             line = [(X(t), Y(r)) for t, r in history]
             area = Image.new("L", big.size, 0)
             baseline = bottom*scale*k
-            ImageDraw.Draw(area).polygon(line + [(line[-1][0], baseline), (line[0][0], baseline)], fill=46 if single else 22)
+            ImageDraw.Draw(area).polygon(line + [(line[-1][0], baseline), (line[0][0], baseline)], fill=46 if filled == 1 else 22)
             fill = Image.new("RGBA", big.size, tuple(color[:3]) + (0,))
             fill.putalpha(area)
             big.alpha_composite(fill)
-    for series, color, history, projection, _ in drawn:
+    for series, color, history, projection, _ in sorted(drawn, key=lambda item: not item[0].idle):
         if len(history) >= 2:
-            pen.line([(X(t), Y(r)) for t, r in history], fill=color, width=max(2, round(1.6 * scale * k)), joint="curve")
-        if projection:
+            if series.idle:
+                pen.line([(X(t), Y(r)) for t, r in history], fill=_with_alpha(color, IDLE_ALPHA),
+                         width=max(1, round(scale * k)), joint="curve")
+            else:
+                pen.line([(X(t), Y(r)) for t, r in history], fill=color, width=max(2, round(1.6 * scale * k)), joint="curve")
+        if projection and not series.idle:
             _dashed_curve(pen, [(X(t), Y(r)) for t, r in burn_projection_curve(projection)],
                           _with_alpha(color, 200), max(2, round(1.3 * scale * k)), 5 * scale * k, 4 * scale * k)
     image.alpha_composite(big.resize((width, height), Image.LANCZOS))

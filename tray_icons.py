@@ -66,14 +66,32 @@ def icon_windows(snapshot: QuotaSnapshot, letter: str) -> tuple[tuple, tuple | N
 
 
 EXHAUSTED_REMAINING = 5.0  # User treats 95% used as exhausted for display.
+# Below this the icon shows when the quota comes back (the red countdown)
+# instead of a nearly empty ring: Claude, Codex, Grok, and Gemini's own model
+# pool (keys are sources, or Antigravity pool keys). Argon, Claude/GPT and
+# MiMo keep EXHAUSTED_REMAINING.
+COUNTDOWN_BELOW = 15.0
+COUNTDOWN_KEYS = frozenset({"claude", "codex", "grok", "gemini"})
 
 
-def exhaustion_threshold(provider: str) -> float:
-    return 10.0 if provider in ("codex", "grok") else EXHAUSTED_REMAINING
+def exhaustion_threshold(provider: str, pool: str | None = None) -> float:
+    return COUNTDOWN_BELOW if (pool or provider) in COUNTDOWN_KEYS else EXHAUSTED_REMAINING
 
 
-def quota_exhausted(value: float | None, provider: str = "") -> bool:
-    return value is not None and value <= exhaustion_threshold(provider)
+def quota_exhausted(value: float | None, provider: str = "", pool: str | None = None) -> bool:
+    """Treated as used up for display: under 15% for the countdown sources,
+    at or under 5% for the rest."""
+    if value is None:
+        return False
+    if (pool or provider) in COUNTDOWN_KEYS:
+        return value < COUNTDOWN_BELOW
+    return value <= EXHAUSTED_REMAINING
+
+
+def exhaustion_text(provider: str) -> str:
+    """How the panel names that line, e.g. "低于 15%" or "不超过 5%"."""
+    below = provider in COUNTDOWN_KEYS
+    return f"{'低于' if below else '不超过'} {exhaustion_threshold(provider):g}%"
 
 
 def countdown_value(seconds: float) -> tuple[int, str]:
@@ -109,10 +127,19 @@ def usable_again_at(snapshot: QuotaSnapshot, now: float) -> float | None:
     windows (all must recover), or the first pool to come back for model
     pools. None while it still has quota or the time is unknown."""
     if snapshot.pools and len(snapshot.pools) > 1:
-        known = [(p.get("remaining_percent"), p.get("resets_at")) for p in snapshot.pools if p.get("remaining_percent") is not None]
-        if not known or len(known) != len(snapshot.pools) or any(not quota_exhausted(value, snapshot.provider) for value, _ in known):
+        # Gemini's own pool under 15% counts down to its reset on its own,
+        # even while Argon or Claude/GPT still have quota.
+        own = [p.get("resets_at") for p in snapshot.pools if p.get("key") in COUNTDOWN_KEYS
+               and quota_exhausted(p.get("remaining_percent"), snapshot.provider, p.get("key"))
+               and p.get("resets_at") and p.get("resets_at") > now]
+        if own:
+            return float(min(own))
+        known = [(p.get("remaining_percent"), p.get("resets_at"), p.get("key")) for p in snapshot.pools
+                 if p.get("remaining_percent") is not None]
+        if not known or len(known) != len(snapshot.pools) or any(
+                not quota_exhausted(value, snapshot.provider, key) for value, _, key in known):
             return None
-        stamps = [stamp for _, stamp in known if stamp and stamp > now]
+        stamps = [stamp for _, stamp, _ in known if stamp and stamp > now]
         return float(min(stamps)) if stamps else None
     empty = [(value, stamp) for value, stamp in ((snapshot.remaining_percent, snapshot.resets_at),
                                                   (snapshot.secondary_remaining_percent, snapshot.secondary_resets_at))
@@ -140,8 +167,8 @@ def make_tps_icon(performance: dict, letter: str, reset_hint: bool = False) -> I
 
 def make_display_icon(snapshot: QuotaSnapshot, letter: str, performance: dict, reset_hint: bool = False) -> Image.Image:
     provider = getattr(snapshot, "provider", None)
-    if provider in ("codex", "grok") and usable_again_at(snapshot, time.time()) is not None:
-        return make_provider_icon(snapshot, letter, reset_hint)
+    if provider in ("claude", "codex", "grok") and usable_again_at(snapshot, time.time()) is not None:
+        return make_provider_icon(snapshot, letter, reset_hint)    # the countdown wins over a live TPS disc
     if provider == "gemini":
         return make_provider_icon(snapshot, letter, reset_hint)
     if performance.get("active_sessions", 0) and performance.get("display_tps") is not None:

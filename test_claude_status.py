@@ -142,6 +142,53 @@ class ClaudeStatusTests(unittest.TestCase):
         self.assertEqual(cli.call_count, 3)
         quota_sources._CLAUDE_PROBE.clear()
 
+    def test_sessions_holding_older_figures_do_not_win(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = time.time()
+            reset = int(now + 3600)
+            rows = {'live': (now - 30, 26.0, reset), 'idle': (now - 2, 16.0, reset),     # redrew last, older figure
+                    'old-window': (now - 1, 90.0, reset - 5 * 3600)}                     # a previous window
+            for name, (seen, used, at) in rows.items():
+                (Path(tmp) / f'{name}.json').write_text(json.dumps({'updated_at': seen, 'rate_limits': {
+                    'five_hour': {'used_percentage': used, 'resets_at': at, 'observed_at': seen}}}), encoding='utf-8')
+            report = claude_status.latest(now, Path(tmp))
+        self.assertEqual(report['rate_limits']['five_hour'], {'used_percentage': 26.0, 'resets_at': reset})
+        self.assertAlmostEqual(report['observed_at'], now - 30)
+
+    def test_claude_is_checked_against_usage_while_in_use_and_after_a_doubtful_reading(self):
+        now = time.time()
+        report = {'updated_at': now, 'observed_at': now - 5, 'rate_limits': {
+            'five_hour': {'used_percentage': 16, 'resets_at': int(now + 1000)},
+            'seven_day': {'used_percentage': 8, 'resets_at': int(now + 10000)}}}
+        usage = {'window_minutes': 300, 'used_percent': 25, 'remaining_percent': 75, 'resets_at': int(now + 1000),
+                 'secondary_window_minutes': 10080, 'secondary_used_percent': 9,
+                 'secondary_remaining_percent': 91, 'secondary_resets_at': int(now + 10000)}
+        quota_sources._CLAUDE_PROBE.clear()
+        with patch.object(claude_status, 'latest', return_value=report), \
+                patch.object(quota_sources.providers, 'find_claude', return_value=Path('claude.exe')), \
+                patch.object(quota_sources.cli_quota, 'read_usage', return_value=usage) as cli:
+            self.assertEqual(quota_sources.get_claude_quota().remaining_percent, 84)    # idle: the status line
+            with patch.object(quota_sources, 'ACTIVE', frozenset({'claude'})):
+                self.assertEqual(quota_sources.get_claude_quota().remaining_percent, 75)  # in use: /usage, further along
+                self.assertEqual(quota_sources.get_claude_quota().remaining_percent, 75)  # checked moments ago: kept
+                self.assertEqual(cli.call_count, 1)
+            old = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 25, 75, int(now + 1000), now, False, None,
+                                              10080, 9, 91, int(now + 10000))
+            quota_sources._CLAUDE_PROBE.clear()                                       # no recent /usage result...
+            held = quota_sources.keep_last_good(quota_sources.get_claude_quota(), old)   # ...so 16 after 25: set aside
+            self.assertTrue(held.held)
+            self.assertEqual(held.remaining_percent, 75)
+            self.assertEqual(quota_sources.get_claude_quota().remaining_percent, 75)      # verified at once
+            self.assertEqual(cli.call_count, 2)
+        quota_sources._CLAUDE_PROBE.clear()
+        from refresh_scheduler import HELD_RECHECK, RefreshScheduler
+        scheduler = RefreshScheduler(('claude',), 0)
+        for moment in range(1, 6):                                      # never the 12 h "no quota" pause
+            scheduler.take_due(moment * 100)
+            scheduler.completed('claude', held, moment * 100)
+            self.assertFalse(scheduler.dormant['claude'])
+            self.assertEqual(scheduler.due['claude'], moment * 100 + HELD_RECHECK)
+
     def test_failed_usage_read_keeps_last_native_numbers_marked_stale(self):
         now = time.time()
         with patch.object(claude_status, 'latest', return_value=self.stale_report(now)),                 patch.object(quota_sources.providers, 'find_claude', return_value=Path('claude.exe')),                 patch.object(quota_sources.cli_quota, 'read_usage', side_effect=RuntimeError('exited')):

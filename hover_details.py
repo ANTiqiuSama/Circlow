@@ -55,6 +55,27 @@ class HoverIcon(pystray.Icon):
         # Set this again after Explorer recreates the notification area.
         self._version4 = bool(self._message(4, 0, uVersion=4))
 
+    icon_failed = False          # the Shell refused the last picture: send it again
+
+    def _update_icon(self):
+        # pystray ignores NIM_MODIFY's result. While Explorer is busy (it
+        # reflows the tray when slots are reassigned) the call can fail, and
+        # the slot keeps showing an old picture, even another source's,
+        # until the image changes again; the tray retries on icon_failed.
+        self._release_icon()
+        self._assert_icon_handle()
+        self.icon_failed = not self._message(win32.NIM_MODIFY, win32.NIF_ICON, hIcon=self._icon_handle)
+        self._icon_valid = True
+        if self.icon_failed:
+            logging.getLogger(__name__).info("tray icon %d: the Shell did not take the new picture; will resend", self.icon_id)
+
+    def resend_icon(self) -> bool:
+        """Send the current picture again; True when the Shell took it."""
+        if not self.visible or not self._hwnd or self.icon is None:
+            return False
+        self._update_icon()
+        return not self.icon_failed
+
     def ensure_registered(self) -> bool:
         """Re-add an icon the Shell does not hold. pystray ignores a failed
         NIM_ADD (e.g. while Explorer is busy) and only retries on
