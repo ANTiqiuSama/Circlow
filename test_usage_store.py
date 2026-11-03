@@ -90,6 +90,51 @@ class UsageStoreTests(unittest.TestCase):
         self.assertEqual(lines[4], "额度换算：5 小时额度每 1% 约 807 输出 tokens")
         self.assertEqual(insights(store, "claude", now)[0][:4], "记录：暂")
 
+    def test_tile_lines_never_start_with_closing_or_end_with_opening_marks(self):
+        from PIL import Image, ImageDraw
+        draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        face = view.ui_font(12)
+        text = "11:02 刚重置；上周还剩 38% 没用完（约 29.4K 输出 tokens），本周可多用"
+        for limit in range(60, 260, 7):
+            lines = view._wrap_text(draw, text, face, limit)
+            self.assertEqual("".join(lines).replace(" ", ""), text.replace(" ", ""))
+            self.assertFalse(any(line[:1] in view.NO_LINE_START for line in lines if line), (limit, lines))
+            self.assertFalse(any(line[-1:] in view.NO_LINE_END for line in lines[:-1] if line), (limit, lines))
+
+    def test_a_weekly_reset_with_much_left_unused_is_pointed_out(self):
+        now = time.mktime((2026, 11, 3, 15, 0, 0, 0, 0, -1))
+        reset = int(time.mktime((2026, 11, 3, 11, 2, 0, 0, 0, -1)))
+        week = 7 * 86400
+
+        def week_of(last_used, last_read=reset - 600, new_reset=reset + week, early=None):
+            readings = [Sample(reset - week + 3600 * k, min(last_used, k), reset) for k in range(0, 160, 8)]
+            readings.append(Sample(last_read, last_used, reset if early is None else early))
+            readings += [Sample(reset + 600, 0, new_reset), Sample(reset + 3600, 1, new_reset)]
+            return readings
+        found = usage_store.weekly_leftover(week_of(62), now)
+        self.assertEqual((found["left"], found["used"], found["reset_at"]), (38, 62, reset))
+        self.assertIsNone(usage_store.weekly_leftover(week_of(88), now))                   # used a lot: no note
+        self.assertIsNone(usage_store.weekly_leftover(week_of(62), now + 3 * 86400))       # old news
+        self.assertIsNone(usage_store.weekly_leftover(week_of(62, last_read=reset - 20 * 3600), now))  # end unknown
+        self.assertIsNone(usage_store.weekly_leftover(week_of(62)[:-2], now))               # no reset yet
+        early = usage_store.weekly_leftover(week_of(40, early=reset + 3 * 86400), now)      # reset before schedule
+        self.assertEqual(early["reset_at"], reset + 600)
+        back = week_of(62)[:-2] + [Sample(reset - 300, 0, reset + week), Sample(reset - 200, 62, reset)]
+        self.assertIsNone(usage_store.weekly_leftover(back, now - 7200))                    # a window that went back
+
+        store = UsageStore(self.path)
+        line = usage_store.weekly_line(store, "grok", found, now)
+        self.assertEqual(line, "周额度：11:02 刚重置；上周还剩 38% 没用完，本周可多用")
+        for day in range(1, 7):                                                             # last week's own output
+            store.note(reply(f"w{day}", reset - day * 86400, 10_000, provider="grok"))
+        line = usage_store.weekly_line(store, "grok", found, now)
+        self.assertEqual(line, "周额度：11:02 刚重置；上周还剩 38% 没用完（约 36.8K 输出 tokens），本周可多用")  # 60K for 62%
+        lines = insights(store, "grok", now, weekly=week_of(62))
+        self.assertTrue(lines[0].startswith("周额度：11:02 刚重置"))                          # first, ahead of the day's figures
+        self.assertFalse(any(line.startswith("周额度") for line in insights(store, "grok", now, weekly=week_of(88))))
+        self.assertTrue(insights(UsageStore(self.folder / "empty.json.gz"), "grok", now, weekly=week_of(62))[0]
+                        .startswith("周额度"))                                               # even before any output record
+
 
 if __name__ == "__main__":
     unittest.main()

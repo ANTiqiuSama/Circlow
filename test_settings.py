@@ -298,6 +298,18 @@ class SettingsViewTests(unittest.TestCase):
         sections = tray_app.QuotaTray.detail_sections(tray, "codex")
         self.assertEqual([title for title, _lines in sections], ["额度", "速度", "重置", "用量", "读取"])
         self.assertIn("暂无输出", sections[3][1][0])
+        # The weekly window's readings feed the "周额度" note: Codex's second window.
+        from forecast import QuotaHistory
+        tray.history = QuotaHistory(Path(tempfile.mkdtemp()) / "history.json")
+        reset = int(time.time() - 3600)
+        for at, used, window in ((reset - 7200, 55, reset), (reset - 600, 58, reset), (reset + 600, 0, reset + 7 * 86400)):
+            tray.history.add("codex:secondary", at, used, window)
+        lines = tray_app.QuotaTray.detail_sections(tray, "codex")[3][1]
+        self.assertTrue(lines[0].startswith("周额度：") and "还剩 42%" in lines[0])
+        tray.history = QuotaHistory(Path(tempfile.mkdtemp()) / "five-hour.json")      # a 5-hour reset says nothing
+        for at, used, window in ((reset - 7200, 55, reset), (reset - 600, 58, reset), (reset + 600, 0, reset + 5 * 3600)):
+            tray.history.add("codex", at, used, window)
+        self.assertFalse(tray_app.QuotaTray.detail_sections(tray, "codex")[3][1][0].startswith("周额度"))
 
     def test_preferences_round_trip_and_apply(self):
         import tray_app

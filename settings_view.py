@@ -230,16 +230,23 @@ def _fact_layout(draw, rows, width: float, s: float, title: str = ""):
     return laid, height - FACT_GAP + FACT_FOOT
 
 
+NO_LINE_START = "）)」』】》，。、；：！？,.;:!?%"     # closing marks hang on the line before
+NO_LINE_END = "（(「『【《"                          # opening marks go to the next line
+
+
 def _wrap_text(draw, text: str, face, limit: float) -> list[str]:
     lines = []
     for paragraph in text.split("\n"):
         line = ""
         for char in paragraph:
-            if not line or draw.textlength(line + char, font=face) <= limit:
-                line += char
+            if not line or draw.textlength(line + char, font=face) <= limit or char in NO_LINE_START:
+                line += char           # a closing mark may run a little past the edge
             else:
+                carry = ""
+                while line and line[-1] in NO_LINE_END:
+                    line, carry = line[:-1], line[-1] + carry
                 lines.append(line.rstrip())
-                line = char.lstrip()
+                line = (carry + char).lstrip()
         lines.append(line)
     return lines
 
