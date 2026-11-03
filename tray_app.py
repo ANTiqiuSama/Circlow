@@ -782,7 +782,12 @@ class QuotaTray:
         if usage is not None:
             samples = self.history.samples(provider) if self.history is not None else []
             window = window_label(snapshot.window_minutes) if snapshot.window_minutes else ""
-            sections.append(("用量", usage_insights(usage, provider, time.time(), samples, f"{window}额度" if window else "")))
+            # The weekly window's readings (Grok's only window; Codex's and Claude's second one).
+            weekly_name = provider if snapshot.window_minutes == 10080 else (
+                f"{provider}:secondary" if snapshot.secondary_window_minutes == 10080 else None)
+            weekly = self.history.samples(weekly_name) if self.history is not None and weekly_name else []
+            sections.append(("用量", usage_insights(usage, provider, time.time(), samples, f"{window}额度" if window else "",
+                                                   weekly)))
         reads = [self.menu_updated(provider)]
         if self.scheduler:
             reads.append("刷新计划：" + self.scheduler.describe(provider, time.time()))

@@ -157,21 +157,65 @@ def _between(hours: dict[int, int], start: float, end: float) -> float:
     return total
 
 
-def insights(store: UsageStore, provider: str, now: float, samples: Iterable[Any] = (), window: str = "") -> list[str]:
-    """"标题：内容" lines about one provider's own output: today against
-    yesterday, the week's daily average and busiest hours, and how many output
-    tokens a percent of quota has gone for. `samples` are that window's quota
-    readings (forecast.Sample) over the same week."""
+WEEKLY_RECENT = 2 * 86400      # a weekly reset this recent is still news
+WEEKLY_LEFTOVER = 20.0         # % of last week left unused before it is worth a word
+WEEKLY_LAST_READ = 12 * 3600   # the old week's last reading must be this close to its reset
+
+
+def weekly_leftover(samples: Iterable[Any], now: float) -> dict | None:
+    """The weekly window that reset lately with plenty left: {"reset_at",
+    "left", "used", "since"} from the weekly window's quota readings
+    (forecast.Sample, glitches already out), or None. Only the latest reset
+    counts, it must be within WEEKLY_RECENT, the old week's last reading
+    within WEEKLY_LAST_READ of it, and at least WEEKLY_LEFTOVER left."""
+    ordered = sorted(samples, key=lambda s: s.at)
+    for before, after in reversed(list(zip(ordered, ordered[1:]))):
+        if same_window(before.resets_at, after.resets_at):
+            continue
+        if (after.resets_at or 0) <= (before.resets_at or 0) or after.used >= before.used:
+            return None              # not a reset (the window went back, or use did not start over)
+        # An early reset (Codex can reset before schedule) lands at the first new reading.
+        reset_at = min(before.resets_at, after.at) if before.resets_at else after.at
+        left = 100.0 - before.used
+        if now - reset_at > WEEKLY_RECENT or reset_at - before.at > WEEKLY_LAST_READ or left < WEEKLY_LEFTOVER:
+            return None
+        return {"reset_at": float(reset_at), "left": left, "used": before.used, "since": float(before.at)}
+    return None
+
+
+def weekly_line(store: UsageStore, provider: str, leftover: dict, now: float) -> str:
+    """"周额度：…" for a weekly reset with quota left over, and what that
+    leftover was worth in last week's own output, when that is known."""
+    moment = time.localtime(leftover["reset_at"])
+    when = time.strftime("%H:%M" if local_day(leftover["reset_at"]) == local_day(now) else "%m-%d %H:%M", moment)
+    text = f"周额度：{when} 刚重置；上周还剩 {leftover['left']:.0f}% 没用完"
+    week = sum(tokens for hour, tokens in store.hourly([provider], leftover["reset_at"] - 7 * 86400).items()
+               if hour < leftover["reset_at"])
+    if leftover["used"] >= 10 and week > 0:
+        text += f"（约 {_tokens(week / leftover['used'] * leftover['left'])} 输出 tokens）"
+    return text + "，本周可多用"
+
+
+def insights(store: UsageStore, provider: str, now: float, samples: Iterable[Any] = (), window: str = "",
+             weekly: Iterable[Any] = ()) -> list[str]:
+    """"标题：内容" lines about one provider's own output: a weekly window
+    that just reset with much of it unused, today against yesterday, the
+    week's daily average and busiest hours, and how many output tokens a
+    percent of quota has gone for. `samples` are that window's quota readings
+    (forecast.Sample) over the same week; `weekly` the weekly window's (none
+    for 5-hour windows: those reset too often to be worth the note)."""
     day = local_day(now)
     week_start = local_day(day - 7 * 86400 + 3600)
     hours = store.hourly([provider], week_start)
+    leftover = weekly_leftover(weekly, now)
+    head = [weekly_line(store, provider, leftover, now)] if leftover else []
     if not any(hours.values()):
-        return ["记录：暂无输出；开始使用后在此统计（保存在本机，重启后保留）"]
+        return head + ["记录：暂无输出；开始使用后在此统计（保存在本机，重启后保留）"]
     today = sum(tokens for hour, tokens in hours.items() if hour >= day)
     yesterday_start = local_day(day - 3600)
     yesterday = sum(tokens for hour, tokens in hours.items() if yesterday_start <= hour < day)
     so_far = sum(tokens for hour, tokens in hours.items() if yesterday_start <= hour < now - 86400)
-    lines = [f"今天：{_tokens(today)} tokens · {store.replies([provider], day)} 次回复"]
+    lines = head + [f"今天：{_tokens(today)} tokens · {store.replies([provider], day)} 次回复"]
     if so_far > 0:
         change = (today - so_far) / so_far * 100
         lines.append(f"比昨天此时：{'+' if change >= 0 else ''}{change:.0f}%（昨天全天 {_tokens(yesterday)}）")
