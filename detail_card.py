@@ -14,7 +14,7 @@ from icon_art import IVORY
 MARGIN = 14                      # Transparent room for the soft shadow.
 RADIUS = 14
 
-SURFACE = (36, 35, 32, 250)
+SURFACE = (22, 21, 19, 250)          # hover card and task panel background
 BORDER = (240, 238, 230, 30)
 TRACK = (240, 238, 230, 30)
 TEXT = IVORY
