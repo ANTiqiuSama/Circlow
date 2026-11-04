@@ -145,7 +145,8 @@ CHART = 80 + CHART_AXIS     # Burn chart under the task field.
 CHART_TOP = 16              # Field bottom to chart sprite; the two plates keep an 8 px gap.
 CHART_H = 64 + CHART_AXIS   # Chart sprite: label row, plot and clock row.
 CHART_LABEL = 15            # Label row inside the sprite.
-HINT_H = 42                 # One short paragraph, up to two lines, above the forecast.
+HINT_H = 48                 # One short paragraph, up to two lines, above the forecast.
+HINT_FONT, HINT_LINE = 13, 21   # px: the size of LumaCenter's tray-panel notes beside it
 GEAR_RADIUS = 7.5
 GEAR_HIT = 17.0
 
@@ -799,14 +800,14 @@ class Scene:
     def _hint(self, frame, model, field_h, scale, at):
         """One shared MiMo/local paragraph, drawn over the cached background."""
         draw = ImageDraw.Draw(frame)
-        text_font = ui_font(round(10 * scale))
-        top = chart_top(model, field_h) + CHART_H + chart_extra_for(model) + 14
+        text_font = ui_font(round(HINT_FONT * scale))
+        top = chart_top(model, field_h) + CHART_H + chart_extra_for(model) + 15
         now = model.hint_now.rstrip("。；！ ")
         idea = model.hint_next.lstrip("。；！ ")
         paragraph = "。".join(part for part in (now, idea) if part) or "正在整理可做的事项"
         lines = forecast_lines(paragraph, at(WIDTH - 2 * PAD - 6) - at(0), text_font, draw)
         for index, line in enumerate(lines):
-            draw.text((at(PAD), at(top + index * 17)), line, font=text_font, fill=SECONDARY_TEXT, anchor="lm")
+            draw.text((at(PAD), at(top + index * HINT_LINE)), line, font=text_font, fill=SECONDARY_TEXT, anchor="lm")
 
     def _bubble(self, frame, m: BubbleModel, x, y, r, scale, alpha, label=True, expanded=False, crisp=False):
         layout = round(m.radius * scale)
