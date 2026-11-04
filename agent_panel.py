@@ -146,7 +146,8 @@ CHART_TOP = 16              # Field bottom to chart sprite; the two plates keep 
 CHART_H = 64 + CHART_AXIS   # Chart sprite: label row, plot and clock row.
 CHART_LABEL = 15            # Label row inside the sprite.
 HINT_H = 48                 # One short paragraph, up to two lines, above the forecast.
-HINT_FONT, HINT_LINE = 13, 21   # px: the size of LumaCenter's tray-panel notes beside it
+HINT_FONT, HINT_LINE = 13, 24   # px: LumaCenter's tray-panel notes beside it (size, row)
+HINT_TEXT_X = 22                # text after the 12 px mark, as LumaCenter lays its rows out
 GEAR_RADIUS = 7.5
 GEAR_HIT = 17.0
 
@@ -798,16 +799,23 @@ class Scene:
             frame.alpha_composite(sprite.crop((0, label, width, sprite.height)), (left, top + label))
 
     def _hint(self, frame, model, field_h, scale, at):
-        """One shared MiMo/local paragraph, drawn over the cached background."""
+        """The shared MiMo/local hint as two marked rows, like LumaCenter's
+        notes beside it: what is going on now (a dot in the source's colour,
+        bright text) and an idea for next (a MiMo spark, dimmer text). Each
+        row is one line, cut with an ellipsis."""
         draw = ImageDraw.Draw(frame)
         text_font = ui_font(round(HINT_FONT * scale))
         top = chart_top(model, field_h) + CHART_H + chart_extra_for(model) + 15
-        now = model.hint_now.rstrip("。；！ ")
-        idea = model.hint_next.lstrip("。；！ ")
-        paragraph = "。".join(part for part in (now, idea) if part) or "正在整理可做的事项"
-        lines = forecast_lines(paragraph, at(WIDTH - 2 * PAD - 6) - at(0), text_font, draw)
-        for index, line in enumerate(lines):
-            draw.text((at(PAD), at(top + index * HINT_LINE)), line, font=text_font, fill=SECONDARY_TEXT, anchor="lm")
+        now = model.hint_now.strip("。；！ ") or "正在整理可做的事项"
+        idea = model.hint_next.strip("。；！ ")
+        rows = [("now", now, TEXT, accent(model.letter))] + ([("next", idea, SECONDARY_TEXT, accent("M"))] if idea else [])
+        limit = at(WIDTH - PAD) - at(PAD + HINT_TEXT_X)
+        for index, (kind, text, ink, tone) in enumerate(rows):
+            y = at(top + index * HINT_LINE)
+            mark = hint_mark(kind, tone, scale)
+            frame.alpha_composite(mark, (round(at(PAD + 2)), round(y - mark.height / 2)))
+            draw.text((at(PAD + HINT_TEXT_X), y), forecast_text(text, limit, text_font, draw), font=text_font, fill=ink,
+                      anchor="lm")
 
     def _bubble(self, frame, m: BubbleModel, x, y, r, scale, alpha, label=True, expanded=False, crisp=False):
         layout = round(m.radius * scale)
@@ -1489,6 +1497,26 @@ def _burn_axis(draw, chart: BurnChart, X, k, px, left, right, bottom, scale) -> 
         draw.line((x, px(bottom), x, px(bottom + 2)), fill=_with_alpha(MUTED_TEXT, 120), width=hair)
         draw.text((x, y), text, font=face, fill=MUTED_TEXT, anchor="mm")
         edge = x + half + px(6)
+
+
+@lru_cache(maxsize=16)
+def hint_mark(kind: str, color: tuple, scale: float) -> Image.Image:
+    """The 12 px mark in front of a hint row: "now" a filled dot, "next" a
+    four-point spark; drawn large and scaled down so both stay smooth."""
+    size = max(1, round(12 * scale))
+    k = SUPERSAMPLE
+    image = Image.new("RGBA", (size * k, size * k), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    c = size * k / 2
+    if kind == "now":
+        r = 4 * scale * k
+        draw.ellipse((c - r, c - r, c + r, c + r), fill=color)
+    else:
+        outer, inner = 5.6 * scale * k, 1.5 * scale * k
+        draw.polygon([(c + (outer if i % 2 == 0 else inner) * math.cos(-math.pi / 2 + i * math.pi / 4),
+                       c + (outer if i % 2 == 0 else inner) * math.sin(-math.pi / 2 + i * math.pi / 4)) for i in range(8)],
+                     fill=color)
+    return image.resize((size, size), Image.LANCZOS)
 
 
 def forecast_text(text: str, limit: float, face, probe) -> str:
