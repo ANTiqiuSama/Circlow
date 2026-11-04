@@ -19,7 +19,7 @@ from functools import lru_cache
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
-from detail_card import MARGIN, MUTED_TEXT, SECONDARY_TEXT, TEXT, TRACK, _compose, _wrap, figure_font, ui_font
+from detail_card import MARGIN, MUTED_TEXT, SECONDARY_TEXT, SURFACE, TEXT, TRACK, _compose, _wrap, figure_font, ui_font
 from icon_art import AMBER, CLAY, PAID, POOL_SHADES, UNIFORM_LETTERS, WINDOW_SHADES, accent, ring_color, window_shade
 
 WIDTH = 420
@@ -959,7 +959,7 @@ def caption(text: str, letter: str, max_width: int, expanded: bool, scale: float
         # Hovered: a wider detail line drawn above its neighbours on the panel colour.
         plate = Image.new("RGBA", (width + 2 * round(6 * scale), image.height + 2 * round(3 * scale)), (0, 0, 0, 0))
         ImageDraw.Draw(plate).rounded_rectangle((0, 0, plate.width - 1, plate.height - 1), radius=round(6 * scale),
-                                                fill=(44, 43, 39, 245), outline=(240, 238, 230, 24))
+                                                fill=tuple(c + 8 for c in SURFACE[:3]) + (245,), outline=(240, 238, 230, 24))
         plate.alpha_composite(image, (round(6 * scale), round(3 * scale)))
         image, draw = plate, ImageDraw.Draw(plate)
         offset = (round(6 * scale), round(3 * scale))
@@ -1002,7 +1002,7 @@ def dot(radius: int, letter: str) -> Image.Image:
     image = Image.new("RGBA", (big, big), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     edge = 2 * SUPERSAMPLE
-    draw.ellipse((edge - SUPERSAMPLE, edge - SUPERSAMPLE, big - edge + SUPERSAMPLE, big - edge + SUPERSAMPLE), fill=(36, 35, 32, 255))
+    draw.ellipse((edge - SUPERSAMPLE, edge - SUPERSAMPLE, big - edge + SUPERSAMPLE, big - edge + SUPERSAMPLE), fill=tuple(SURFACE[:3]) + (255,))
     draw.ellipse((edge, edge, big - edge, big - edge), fill=accent(letter))
     return image.resize((big // SUPERSAMPLE, big // SUPERSAMPLE), Image.LANCZOS)
 
