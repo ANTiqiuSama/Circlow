@@ -261,21 +261,18 @@ class HoverTests(unittest.TestCase):
             self.assertEqual(hover.target_at(wintypes.POINT(20, 30)), ("codex", rect))
             self.assertEqual(hover.target_at(wintypes.POINT(40, 30)), (None, None))
 
-    def test_hover_freezes_shell_updates_then_resumes(self):
+    def test_an_icon_keeps_updating_while_its_panel_is_open(self):
         tray = QuotaTray.__new__(QuotaTray)
-        image = Image.new("RGBA", (64, 64), "green")
-        icon = SimpleNamespace(icon=image, title="previous", details_visible=True)
+        ring = Image.new("RGBA", (64, 64), "green")
+        icon = SimpleNamespace(icon=ring, title="最近TPS 暂无完整计数", details_visible=True, icon_failed=False)
         tray.icons, tray.snapshots = {"codex": icon}, {"codex": None}
-        tray.performance = {"providers": {"codex": {}}}
-        tray.tooltip = Mock(return_value="latest")
-        with patch("tray_app.make_display_icon", return_value=Image.new("RGBA", (64, 64), "red")) as render:
-            tray.update_icon("codex", "C")
-            render.assert_not_called()
-            self.assertEqual(icon.title, "previous")
-            icon.details_visible = False
-            tray.update_icon("codex", "C")
-            render.assert_called_once()
-            self.assertEqual(icon.title, "latest")
+        tray.performance = {"providers": {"codex": {"active_sessions": 1, "display_tps": 200.0}}}
+        tray.tooltip = Mock(return_value="最近TPS 200.0")
+        tps = Image.new("RGBA", (64, 64), "red")
+        with patch("tray_app.make_display_icon", return_value=tps):
+            tray.update_icon("codex", "C")                 # generation started while the panel was open
+        self.assertIs(icon.icon, tps)
+        self.assertEqual(icon.title, "最近TPS 200.0")
 
     def test_steady_popup_does_not_repeat_showwindow_or_change_tracking_position(self):
         popup = TrackingTooltip.__new__(TrackingTooltip)

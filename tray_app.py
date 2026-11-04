@@ -925,10 +925,10 @@ class QuotaTray:
         # (this also keeps the cached FreeType faces single-threaded).
         with self.ui_lock:
             icon = self.icons[provider]
-            if getattr(icon, "details_visible", False):
-                # Keep the Shell's hover target stable. The independent detail
-                # window still reads live values from self.performance.
-                return
+            # Hovered icons update too: the panel stays open through a Shell
+            # POPUPCLOSE (HoverDetails.target_at), and freezing the icon while
+            # its panel was open left it on a ring or an old countdown while
+            # the panel showed live TPS.
             image = make_display_icon(self.snapshots[provider], letter, self.performance["providers"][provider],
                                       reset_hint=provider == "codex" and self.reset_level() == "high")
             # Icon assignment always sends NIM_MODIFY, even for identical pixels.
