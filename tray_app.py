@@ -53,7 +53,7 @@ from tray_icons import (  # noqa: F401  (re-exported for callers and tests)
     icon_windows, make_display_icon, make_provider_icon, make_tps_icon, pace_marker, quota_exhausted,
     stale_note, usable_again_at)
 from tps_sources import PERFORMANCE_PATH, TpsMonitor, performance_signature, save_performance
-from usage_store import UsageStore, insights as usage_insights
+from usage_store import UsageStore, hint_line as usage_hint_line, insights as usage_insights
 
 
 APP_NAME = "CodexQuotaTray"
@@ -673,7 +673,9 @@ class QuotaTray:
         running = [data["display_model"]] if data.get("display_tps") is not None and data.get("display_model") else []
         intel, intel_note = self.panel_intel(now, running)
         forecast, forecast_tone = self.headline_forecast(provider)
-        hint_data = agent_hints.context(agents, self.snapshots, self.performance.get("software", []))
+        usage = getattr(self, "usage", None)
+        hint_data = agent_hints.context(agents, self.performance.get("software", []),
+                                        usage_hint_line(usage, PROVIDERS, now) if usage is not None else "")
         advisor = getattr(self, "hint_advisor", None)
         hint_now, hint_next = advisor.lookup(hint_data, getattr(self, "tps_monitor", None)) if advisor is not None else agent_hints.local_hint(hint_data)
         today_used = None

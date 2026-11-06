@@ -1,7 +1,7 @@
 """Short, optional MiMo advice for the hover panel.
 
-Only compact agent labels/actions, provider quota percentages and detected AI
-client names leave the machine. No transcripts, paths, cookies or credentials
+Only compact agent labels/actions, a one-line usage summary (output totals,
+no quota) and detected AI client names leave the machine. No transcripts, paths, cookies or credentials
 are placed in the prompt. Results stay in memory and refresh at a bounded pace.
 """
 from __future__ import annotations
@@ -25,12 +25,12 @@ RESULT_SECONDS = 120
 FAILURE_GAP = 300
 
 SYSTEM_PROMPT = (
-    "你是本机编程工作台的灵感助手。参考当前工作状态以及各 agent 的历史话题，充分发散，"
+    "你是本机编程工作台的灵感助手。参考当前工作状态、usage 中的用量概况以及各 agent 的历史话题，充分发散，"
     "可以提出与当前任务不同、但值得尝试的小项目、清理、验证或改进。历史话题是抽样线索，不代表仍在进行。"
-    "只输出 JSON：{\"now\":\"正在做什么，不超过32字\",\"next\":\"下一步可做什么，不超过38字\"}。"
+    "只输出 JSON：{\"now\":\"正在做什么，不超过24字\",\"next\":\"使用洞察或项目建议，不超过26字\"}。"
     "now 必须只依据当前任务，不编造工作或登录状态；客户端进程存在不代表正在生成。"
-    "next 可跨话题发散，给一个具体、有趣、值得做的建议，不必延续当前任务。"
-    "建议是可选的，不要执行操作。用中文，避免套话。"
+    "next 给一条使用洞察（依据 usage 中的用量规律）或一个具体、有趣、值得做的项目建议，可跨话题发散，不必延续当前任务。"
+    "不要提额度、余量、限额、重置或额度不足。建议是可选的，不要执行操作。用中文，避免套话。"
 )
 
 
@@ -41,19 +41,17 @@ def _label(value: object, length: int = 48) -> str:
     return agent_tasks.shorten(re.sub(r"\s+", " ", text).strip(), length)
 
 
-def context(agents: list[dict], snapshots: dict, software: list[dict]) -> dict:
+def context(agents: list[dict], software: list[dict], usage: str = "") -> dict:
+    """What the hint may know: live agents' short labels, a one-line usage
+    summary (usage_store.hint_line) and running AI clients. No quota: the
+    hint is for usage insight and ideas, not quota warnings."""
     active = [agent for agent in agents if agent.get("live") and not agent.get("schedule")]
     tasks = [{"provider": str(agent.get("provider") or ""),
               "title": _label(agent.get("title") or agent.get("thread_title")),
               "doing": _label(agent.get("doing"), 32)} for agent in active]
     tasks = sorted(tasks, key=lambda item: (item["provider"], item["title"], item["doing"]))[:5]
-    quotas = {}
-    for name, snapshot in snapshots.items():
-        value = snapshot.display_remaining if snapshot is not None else None
-        if snapshot is not None and not snapshot.stale and not snapshot.error and value is not None:
-            quotas[name] = round(float(value) / 5) * 5
     clients = sorted({str(row.get("name")) for row in software if row.get("name") and row.get("processes", 0) > 0})[:8]
-    return {"tasks": tasks, "quotas": quotas, "detected_clients": clients}
+    return {"tasks": tasks, "usage": _label(usage, 40), "detected_clients": clients}
 
 
 def local_hint(data: dict) -> tuple[str, str]:
@@ -67,11 +65,8 @@ def local_hint(data: dict) -> tuple[str, str]:
         current = "检测到 AI 客户端，暂无可确认的生成任务"
     else:
         current = "当前未检测到生成中的 agent"
-    active_sources = {task["provider"] for task in tasks}
-    tight = sorted((value, name) for name, value in data["quotas"].items()
-                   if value <= 15 and (not active_sources or name in active_sources))
-    if tight:
-        next_step = f"{tight[0][1]} 额度较低，非紧急任务可留到重置后"
+    if data.get("usage"):
+        next_step = data["usage"]                       # a usage insight, never a quota warning
     elif tasks:
         next_step = "可先检查当前任务的结果，再决定下一步"
     else:
@@ -80,10 +75,11 @@ def local_hint(data: dict) -> tuple[str, str]:
 
 
 def _signature(data: dict) -> str:
-    # Tool actions change every few seconds. Keep one suggestion per task and
-    # quota band, then ask MiMo again after its short cache expires.
-    stable = {**data, "tasks": [{"provider": task["provider"], "title": task["title"]}
-                                 for task in data["tasks"]]}
+    # Tool actions change every few seconds and the usage figures every
+    # second. Keep one suggestion per set of tasks, then ask MiMo again after
+    # its short cache expires.
+    stable = {"tasks": [{"provider": task["provider"], "title": task["title"]} for task in data["tasks"]],
+              "detected_clients": data.get("detected_clients", [])}
     return json.dumps(stable, ensure_ascii=False, sort_keys=True)
 
 

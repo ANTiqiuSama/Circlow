@@ -138,6 +138,40 @@ class UsageStore:
                     for hour, (tokens, _replies) in hours.items() if since - 3600 <= hour <= now]
 
 
+SOURCE_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "gemini": "Gemini", "mimo": "MiMo"}
+
+
+def hint_line(store: UsageStore, providers: Iterable[str], now: float) -> str:
+    """One short usage insight for the hover panel's hint, from output only
+    (never quota): today against this time yesterday when that moved a lot,
+    else which source did most of today's work, else the busiest hours of the
+    week. Empty without records."""
+    day = local_day(now)
+    keys = list(providers)
+    by_source = {key: store.hourly([key], day - 7 * 86400) for key in keys}
+    today = {key: sum(t for hour, t in hours.items() if hour >= day) for key, hours in by_source.items()}
+    total = sum(today.values())
+    yesterday = local_day(day - 3600)
+    so_far = sum(t for hours in by_source.values() for hour, t in hours.items() if yesterday <= hour < now - 86400)
+    if total and so_far:
+        change = (total - so_far) / so_far * 100
+        if abs(change) >= 20:
+            return f"今天输出 {_tokens(total)}，比昨天此时{'多' if change > 0 else '少'} {abs(change):.0f}%"
+    working = sorted(((t, key) for key, t in today.items() if t), reverse=True)
+    if len(working) >= 2:
+        share, key = working[0][0] / total * 100, working[0][1]
+        return f"今天输出 {_tokens(total)}，{SOURCE_NAMES.get(key, key)} 占 {share:.0f}%"
+    by_hour = [0] * 24
+    for hours in by_source.values():
+        for hour, t in hours.items():
+            by_hour[time.localtime(hour).tm_hour] += t
+    if sum(by_hour):
+        start = max(range(24), key=lambda h: (by_hour[h] + by_hour[(h + 1) % 24], by_hour[h]))
+        lead = f"今天输出 {_tokens(total)}，" if total else ""
+        return f"{lead}近 7 天 {start:02d}–{(start + 2) % 24:02d} 点最忙"
+    return ""
+
+
 def _tokens(value: float) -> str:
     if value < 1000:
         return f"{value:.0f}"
@@ -230,7 +264,7 @@ def insights(store: UsageStore, provider: str, now: float, samples: Iterable[Any
     for hour, tokens in hours.items():
         by_hour[time.localtime(hour).tm_hour] += tokens
     if sum(by_hour):
-        start = max(range(24), key=lambda h: by_hour[h] + by_hour[(h + 1) % 24])
+        start = max(range(24), key=lambda h: (by_hour[h] + by_hour[(h + 1) % 24], by_hour[h]))
         lines.append(f"最忙时段：{start:02d}:00–{(start + 2) % 24:02d}:00")
     spent = tokens = 0.0
     ordered = sorted((s for s in samples if s.at >= week_start), key=lambda s: s.at)
