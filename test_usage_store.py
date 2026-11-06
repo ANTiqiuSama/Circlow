@@ -90,6 +90,23 @@ class UsageStoreTests(unittest.TestCase):
         self.assertEqual(lines[4], "额度换算：5 小时额度每 1% 约 807 输出 tokens")
         self.assertEqual(insights(store, "claude", now)[0][:4], "记录：暂")
 
+    def test_the_hint_gets_one_usage_insight_from_output_only(self):
+        now = time.mktime((2026, 11, 6, 15, 30, 0, 0, 0, -1))
+        day = local_day(now)
+        keys = ["codex", "claude", "grok"]
+        store = UsageStore(self.path)
+        self.assertEqual(usage_store.hint_line(store, keys, now), "")
+        store.note(reply("y1", day - 86400 + 10 * 3600, 10_000, provider="claude"))     # yesterday by this time
+        store.note(reply("t1", day + 10 * 3600, 12_000, provider="claude"))
+        store.note(reply("t2", day + 11 * 3600, 4_000, provider="codex"))
+        self.assertEqual(usage_store.hint_line(store, keys, now), "今天输出 16K，比昨天此时多 60%")
+        store.note(reply("y2", day - 86400 + 12 * 3600, 5_000, provider="codex"))       # now only +7%
+        self.assertEqual(usage_store.hint_line(store, keys, now), "今天输出 16K，Claude 占 75%")
+        solo = UsageStore(self.folder / "solo.json.gz")
+        solo.note(reply("s1", day - 2 * 86400 + 14 * 3600, 9_000, provider="grok"))
+        self.assertEqual(usage_store.hint_line(solo, keys, now), "近 7 天 14–16 点最忙")
+        self.assertNotIn("额度", usage_store.hint_line(store, keys, now))
+
     def test_tile_lines_never_start_with_closing_or_end_with_opening_marks(self):
         from PIL import Image, ImageDraw
         draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
