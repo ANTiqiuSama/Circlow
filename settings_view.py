@@ -15,15 +15,17 @@ from forecast import reset_distance
 from icon_art import AMBER, CLAY, PAID, UNIFORM_LETTERS, accent, ring_color, window_shade
 
 # Window palette (Tk wants hex).
-BG = "#1b1a18"
-SIDEBAR = "#22211e"
+# Three depths, each a step lighter: the window (BG), the sidebar and footer
+# bar (SIDEBAR), and the cards on them (SURFACE); fields sink below their card.
+BG = "#161513"
+SIDEBAR = "#1c1b19"
 SURFACE = "#2a2925"
-SURFACE_HI = "#33322d"
-BORDER = "#3a3833"
+SURFACE_HI = "#34332e"
+BORDER = "#3b3934"
 INK = "#f0eee6"
 INK_2 = "#c4bfb4"
 INK_3 = "#8e897f"
-FIELD = "#201f1c"
+FIELD = "#1d1c1a"
 GREEN = "#7ec9a6"               # primary actions and the selected page
 WARN = "#e5a84b"
 

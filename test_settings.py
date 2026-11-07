@@ -295,6 +295,7 @@ class SettingsViewTests(unittest.TestCase):
         # With the saved output records, a usage tile sits before 读取.
         from usage_store import UsageStore
         tray.usage, tray.history = UsageStore(Path(tempfile.mkdtemp()) / "usage.json.gz"), None
+        tray.weekly_windows = lambda: tray_app.QuotaTray.weekly_windows(tray)
         sections = tray_app.QuotaTray.detail_sections(tray, "codex")
         self.assertEqual([title for title, _lines in sections], ["额度", "速度", "重置", "用量", "读取"])
         self.assertIn("暂无输出", sections[3][1][0])

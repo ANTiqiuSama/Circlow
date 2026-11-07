@@ -16,7 +16,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Iterable
 
-from forecast import same_window
+from forecast import duration_text, forecast, same_window
 
 USAGE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray" / "usage.json.gz"
 RAW_SECONDS = 26 * 3600         # a little over the chart's day, so a restart finds the whole day
@@ -141,22 +141,24 @@ class UsageStore:
 SOURCE_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "gemini": "Gemini", "mimo": "MiMo"}
 
 
-def hint_line(store: UsageStore, providers: Iterable[str], now: float) -> str:
-    """One short usage insight for the hover panel's hint, from output only
-    (never quota): today against this time yesterday when that moved a lot,
-    else which source did most of today's work, else the busiest hours of the
-    week. Empty without records."""
+def hint_line(store: UsageStore, providers: Iterable[str], now: float, weekly: dict | None = None) -> str:
+    """One short usage insight for the hover panel's hint: a weekly quota
+    about to reset with much of it unused (from `weekly`: provider ->
+    (quota readings, remaining %, resets_at)), else which source did most of
+    today's work, else the busiest hours of the week. No comparison with
+    yesterday: that figure said nothing anyone could act on. Empty without
+    records."""
     day = local_day(now)
     keys = list(providers)
+    for key in keys:
+        readings, remaining, resets_at = (weekly or {}).get(key, ((), None, None))
+        spare = weekly_spare(readings, now, remaining, resets_at)
+        if spare:
+            return (f"{SOURCE_NAMES.get(key, key)} 周额度 {duration_text(spare['reset_at'] - now)}后重置，"
+                    f"预计剩 {spare['spare']:.0f}%，可多用")
     by_source = {key: store.hourly([key], day - 7 * 86400) for key in keys}
     today = {key: sum(t for hour, t in hours.items() if hour >= day) for key, hours in by_source.items()}
     total = sum(today.values())
-    yesterday = local_day(day - 3600)
-    so_far = sum(t for hours in by_source.values() for hour, t in hours.items() if yesterday <= hour < now - 86400)
-    if total and so_far:
-        change = (total - so_far) / so_far * 100
-        if abs(change) >= 20:
-            return f"今天输出 {_tokens(total)}，比昨天此时{'多' if change > 0 else '少'} {abs(change):.0f}%"
     working = sorted(((t, key) for key, t in today.items() if t), reverse=True)
     if len(working) >= 2:
         share, key = working[0][0] / total * 100, working[0][1]
@@ -194,6 +196,35 @@ def _between(hours: dict[int, int], start: float, end: float) -> float:
 WEEKLY_RECENT = 2 * 86400      # a weekly reset this recent is still news
 WEEKLY_LEFTOVER = 20.0         # % of last week left unused before it is worth a word
 WEEKLY_LAST_READ = 12 * 3600   # the old week's last reading must be this close to its reset
+WEEKLY_AHEAD = 36 * 3600       # a weekly reset this close ahead: say what will be left over
+
+
+def weekly_spare(samples: Iterable[Any], now: float, remaining: float | None, resets_at: int | None) -> dict | None:
+    """The weekly window about to reset with quota that will go unused:
+    {"reset_at", "spare", "remaining", "rate"} when the reset is within
+    WEEKLY_AHEAD and, at the current pace (forecast's slope over this
+    window's readings), at least WEEKLY_LEFTOVER will be left; else None."""
+    if remaining is None or not resets_at or not 0 < resets_at - now <= WEEKLY_AHEAD:
+        return None
+    outlook = forecast(samples, now, remaining, resets_at)
+    if outlook.tone == "unknown":
+        return None                 # no readings over this window yet: the pace is anyone's guess
+    rate = max(0.0, outlook.rate_per_hour or 0.0)
+    spare = remaining - rate * (resets_at - now) / 3600
+    if spare < WEEKLY_LEFTOVER:
+        return None
+    return {"reset_at": float(resets_at), "spare": spare, "remaining": float(remaining), "rate": rate}
+
+
+def spare_line(store: UsageStore, provider: str, spare: dict, now: float) -> str:
+    """"周额度：…" for a weekly window that will reset with quota unused, and
+    what that is worth in this week's own output, when that is known."""
+    text = f"周额度：{duration_text(spare['reset_at'] - now)}后重置，按现在的用法到时还剩约 {spare['spare']:.0f}%"
+    used = 100.0 - spare["remaining"]
+    week = sum(tokens for hour, tokens in store.hourly([provider], spare["reset_at"] - 7 * 86400).items() if hour < now)
+    if used >= 10 and week > 0:
+        text += f"（约 {_tokens(week / used * spare['spare'])} 输出 tokens）"
+    return text + "，趁重置前多用"
 
 
 def weekly_leftover(samples: Iterable[Any], now: float) -> dict | None:
@@ -231,18 +262,22 @@ def weekly_line(store: UsageStore, provider: str, leftover: dict, now: float) ->
 
 
 def insights(store: UsageStore, provider: str, now: float, samples: Iterable[Any] = (), window: str = "",
-             weekly: Iterable[Any] = ()) -> list[str]:
+             weekly: Iterable[Any] = (), weekly_quota: tuple | None = None) -> list[str]:
     """"标题：内容" lines about one provider's own output: a weekly window
-    that just reset with much of it unused, today against yesterday, the
-    week's daily average and busiest hours, and how many output tokens a
-    percent of quota has gone for. `samples` are that window's quota readings
-    (forecast.Sample) over the same week; `weekly` the weekly window's (none
-    for 5-hour windows: those reset too often to be worth the note)."""
+    about to reset with quota to spare, or one that just reset with much of
+    it unused; today against yesterday; the week's daily average and busiest
+    hours; and how many output tokens a percent of quota has gone for.
+    `samples` are that window's quota readings (forecast.Sample) over the same
+    week; `weekly` the weekly window's and `weekly_quota` its (remaining %,
+    resets_at) (none for 5-hour windows: those reset too often to be worth
+    the note)."""
     day = local_day(now)
     week_start = local_day(day - 7 * 86400 + 3600)
     hours = store.hourly([provider], week_start)
-    leftover = weekly_leftover(weekly, now)
-    head = [weekly_line(store, provider, leftover, now)] if leftover else []
+    spare = weekly_spare(weekly, now, *(weekly_quota or (None, None)))
+    leftover = None if spare else weekly_leftover(weekly, now)
+    head = ([spare_line(store, provider, spare, now)] if spare
+            else [weekly_line(store, provider, leftover, now)] if leftover else [])
     if not any(hours.values()):
         return head + ["记录：暂无输出；开始使用后在此统计（保存在本机，重启后保留）"]
     today = sum(tokens for hour, tokens in hours.items() if hour >= day)

@@ -70,6 +70,98 @@ WINDOWS = ("five_hour", "seven_day")
 MAX_AGE_SECONDS = 7 * 86400  # a weekly reading stays meaningful until its own reset
 
 
+NEWEST_FILES = 128           # sessions whose files are considered, newest first
+PRUNE_EVERY = 3600           # how often files older than MAX_AGE_SECONDS are deleted
+_parsed: dict[str, tuple[int, int, tuple | None]] = {}   # path -> (mtime_ns, size, parsed record)
+_listed: dict[str, tuple[int, list]] = {}                 # folder -> (its mtime_ns, the entries last listed)
+_pruned_at = 0.0
+
+
+def _scan(folder: Path, wall: float) -> list[os.DirEntry]:
+    """The NEWEST_FILES newest status files written within MAX_AGE_SECONDS.
+    One directory listing (scandir carries the timestamps on Windows), no
+    stat per file: the folder keeps one file per Claude session ever seen."""
+    # The receiver writes each file in place by renaming a temporary one, so
+    # every change moves the folder's own mtime; while that stands still the
+    # last listing is reused.
+    stamp = os.stat(folder).st_mtime_ns
+    cached = _listed.get(str(folder))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    fresh = []
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                seen = entry.stat().st_mtime
+            except OSError:
+                continue
+            if seen >= wall - MAX_AGE_SECONDS:
+                fresh.append((seen, entry))
+    fresh.sort(key=lambda item: item[0], reverse=True)
+    newest = [entry for _, entry in fresh[:NEWEST_FILES]]
+    _listed[str(folder)] = (stamp, newest)
+    return newest
+
+
+def _parse(entry: os.DirEntry) -> tuple | None:
+    """(updated_at, [(window, seen, used, reset)]) of one status file, cached
+    until the file changes; None for a file that holds no usable reading."""
+    try:
+        stat = entry.stat()
+    except OSError:
+        return None
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = _parsed.get(entry.path)
+    if cached is not None and cached[:2] == key:
+        return cached[2]
+    record = None
+    try:
+        if stat.st_size <= 16384:
+            row = json.loads(Path(entry.path).read_text(encoding="utf-8-sig"))
+            at = float(row["updated_at"])
+            limits = row.get("rate_limits")
+            if math.isfinite(at) and isinstance(limits, dict):
+                readings = []
+                for name in WINDOWS:
+                    value = limits.get(name)
+                    if not isinstance(value, dict) or isinstance(value.get("used_percentage"), bool):
+                        continue
+                    used = float(value["used_percentage"])
+                    seen = float(value.get("observed_at", at))
+                    reset = value.get("resets_at")
+                    reset = int(reset) if reset is not None else None
+                    if math.isfinite(used) and 0 <= used <= 100 and math.isfinite(seen) and seen <= at + 1:
+                        readings.append((name, seen, used, reset))
+                if readings:
+                    record = (at, readings)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        record = None
+    _parsed[entry.path] = (*key, record)
+    return record
+
+
+def prune(folder: Path, wall: float) -> int:
+    """Delete status files older than MAX_AGE_SECONDS (one per Claude session
+    ever seen, so the folder grows without end); returns how many went."""
+    removed = 0
+    try:
+        with os.scandir(folder) as entries:
+            stale = [entry.path for entry in entries if entry.name.endswith(".json")
+                     and entry.stat().st_mtime < wall - MAX_AGE_SECONDS]
+    except OSError:
+        return 0
+    for path in stale:
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            continue
+        _parsed.pop(path, None)
+    return removed
+
+
 def latest(now: float | None = None, folder: Path | None = None) -> dict | None:
     """Native account quota merged across sessions, one value per window.
 
@@ -79,39 +171,30 @@ def latest(now: float | None = None, folder: Path | None = None) -> dict | None:
     has passed its reset; a window that is missing or past its reset is a new
     window that has not started yet: nothing used, reset unknown ("idle").
     """
+    global _pruned_at
     now = now or time.time()
-    reports, observed = [], {}          # window -> [(seen, used, reset)] from every session
+    wall = time.time()
+    target = folder or data_dir() / "claude-status"
     try:
-        paths = sorted((folder or data_dir() / "claude-status").glob("*.json"),
-                       key=lambda path: path.stat().st_mtime, reverse=True)[:128]
+        entries = _scan(target, wall)
     except OSError:
         return None
-    for path in paths:
-        try:
-            if path.stat().st_size > 16384:
-                continue
-            row = json.loads(path.read_text(encoding="utf-8-sig"))
-            at = float(row["updated_at"])
-            limits = row.get("rate_limits")
-            if not math.isfinite(at) or not now - MAX_AGE_SECONDS <= at <= now + 30 or not isinstance(limits, dict):
-                continue
-            found = False
-            for name in WINDOWS:
-                value = limits.get(name)
-                if not isinstance(value, dict) or isinstance(value.get("used_percentage"), bool):
-                    continue
-                used = float(value["used_percentage"])
-                seen = float(value.get("observed_at", at))
-                reset = value.get("resets_at")
-                reset = int(reset) if reset is not None else None
-                if not math.isfinite(used) or not 0 <= used <= 100 or not math.isfinite(seen) or seen > at + 1:
-                    continue
-                found = True
-                observed.setdefault(name, []).append((seen, used, reset))
-            if found:
-                reports.append(at)
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+    if folder is None and wall - _pruned_at >= PRUNE_EVERY:
+        _pruned_at = wall
+        prune(target, wall)
+        for path in [path for path in _parsed if not os.path.exists(path)]:
+            _parsed.pop(path, None)
+    reports, observed = [], {}          # window -> [(seen, used, reset)] from every session
+    for entry in entries:
+        record = _parse(entry)
+        if record is None:
             continue
+        at, readings = record
+        if not now - MAX_AGE_SECONDS <= at <= now + 30:
+            continue
+        for name, seen, used, reset in readings:
+            observed.setdefault(name, []).append((seen, used, reset))
+        reports.append(at)
     if not reports:
         return None
     observed = {name: _furthest(rows) for name, rows in observed.items()}

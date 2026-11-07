@@ -762,23 +762,27 @@ class SettingsWindow:
         return line
 
     def heading(self, parent, title, subtitle="", action=None):
+        """The page's title row: a large title, one quiet line under it, and
+        the page's action at the right end of the title's baseline."""
         top = self.tk.Frame(parent, bg=view.BG)
         top.pack(fill="x")
         if action is not None:
             self.button(top, *action).pack(side="right", anchor="n")
-        self.label(top, title, 16, weight="bold").pack(side="left", anchor="w")
+        self.label(top, title, 18, weight="bold").pack(side="left", anchor="w")
         under = self.tk.Frame(parent, bg=view.BG)
-        under.pack(fill="x", pady=(self.S(2), self.S(14)))
+        under.pack(fill="x", pady=(self.S(3), self.S(20)))
         if subtitle:
-            self.para(under, subtitle, 10).pack(anchor="w", fill="x")
+            self.para(under, subtitle, 10, view.INK_2).pack(anchor="w", fill="x")
         return top
 
     def section(self, parent, title, note=""):
+        """A group title between cards: bold, with its note trailing in grey;
+        more air above it than below, so it belongs to what follows."""
         line = self.tk.Frame(parent, bg=view.BG)
-        line.pack(fill="x", pady=(self.S(6), self.S(8)))
+        line.pack(fill="x", pady=(self.S(14), self.S(8)))
         self.label(line, title, 11, weight="bold").pack(side="left")
         if note:
-            self.label(line, note, 9, view.INK_3).pack(side="left", padx=self.S(10))
+            self.label(line, note, 9, view.INK_3).pack(side="left", padx=self.S(10), pady=(self.S(2), 0))
         return line
 
     def entry(self, parent, variable, secret=False):
@@ -964,7 +968,12 @@ class SettingsWindow:
         self.nav_bar = tk.Frame(side, bg=view.GREEN, width=S(3))
         self.nav_at = None
         side.bind("<Configure>", lambda _: self._place_nav(animate=False), add="+")
-        self.label(side, "托盘右键或面板齿轮可打开此页", 8, view.INK_3, wraplength=S(180)).pack(side="bottom", anchor="w", padx=S(20), pady=S(18))
+        stamp = getattr(self.app, "build_stamp", lambda: "")()
+        foot = tk.Frame(side, bg=view.SIDEBAR)
+        foot.pack(side="bottom", fill="x", padx=S(20), pady=S(18))
+        if stamp:
+            self.label(foot, f"构建 {stamp}", 8, view.INK_3).pack(anchor="w")
+        self.label(foot, "托盘右键或面板齿轮可打开此页", 8, view.INK_3, wraplength=S(176)).pack(anchor="w")
 
         main = tk.Frame(self.root, bg=view.BG)
         main.pack(side="left", fill="both", expand=True)
@@ -1213,8 +1222,7 @@ class SettingsWindow:
     # ----- 概览 ---------------------------------------------------------------------------
     def _overview(self, page):
         tk, S = self.tk, self.S
-        self.heading(page, "概览", "与托盘和悬停面板同步：每行标题是距下次重置的时间，颜色与托盘图标一致；"
-                                   "卡片底部是下次读取的时间与原因。点击卡片查看这个来源的详情。",
+        self.heading(page, "概览", "与托盘和悬停面板同步的来源卡片，以及最近的输出。点击卡片查看详情。",
                      ("立即刷新", self.app.request_refresh))
         self.tray_notice = self.panel(page, "#3a3122", "#4a3d27", padx=16, pady=10)
         notice = self.tray_notice.inner
@@ -1379,7 +1387,7 @@ class SettingsWindow:
     def _sources(self, page):
         import providers
         tk, S = self.tk, self.S
-        self.heading(page, "来源", "开关在点“保存”后生效，托盘会自动重启；MiMo 的登录和手动套餐点击后立即生效。")
+        self.heading(page, "来源", "开关在保存后生效并自动重启托盘；MiMo 的登录与手动套餐立即生效。")
         if os.environ.get("CODEX_QUOTA_PROVIDERS"):
             self.para(page, f"已设置 CODEX_QUOTA_PROVIDERS={os.environ['CODEX_QUOTA_PROVIDERS']}；本页开关优先于它。", 9, view.WARN).pack(
                 anchor="w", fill="x", pady=(0, S(10)))
@@ -1554,7 +1562,7 @@ class SettingsWindow:
         import grok_iq
         import model_iq
         tk, S = self.tk, self.S
-        self.heading(page, "模型智商", "悬停面板顶部横条右侧显示所选模型的编程分；Grok 面板中间一栏显示 Grok 相对最强模型的总分。")
+        self.heading(page, "模型智商", "面板横条显示所选模型的编程分，Grok 栏显示它相对最强模型的总分。")
         self.section(page, "面板横条", "AI Stupid Level · 近 24 小时编程分（0–100）")
         box = self.card(page)
         self.iq_key = tk.StringVar()
@@ -1713,7 +1721,7 @@ class SettingsWindow:
     # ----- 任务 ---------------------------------------------------------------------------
     def _tasks(self, page):
         tk, S = self.tk, self.S
-        self.heading(page, "任务", "任务气泡来自本机 agent 记录；使用 herdr 时，同一窗格的会话合并为一个气泡。")
+        self.heading(page, "任务", "任务气泡来自本机 agent 记录；herdr 同一窗格的会话合并为一个气泡。")
         box = self.card(page)
         self.vars["herdr"] = tk.BooleanVar(value=True)
         self.vars["herdr"].trace_add("write", lambda *_: self.update_footer())
@@ -1763,7 +1771,7 @@ class SettingsWindow:
         import providers
         import refresh_scheduler
         tk, S = self.tk, self.S
-        self.heading(page, "常规", "启动、额度读取节奏、诊断与退出。")
+        self.heading(page, "常规", "开机自启、额度读取节奏、工具与退出。")
         box = self.card(page)
         self.vars["startup"] = tk.BooleanVar()
         self.vars["startup"].trace_add("write", lambda *_: self.update_footer())

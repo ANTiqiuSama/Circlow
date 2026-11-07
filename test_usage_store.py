@@ -99,9 +99,11 @@ class UsageStoreTests(unittest.TestCase):
         store.note(reply("y1", day - 86400 + 10 * 3600, 10_000, provider="claude"))     # yesterday by this time
         store.note(reply("t1", day + 10 * 3600, 12_000, provider="claude"))
         store.note(reply("t2", day + 11 * 3600, 4_000, provider="codex"))
-        self.assertEqual(usage_store.hint_line(store, keys, now), "今天输出 16K，比昨天此时多 60%")
-        store.note(reply("y2", day - 86400 + 12 * 3600, 5_000, provider="codex"))       # now only +7%
-        self.assertEqual(usage_store.hint_line(store, keys, now), "今天输出 16K，Claude 占 75%")
+        self.assertEqual(usage_store.hint_line(store, keys, now), "今天输出 16K，Claude 占 75%")   # never "比昨天此时"
+        reset = int(now + 20 * 3600)
+        flat = [Sample(now - 7200, 40, reset), Sample(now - 3600, 40, reset), Sample(now, 40, reset)]
+        weekly = {"grok": (flat, 60, reset)}                                            # 60% left, reset tomorrow
+        self.assertEqual(usage_store.hint_line(store, keys, now, weekly), "Grok 周额度 20 小时后重置，预计剩 60%，可多用")
         solo = UsageStore(self.folder / "solo.json.gz")
         solo.note(reply("s1", day - 2 * 86400 + 14 * 3600, 9_000, provider="grok"))
         self.assertEqual(usage_store.hint_line(solo, keys, now), "近 7 天 14–16 点最忙")
@@ -117,6 +119,32 @@ class UsageStoreTests(unittest.TestCase):
             self.assertEqual("".join(lines).replace(" ", ""), text.replace(" ", ""))
             self.assertFalse(any(line[:1] in view.NO_LINE_START for line in lines if line), (limit, lines))
             self.assertFalse(any(line[-1:] in view.NO_LINE_END for line in lines[:-1] if line), (limit, lines))
+
+    def test_a_weekly_quota_that_will_go_unused_is_pointed_out_before_its_reset(self):
+        now = time.mktime((2026, 11, 7, 15, 0, 0, 0, 0, -1))
+        reset = int(now + 30 * 3600)
+        readings = [Sample(now - 6 * 3600 + 1800 * k, 20 + k / 2, reset) for k in range(13)]   # 1 %/h, 26 % used
+        spare = usage_store.weekly_spare(readings, now, 74, reset)
+        self.assertAlmostEqual(spare["spare"], 74 - 1 * 30, delta=0.5)                      # 44 % left at this pace
+        fast = [Sample(now - 6 * 3600 + 1800 * k, 20 + k, reset) for k in range(13)]        # 2 %/h: 8 % left, no note
+        self.assertIsNone(usage_store.weekly_spare(fast, now, 68, reset))
+        self.assertIsNone(usage_store.weekly_spare([], now, 74, reset))                     # no readings: pace unknown
+        self.assertIsNone(usage_store.weekly_spare(readings, now, 74, int(now + 40 * 3600)))   # too far ahead
+        self.assertIsNone(usage_store.weekly_spare(readings, now, 68, int(now - 60)))      # already reset
+        self.assertIsNone(usage_store.weekly_spare(readings, now, None, reset))
+        idle = [Sample(now - 7200, 40, reset), Sample(now, 40, reset)]
+        self.assertEqual(usage_store.weekly_spare(idle, now, 60, reset)["spare"], 60)       # no use: all of it
+        self.assertIsNone(usage_store.weekly_spare(idle, now, 15, reset))                   # under 20 %: nothing to say
+        store = UsageStore(self.path)
+        line = usage_store.spare_line(store, "grok", usage_store.weekly_spare(idle, now, 60, reset), now)
+        self.assertEqual(line, "周额度：1 天后重置，按现在的用法到时还剩约 60%，趁重置前多用")
+        for day in range(1, 6):
+            store.note(reply(f"w{day}", now - day * 86400, 10_000, provider="grok"))       # 50K for the 40 % used
+        line = usage_store.spare_line(store, "grok", usage_store.weekly_spare(idle, now, 60, reset), now)
+        self.assertIn("（约 75K 输出 tokens）", line)
+        lines = insights(store, "grok", now, weekly=idle, weekly_quota=(60, reset))
+        self.assertTrue(lines[0].startswith("周额度：1 天后重置"))
+        self.assertFalse(any(line.startswith("周额度") for line in insights(store, "grok", now, weekly=idle, weekly_quota=(15, reset))))
 
     def test_a_weekly_reset_with_much_left_unused_is_pointed_out(self):
         now = time.mktime((2026, 11, 3, 15, 0, 0, 0, 0, -1))

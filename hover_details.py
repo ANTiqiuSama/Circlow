@@ -698,11 +698,21 @@ class HoverDetails:
             return self.stop_event.is_set()
         return self.stop_event.wait(delay)
 
+    POINTER_REUSE = 1.0          # a still pointer keeps its last answer this long
+
     def pointer(self):
-        """(point, provider, anchor, left, right) for this tick."""
+        """(point, provider, anchor, left, right) for this tick. While the
+        pointer and buttons have not moved, the previous answer is reused for
+        up to POINTER_REUSE seconds: ten window lookups a second for a mouse
+        at rest were most of this thread's CPU."""
         point = wintypes.POINT()
         have_point = bool(user.GetCursorPos(ctypes.byref(point)))
         left, right = (bool(user.GetAsyncKeyState(key) & 0x8000) for key in (1, 2))
+        key = (have_point, point.x, point.y, left, right)
+        now = time.monotonic()
+        held = getattr(self, "_pointer_held", None)
+        if held is not None and held[0] == key and now - held[1] < self.POINTER_REUSE:
+            return held[2]
         provider = anchor = None
         if have_point and notification_area_at(point) and not (left or right):
             provider, anchor = self.target_at(point)
@@ -712,7 +722,9 @@ class HoverDetails:
                     rect = icon_rect(icon)
                     if not rect or not contains(rect, point.x, point.y):
                         icon.suppress_hover = False
-        return point, provider, anchor, left, right
+        result = (point, provider, anchor, left, right)
+        self._pointer_held = (key, now, result)
+        return result
 
     def dwell(self, provider) -> float:
         # Shell v4 already waited for its own hover delay before POPUPOPEN.
