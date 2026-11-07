@@ -234,6 +234,9 @@ class TpsMonitor:
         self.mimocode_scanned = 0.0
         self.mimocode_cursor: dict[Path, float] = {}
         self.antigravity_bridge = (self.home / "AppData/Local/Packages/OpenAI.Codex_2p2nqsd0c76g0/LocalCache/Local/codex-grok-bridge/app/src/antigravity.mjs").is_file()
+        self.grok_scanned: dict[Path, float] = {}       # Grok project folder -> its mtime when last listed
+        self.grok_paths: set[Path] = set()
+        self.antigravity_cache: tuple[float, list] = (0.0, [])
         self.readers: dict[Path, JsonlReader] = {}
         self.context: dict[str, dict[str, Any]] = {}
         self.events: deque[Observation] = deque()
@@ -363,8 +366,7 @@ class TpsMonitor:
                     # the file name (which made one session show up as two bubbles).
                     found = THREAD_ID.findall(path.stem)
                     self._register(path, found[-1] if found else path.stem.split("T", 1)[-1], "Codex")
-        grok_paths = [path for path in self.grok_root.glob("sessions/*/*/updates.jsonl")
-                      if path in self.readers or self._recent(path, now)]
+        grok_paths = self._grok_sessions(now)
         for path in grok_paths:
             self._register(path, path.parent.name, "Grok CLI", "grok")
             if path.with_name("events.jsonl").is_file():
@@ -379,6 +381,36 @@ class TpsMonitor:
             self._refresh_schedules(state, now)
             self.last_slow_discovery = now
         self.last_discovery = now
+
+    def _grok_sessions(self, now: float) -> list[Path]:
+        """Recent Grok sessions (sessions/<project>/<id>/updates.jsonl). A
+        project folder's mtime changes when a session folder is added, so only
+        folders changed since their last listing are listed again; listing all
+        ~1,800 sessions every two seconds was a fifth of this loop's time."""
+        sessions = self.grok_root / "sessions"
+        try:
+            projects = [folder for folder in sessions.iterdir() if folder.is_dir()]
+        except OSError:
+            self.grok_paths = set()
+            return []
+        seen = set()
+        for folder in projects:
+            try:
+                stamp = folder.stat().st_mtime
+            except OSError:
+                continue
+            seen.add(folder)
+            if self.grok_scanned.get(folder) == stamp:
+                continue
+            self.grok_scanned[folder] = stamp
+            self.grok_paths = {path for path in self.grok_paths if path.parent.parent != folder}
+            self.grok_paths.update(path for path in folder.glob("*/updates.jsonl") if path in self.readers or self._recent(path, now))
+        for folder in [folder for folder in self.grok_scanned if folder not in seen]:
+            self.grok_scanned.pop(folder, None)
+            self.grok_paths = {path for path in self.grok_paths if path.parent.parent != folder}
+        # Sessions that went quiet since their folder was listed drop out as
+        # readers are forgotten; ones still open stay registered.
+        return sorted(path for path in self.grok_paths if path in self.readers or self._recent(path, now))
 
     def _refresh_schedules(self, state: Path, now: float):
         if state.is_file():
@@ -912,8 +944,17 @@ class TpsMonitor:
 
     def _antigravity_roots(self) -> list[tuple[Path, str]]:
         roots = [(self.home / ".gemini/antigravity/conversations", "Antigravity 桌面"), (self.home / ".gemini/antigravity-cli/conversations", "Antigravity CLI")]
-        temporary = Path(os.environ.get("TEMP", self.home / "AppData/Local/Temp"))
-        for profile in temporary.glob("codex-agy-model-*"):
+        # Codex's isolated agy profiles live in TEMP, which holds tens of
+        # thousands of entries; list it at the slow-discovery pace, not every second.
+        listed, profiles = self.antigravity_cache
+        if time.time() - listed >= SLOW_DISCOVERY_SECONDS:
+            temporary = Path(os.environ.get("TEMP", self.home / "AppData/Local/Temp"))
+            try:
+                profiles = sorted(temporary.glob("codex-agy-model-*"))
+            except OSError:
+                profiles = []
+            self.antigravity_cache = (time.time(), profiles)
+        for profile in profiles:
             roots.append((profile / "profile/antigravity-cli/conversations", "Antigravity CLI · Codex隔离配置"))
         return roots
 

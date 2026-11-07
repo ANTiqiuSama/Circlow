@@ -8,6 +8,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -675,7 +676,7 @@ class QuotaTray:
         forecast, forecast_tone = self.headline_forecast(provider)
         usage = getattr(self, "usage", None)
         hint_data = agent_hints.context(agents, self.performance.get("software", []),
-                                        usage_hint_line(usage, PROVIDERS, now) if usage is not None else "")
+                                        usage_hint_line(usage, PROVIDERS, now, self.weekly_windows()) if usage is not None else "")
         advisor = getattr(self, "hint_advisor", None)
         hint_now, hint_next = advisor.lookup(hint_data, getattr(self, "tps_monitor", None)) if advisor is not None else agent_hints.local_hint(hint_data)
         today_used = None
@@ -784,12 +785,10 @@ class QuotaTray:
         if usage is not None:
             samples = self.history.samples(provider) if self.history is not None else []
             window = window_label(snapshot.window_minutes) if snapshot.window_minutes else ""
-            # The weekly window's readings (Grok's only window; Codex's and Claude's second one).
-            weekly_name = provider if snapshot.window_minutes == 10080 else (
-                f"{provider}:secondary" if snapshot.secondary_window_minutes == 10080 else None)
-            weekly = self.history.samples(weekly_name) if self.history is not None and weekly_name else []
+            weekly, remaining, resets_at = self.weekly_windows().get(provider, ((), None, None))
             sections.append(("用量", usage_insights(usage, provider, time.time(), samples, f"{window}额度" if window else "",
-                                                   weekly)))
+                                                   weekly, (remaining, resets_at))))
+
         reads = [self.menu_updated(provider)]
         if self.scheduler:
             reads.append("刷新计划：" + self.scheduler.describe(provider, time.time()))
@@ -798,6 +797,22 @@ class QuotaTray:
         sections.append(("读取", reads))
         return sections
 
+    def weekly_windows(self) -> dict:
+        """provider -> (quota readings, remaining %, resets_at) of its weekly
+        window: Grok's only window, Codex's and Claude Code's second one."""
+        found = {}
+        for provider, snapshot in self.snapshots.items():
+            if snapshot is None:
+                continue
+            if snapshot.window_minutes == 10080:
+                name, remaining, resets_at = provider, snapshot.remaining_percent, snapshot.resets_at
+            elif snapshot.secondary_window_minutes == 10080:
+                name, remaining, resets_at = f"{provider}:secondary", snapshot.secondary_remaining_percent, snapshot.secondary_resets_at
+            else:
+                continue
+            readings = self.history.samples(name) if self.history is not None else []
+            found[provider] = (readings, None if snapshot.stale else remaining, resets_at)
+        return found
     def open_details(self, provider: str) -> None:
         text = "\n\n".join("\n".join(lines) for _title, lines in self.detail_sections(provider))
         threading.Thread(
@@ -1399,8 +1414,11 @@ class QuotaTray:
             if fresh.remaining_percent is not None or self.snapshots["mimo"].remaining_percent is None:
                 self.snapshots["mimo"] = fresh
 
+    def build_stamp(self) -> str:
+        return build_stamp()
+
     def diagnostic_text(self) -> str:
-        sections = [dump_snapshot(self.snapshots), "", "数据源边界："]
+        sections = [f"构建：{build_stamp()}", "", dump_snapshot(self.snapshots), "", "数据源边界："]
         sections += [f"- {provider_registry.get(p).label}：{provider_registry.get(p).source_note}" for p in PROVIDERS]
         for item in self.snapshots.values():
             if item.error:
@@ -1590,6 +1608,53 @@ class QuotaTray:
         self.maybe_reorder(time.time(), force=True)
         for thread in threads:
             thread.join()
+
+
+LEFTOVER_MIN_AGE = 3600          # an unpack folder younger than this may be another copy starting up
+
+
+def clean_runtime_leftovers(folder: Path | None = None, keep: Path | None = None, now: float | None = None) -> int:
+    """Delete the onefile build's leftover unpack folders (_MEI*). The
+    bootloader removes its folder only on a normal exit; a forced close, a
+    crash or a shutdown leaves ~78 MB behind each time, and they add up to
+    gigabytes. A folder is only removed when it can be renamed first: one in
+    use by a running copy holds open files and cannot be. Returns how many
+    folders went."""
+    if folder is None:
+        if not getattr(sys, "frozen", False):
+            return 0
+        keep = Path(getattr(sys, "_MEIPASS", ""))
+        folder = keep.parent
+    now = time.time() if now is None else now
+    removed = 0
+    try:
+        candidates = [path for path in folder.iterdir() if path.name.startswith("_MEI") and path.is_dir()]
+    except OSError:
+        return 0
+    for path in candidates:
+        if keep is not None and path == keep:
+            continue
+        try:
+            if now - path.stat().st_mtime < LEFTOVER_MIN_AGE:
+                continue
+            parked = path.with_name(path.name + ".old")
+            path.rename(parked)
+            shutil.rmtree(parked, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def build_stamp(root: Path | None = None) -> str:
+    """"2026-11-07 12:00 · 8f73038" from the build's build_info.json (written
+    by build.ps1, with a BOM), or "源码运行" when running from source."""
+    root = root or Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    try:
+        info = json.loads((root / "build_info.json").read_text(encoding="utf-8-sig"))
+        return f"{info['date']} · {info['commit']}"
+    except (OSError, ValueError, KeyError, TypeError):
+        return "源码运行"
 
 
 def acquire_single_instance():
@@ -1801,6 +1866,8 @@ def main() -> int:
     if handle is None:
         return 0
     setup_logging()
+    threading.Thread(target=lambda: log.info("removed %d leftover unpack folders", clean_runtime_leftovers()),
+                     name="runtime-cleanup", daemon=True).start()
     tray = QuotaTray()
     tray.run()
     if getattr(tray, "restart_requested", False):

@@ -181,6 +181,33 @@ class HoverTests(unittest.TestCase):
         for slot in tray.slots:
             slot.ensure_registered.assert_called_once()
 
+    def test_build_stamp_reads_the_builds_json_with_its_bom_or_says_source(self):
+        import tempfile
+        from pathlib import Path
+        root = Path(tempfile.mkdtemp())
+        self.assertEqual(tray_app.build_stamp(root), "源码运行")
+        (root / "build_info.json").write_bytes("﻿".encode("utf-8") + b'{"date":"2026-11-07 14:12","commit":"8f73038"}')
+        self.assertEqual(tray_app.build_stamp(root), "2026-11-07 14:12 · 8f73038")
+
+    def test_leftover_unpack_folders_are_removed_except_ones_in_use_or_new(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        root = Path(tempfile.mkdtemp())
+        old, mine, young, other = (root / name for name in ("_MEI111", "_MEI222", "_MEI333", "work"))
+        for folder in (old, mine, young, other):
+            folder.mkdir()
+            (folder / "python312.dll").write_bytes(b"x" * 10)
+        stale = time.time() - 2 * tray_app.LEFTOVER_MIN_AGE
+        for folder in (old, mine, other):
+            os.utime(folder, (stale, stale))
+        with (mine / "python312.dll").open("rb"):                            # a running copy holds its files open
+            removed = tray_app.clean_runtime_leftovers(root, keep=young, now=time.time())
+        self.assertEqual(removed, 1)
+        self.assertEqual(sorted(path.name for path in root.iterdir()), ["_MEI222", "_MEI333", "work"])
+        self.assertEqual(tray_app.clean_runtime_leftovers(root, keep=None, now=time.time()), 1)   # mine, once released
+        self.assertTrue(young.exists())
+
     def test_a_picture_the_shell_refused_is_sent_again(self):
         icon = HoverIcon("hover-resend-test", Image.new("RGBA", (16, 16)))
         icon._hwnd = 123
