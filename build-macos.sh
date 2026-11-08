@@ -15,6 +15,7 @@ python3 -m venv .venv-macos
 
 .venv-macos/bin/python -m PyInstaller --noconfirm --onedir --windowed \
   --name Circlow --osx-bundle-identifier com.antiqiusama.circlow --icon "$PWD/assets/circlow-fox-tray-mascot.icns" \
+  --add-data "$PWD/assets/circlow-fox-tray-mascot.png:." \
   --collect-data tzdata --distpath dist-macos --workpath work/pyinstaller-macos \
   --specpath work mac_menu.py
 

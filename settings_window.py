@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import app_identity
 import json
+import math
 import logging
 import os
 import queue
@@ -29,6 +30,22 @@ from urllib.parse import urlsplit
 import agent_tasks
 import settings_view as view
 import ui_motion
+
+
+def brand_mark(pixels: int):
+    """The app icon (the Circlow mascot) as a square RGBA picture, or None
+    when no icon file is found."""
+    from PIL import Image
+    for suffix in (".png", ".ico", ".icns"):
+        path = app_identity.icon_file(suffix)
+        if path is None:
+            continue
+        try:
+            with Image.open(path) as source:
+                return source.convert("RGBA").resize((pixels, pixels), Image.LANCZOS)
+        except OSError:
+            continue
+    return None
 
 
 def picture_factor() -> int:
@@ -708,37 +725,106 @@ class SettingsWindow:
         widget.bind("<Leave>", lambda _: self.fade(widget, .12, fg=color))
         return widget
 
-    def switch(self, parent, variable, command=None):
-        tk, S = self.tk, self.S
-        width, r = S(40), S(11)
-        canvas = tk.Canvas(parent, width=width, height=2 * r, bg=parent["bg"], highlightthickness=0, cursor="hand2")
-        track = canvas.create_polygon(round_points(0, 0, width, 2 * r, r), smooth=True, splinesteps=12, outline="")
-        knob = canvas.create_oval(0, 0, 0, 0, fill="#f6f4ee", outline="")
-        state = {"at": 1.0 if variable.get() else 0.0}
+    SWITCH = (44, 24, 4)       # track width, height, and room around it for the swollen thumb (points)
+    _switch_frames: dict = {}  # resting pictures, shared by every switch of the same look
 
-        def place(at):
-            state["at"] = at
-            fill = ui_motion.blend("#4a4842", view.GREEN, at)
-            canvas.itemconfigure(track, fill=fill)
-            x = r + (width - 2 * r) * at
-            canvas.coords(knob, x - S(8), r - S(8), x + S(8), r + S(8))
+    def switch(self, parent, variable, command=None):
+        """A Liquid Glass switch (glass_switch.render). Pressing swells the
+        thumb into clear glass over the track; on release it springs to the
+        other end, stretching as it goes, and settles back into white."""
+        import glass_switch
+        tk, S, f = self.tk, self.S, self.f
+        width, height, pad = (S(value) for value in self.SWITCH)
+        ground = parent["bg"]
+        canvas = tk.Canvas(parent, width=width + 2 * pad, height=height + 2 * pad, bg=ground,
+                           highlightthickness=0, bd=0, cursor="hand2")
+        state = {"at": 1.0 if variable.get() else 0.0, "press": 0.0, "hover": 0.0, "stretch": 0.0,
+                 "held": False, "flipping": False, "photo": None, "item": None, "queued": False}
+        key = str(canvas)
+
+        def picture():
+            at, press, hover, stretch = state["at"], state["press"], state["hover"], state["stretch"]
+            resting = press == 0 and stretch == 0 and at in (0.0, 1.0) and hover in (0.0, 1.0)
+            cache = (width, height, pad, f, ground, at, hover)
+            if resting and cache in self._switch_frames:
+                return self._switch_frames[cache]
+            image = glass_switch.render(width * f, height * f, at, press, hover, stretch, ground=ground, pad=pad * f)
+            if resting:
+                self._switch_frames[cache] = image
+            return image
+
+        def paint():
+            state["queued"] = False
+            if not canvas.winfo_exists():
+                return
+            photo = self.photo(picture(), state["photo"])
+            if state["item"] is None:
+                state["item"] = canvas.create_image(0, 0, anchor="nw", image=photo)
+            elif photo is not state["photo"]:
+                canvas.itemconfigure(state["item"], image=photo)
+            state["photo"] = photo
+
+        def request():
+            # Several tweens move one switch at once: draw it once per frame.
+            if not state["queued"]:
+                state["queued"] = True
+                canvas.after_idle(paint)
+
+        def ease(name, goal, duration, curve=ui_motion.ease_out, done=None):
+            def apply(value):
+                state[name] = value
+                request()
+            self.motion.to((name, key), state[name], goal, duration, apply, curve, done)
+
+        def settle():
+            state["flipping"] = False
+            state["stretch"] = 0.0
+            if not state["held"]:
+                ease("press", 0.0, .26)
+            request()
 
         def changed(*_):
             goal = 1.0 if variable.get() else 0.0
-            if canvas.winfo_ismapped():
-                self.motion.to(("switch", str(canvas)), state["at"], goal, .18, place)
-            else:
-                self.motion.cancel(("switch", str(canvas)))
-                place(goal)
+            if not canvas.winfo_ismapped():
+                for name in ("at", "press"):
+                    self.motion.cancel((name, key))
+                state.update(at=goal, press=0.0, stretch=0.0, flipping=False)
+                request()
+                return
+            start = state["at"]
+            span = abs(goal - start) or 1.0
 
-        def toggle(_):
-            variable.set(not variable.get())
-            if command:
-                command()
+            def travel(value):
+                state["at"] = value
+                progress = min(1.0, abs(value - start) / span)
+                state["stretch"] = 0.22 * math.sin(math.pi * progress) * state["press"]
+                request()
+            state["flipping"] = True
+            self.motion.to(("at", key), start, goal, .42, travel, ui_motion.ease_out_back, settle)
 
-        canvas.bind("<Button-1>", toggle)
+        def press(_):
+            state["held"] = True
+            ease("press", 1.0, .14)
+
+        def release(event):
+            state["held"] = False
+            inside = 0 <= event.x < canvas.winfo_width() and 0 <= event.y < canvas.winfo_height()
+            if inside:
+                variable.set(not variable.get())
+                if command:
+                    command()
+            elif not state["flipping"]:
+                ease("press", 0.0, .22)
+
+        def leave(_):
+            ease("hover", 0.0, .14)
+
+        canvas.bind("<ButtonPress-1>", press)
+        canvas.bind("<ButtonRelease-1>", release)
+        canvas.bind("<Enter>", lambda _: ease("hover", 1.0, .14))
+        canvas.bind("<Leave>", leave)
         variable.trace_add("write", changed)
-        place(state["at"])
+        paint()
         return canvas
 
     def segmented(self, parent, options, current, command):
@@ -1002,23 +1088,24 @@ class SettingsWindow:
         return inner
 
     # ----- layout ----------------------------------------------------------------------
+    BRAND_SIZE = 36                   # the mascot in the sidebar header (points)
+
+    def _brand(self, side):
+        """The sidebar header: the Circlow mascot and the name, nothing else."""
+        tk, S = self.tk, self.S
+        brand = tk.Frame(side, bg=view.SIDEBAR)
+        brand.pack(fill="x", padx=S(14), pady=(S(18), S(20)))
+        mark = brand_mark(S(self.BRAND_SIZE) * self.f)
+        if mark is not None:
+            self.picture(brand, "brand", mark).pack(side="left")
+        self.label(brand, "环流 · Circlow", 12, weight="bold").pack(side="left", padx=(S(8), 0))
+
     def _layout(self):
         tk, S = self.tk, self.S
         side = self.side = tk.Frame(self.root, bg=view.SIDEBAR, width=S(212))
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
-        brand = tk.Frame(side, bg=view.SIDEBAR)
-        brand.pack(fill="x", padx=S(16), pady=(S(22), S(24)))
-        dots = tk.Canvas(brand, width=S(26), height=S(26), bg=view.SIDEBAR, highlightthickness=0)
-        for index, provider in enumerate(("claude", "codex", "gemini")):
-            color = view.hex_color(view.accent(letter_of(provider)))
-            x = S(1 + index * 7)
-            dots.create_oval(x, S(8), x + S(11), S(19), fill=color, outline=view.SIDEBAR, width=S(2))
-        dots.pack(side="left", anchor="n")
-        names = tk.Frame(brand, bg=view.SIDEBAR)
-        names.pack(side="left", padx=(S(6), 0))
-        self.label(names, "环流 · Circlow", 11, weight="bold").pack(anchor="w")
-        self.label(names, "AI 额度与 TPS 流速", 9, view.INK_3).pack(anchor="w")
+        self._brand(side)
         self.nav = {}
         self.nav_hover = None
         for key, title in PAGES:
@@ -1038,7 +1125,6 @@ class SettingsWindow:
         foot.pack(side="bottom", fill="x", padx=S(20), pady=S(18))
         if stamp:
             self.label(foot, f"构建 {stamp}", 8, view.INK_3).pack(anchor="w")
-        self.label(foot, "托盘右键或面板齿轮可打开此页", 8, view.INK_3, wraplength=S(176)).pack(anchor="w")
 
         main = tk.Frame(self.root, bg=view.BG)
         main.pack(side="left", fill="both", expand=True)

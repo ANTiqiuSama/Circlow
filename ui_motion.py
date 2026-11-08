@@ -17,6 +17,12 @@ def ease_out(t: float) -> float:
     return 1 - (1 - t) ** 3
 
 
+def ease_out_back(t: float, overshoot: float = 1.2) -> float:
+    """Ease out past the end and settle back: a light spring."""
+    t -= 1
+    return 1 + (overshoot + 1) * t ** 3 + overshoot * t ** 2
+
+
 def ease_in_out(t: float) -> float:
     return 4 * t ** 3 if t < .5 else 1 - (-2 * t + 2) ** 3 / 2
 
