@@ -161,12 +161,20 @@ GROK_PROBE = UsageProbe(
 KEY_PAUSE = 0.3      # between the keystrokes of one reply, so the TUI sees each
 
 
-def _type_reply(write: Callable[[str], Any], reply: str | tuple[str, ...]) -> None:
+def _type_reply(write: Callable[[str], Any], reply: str | tuple[str | float, ...]) -> None:
+    """Type a reply: one string, or a tuple of keystrokes and pauses (numbers,
+    in seconds). Keystrokes with no pause between them get KEY_PAUSE."""
     keys = (reply,) if isinstance(reply, str) else reply
-    for index, key in enumerate(keys):
-        if index:
+    typed_last = False
+    for key in keys:
+        if isinstance(key, (int, float)):
+            time.sleep(key)
+            typed_last = False
+            continue
+        if typed_last:
             time.sleep(KEY_PAUSE)
         write(key)
+        typed_last = True
 
 
 def _spawn_target(executable: str, args: list[str]) -> tuple[str, str]:
@@ -575,8 +583,10 @@ CLAUDE_PROBE = UsageProbe(
     retry_every=4.0,
     settle=2.0,
     # The folder is the empty claude-probe one. Newer Claude Code redraws only
-    # the ❯ marker after ↓, so "❯ Yes, I trust" never shows: confirm right away.
-    answers=((CLAUDE_TRUST_RE, "\r"), (CLAUDE_TRUST_NO_RE, ("\x1b[B", "\r")), (CLAUDE_TRUST_YES_RE, "\r")),
+    # the ❯ marker after ↓, so "❯ Yes, I trust" never shows: confirm after a
+    # pause. The dialog appears while Claude Code still queries the terminal
+    # and drops keys sent at once, so wait before ↓ and let it move before ⏎.
+    answers=((CLAUDE_TRUST_RE, "\r"), (CLAUDE_TRUST_NO_RE, (1.5, "\x1b[B", 0.6, "\r")), (CLAUDE_TRUST_YES_RE, "\r")),
     cwd=_claude_probe_dir,
 )
 # No MCP servers, no IDE hookup: the session only needs to render /usage.

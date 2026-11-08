@@ -185,6 +185,10 @@ class ClaudeProbeTest(unittest.TestCase):
             reply = dict((p.pattern, r) for p, r in cli_usage.CLAUDE_PROBE.answers)[cli_usage.CLAUDE_TRUST_NO_RE.pattern]
             cli_usage._type_reply(typed.append, reply)
         self.assertEqual(typed, ["\x1b[B", "\r"])
+        # It waits for the dialog to take keys, then lets the marker move before Enter.
+        self.assertEqual([call.args[0] for call in pause.call_args_list], [1.5, 0.6])
+        with patch.object(cli_usage.time, "sleep") as pause:
+            cli_usage._type_reply(typed.append, ("a", "b"))     # back-to-back keys get KEY_PAUSE
         pause.assert_called_once_with(cli_usage.KEY_PAUSE)
         cli_usage._type_reply(typed.append, "x")
         self.assertEqual(typed[-1], "x")
