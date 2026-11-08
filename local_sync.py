@@ -12,7 +12,7 @@ from quota_charts import weekly_series_name
 from quota_sources import mimo_snapshot, mimo_tracker, parse_codex_session_limits
 from tps_sources import performance_signature, save_performance
 
-log = logging.getLogger("CodexQuotaTray")
+log = logging.getLogger("Circlow")
 PERFORMANCE_SAVE_SECONDS = 60
 
 

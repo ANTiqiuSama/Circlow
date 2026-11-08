@@ -16,16 +16,17 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+import app_identity
 
-ENABLED = (os.environ.get("CODEX_QUOTA_RESET_WATCH") or "1").strip().lower() not in ("0", "off", "false", "no")
+ENABLED = (os.environ.get("CIRCLOW_RESET_WATCH") or "1").strip().lower() not in ("0", "off", "false", "no")
 try:
-    ALERT_PERCENT = max(1, min(100, int(os.environ.get("CODEX_QUOTA_RESET_ALERT") or 60)))
+    ALERT_PERCENT = max(1, min(100, int(os.environ.get("CIRCLOW_RESET_ALERT") or 60)))
 except ValueError:
     ALERT_PERCENT = 60
 POLL_SECONDS = 30 * 60           # normal cadence
 POLL_SECONDS_HIGH = 10 * 60      # while a reset looks likely
 STALE_SECONDS = 3 * 3600         # older forecasts are not shown as current
-USER_AGENT = "CodexQuotaTray (+https://github.com/ANTiqiuSama/CodexQuotaTray)"
+USER_AGENT = app_identity.USER_AGENT
 
 
 @dataclass

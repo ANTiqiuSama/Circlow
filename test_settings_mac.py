@@ -59,7 +59,7 @@ class CommandChannelTest(TempData):
 class LaunchTest(TempData):
     def test_login_item_is_a_launch_agent_that_opens_the_bundle(self):
         agent = Path(self.folder.name) / "LaunchAgents" / "x.plist"
-        bundle = Path("/Applications/CodexQuotaTray.app")
+        bundle = Path("/Applications/Circlow.app")
         with patch.object(settings_mac, "launch_agent_path", return_value=agent), \
                 patch.object(settings_mac, "app_bundle", return_value=bundle):
             self.assertFalse(settings_mac.login_item_enabled())
@@ -73,10 +73,10 @@ class LaunchTest(TempData):
             self.assertFalse(agent.exists())
 
     def test_relaunch_reopens_the_bundle_after_a_pause(self):
-        with patch.object(settings_mac, "app_bundle", return_value=Path("/Applications/Codex Quota.app")):
+        with patch.object(settings_mac, "app_bundle", return_value=Path("/Applications/Circlow Beta.app")):
             command = settings_mac.relaunch_command()
         self.assertEqual(command[:2], ["/bin/sh", "-c"])
-        self.assertIn('sleep 1; /usr/bin/open -n "/Applications/Codex Quota.app"', command[2])
+        self.assertIn('sleep 1; /usr/bin/open -n "/Applications/Circlow Beta.app"', command[2])
 
     def test_shell_open_uses_open_and_skips_windows_targets(self):
         with patch.object(settings_mac.subprocess, "Popen") as popen:
@@ -99,7 +99,7 @@ class MenuCommandTest(unittest.TestCase):
         tray.wake.set.assert_called_once()
         self.assertEqual(settings_mac.handle_menu_command(tray, {"name": "restart"}), "restart")
         self.assertEqual(settings_mac.handle_menu_command(tray, {"name": "quit"}), "quit")
-        with self.assertLogs("CodexQuotaTray", "WARNING"):
+        with self.assertLogs("Circlow", "WARNING"):
             self.assertIsNone(settings_mac.handle_menu_command(tray, {"name": "bogus"}))
 
     def test_reload_rereads_preferences_summaries_and_iq(self):

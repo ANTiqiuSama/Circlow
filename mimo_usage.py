@@ -37,11 +37,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-PLATFORM = os.environ.get("CODEX_QUOTA_MIMO_PLATFORM", "https://platform.xiaomimimo.com")
+PLATFORM = os.environ.get("CIRCLOW_MIMO_PLATFORM", "https://platform.xiaomimimo.com")
 CONSOLE_URL = PLATFORM + "/console/plan-manage"
 USAGE_PATH = "/api/v1/tokenPlan/usage"
 DETAIL_PATH = "/api/v1/tokenPlan/detail"
-DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray"
+DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow"
 COOKIE_PATH = DATA_DIR / "mimo-session.bin"
 LEDGER_PATH = DATA_DIR / "mimo-ledger.json"
 CONFIG_PATH = DATA_DIR / "mimo.json"
@@ -114,12 +114,12 @@ def _protect(data: bytes, decrypt: bool = False) -> bytes:
     crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
     buffer = ctypes.create_string_buffer(data, len(data))
     source, target = Blob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char))), Blob()
-    entropy_bytes = b"CodexQuotaTray/mimo"
+    entropy_bytes = b"CodexQuotaTray/mimo"      # the old name stays: sessions saved before the rename must still open
     entropy_buffer = ctypes.create_string_buffer(entropy_bytes, len(entropy_bytes))
     entropy = Blob(len(entropy_bytes), ctypes.cast(entropy_buffer, ctypes.POINTER(ctypes.c_char)))
     call = crypt32.CryptUnprotectData if decrypt else crypt32.CryptProtectData
     args = (ctypes.byref(source), None, ctypes.byref(entropy), None, None, 0x1, ctypes.byref(target)) if decrypt else \
-        (ctypes.byref(source), "CodexQuotaTray", ctypes.byref(entropy), None, None, 0x1, ctypes.byref(target))
+        (ctypes.byref(source), "Circlow", ctypes.byref(entropy), None, None, 0x1, ctypes.byref(target))
     if not call(*args):
         raise OSError("DPAPI 处理失败")
     try:
@@ -307,7 +307,7 @@ def _request(path: str, session: dict[str, Any], timeout: float = 15.0) -> Any:
         "Accept-Language": "zh-CN",
         "x-timeZone": "Asia/Shanghai",
         "Referer": CONSOLE_URL,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CodexQuotaTray/read-only",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Circlow/read-only",
     }
     headers.update(session.get("headers") or {})
     cookies = session.get("cookies") or {}
@@ -608,7 +608,7 @@ class MimoTracker:
 # ----- Edge login (Chrome DevTools Protocol over a tiny WebSocket client) -------
 
 def edge_path() -> str | None:
-    override = os.environ.get("CODEX_QUOTA_MIMO_BROWSER")
+    override = os.environ.get("CIRCLOW_MIMO_BROWSER")
     candidates = [override] if override else []
     for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"), os.environ.get("LOCALAPPDATA")):
         if base:
@@ -916,7 +916,7 @@ def login(interactive: bool = True, timeout: float = 600.0, raw: dict | None = N
                     globals()["_headless_failed_at"] = 0.0
                     return plan
             time.sleep(2.0)
-        raise LoginRequired("登录超时（详情见 %LOCALAPPDATA%\\CodexQuotaTray\\mimo-login.log）" if interactive else
+        raise LoginRequired("登录超时（详情见 %LOCALAPPDATA%\\Circlow\\mimo-login.log）" if interactive else
                             "MiMo 控制台会话已过期")
     finally:
         if socket_:

@@ -66,7 +66,7 @@ def read_usage(executable: str, provider: str = "claude", raw: dict | None = Non
         raise ValueError(reason)
     # Resolve migrated data junctions before creating a child directory (also
     # avoids MSIX Python's LocalAppData redirection across a reparse point).
-    folder = (Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray/work").resolve()
+    folder = (Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow/work").resolve()
     folder.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"{provider}-quota-", dir=folder) as temporary:
         destination = Path(temporary) / "result.json"

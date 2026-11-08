@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 from forecast import duration_text, forecast, same_window
 
-USAGE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray" / "usage.json.gz"
+USAGE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow" / "usage.json.gz"
 RAW_SECONDS = 26 * 3600         # a little over the chart's day, so a restart finds the whole day
 KEEP_DAYS = 90
 SAVE_EVERY = 60

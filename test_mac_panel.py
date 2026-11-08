@@ -77,7 +77,7 @@ class HoverPanelLogicTest(unittest.TestCase):
         hover, _ = self.controller()
         hover.pointer = Mock(return_value=((1.0, 1.0), False, False))
         hover.target_at = Mock(side_effect=RuntimeError("boom"))
-        with self.assertLogs("CodexQuotaTray", "ERROR"):
+        with self.assertLogs("Circlow", "ERROR"):
             hover.tick()
         self.assertIsNone(hover.window)
         self.assertGreater(hover.retry_at, time.monotonic())
@@ -152,7 +152,7 @@ class ClickRoutingTest(unittest.TestCase):
             state.open_in_herdr.assert_called_once_with("grok")
             state.reset_mock()
             failed = Mock(return_value=Mock(returncode=1))
-            with self.assertLogs("CodexQuotaTray", "WARNING"):
+            with self.assertLogs("Circlow", "WARNING"):
                 self.assertEqual(mac_menu.open_source("claude", state, run=failed), "herdr")
             state.open_in_herdr.assert_called_once_with("claude")
 

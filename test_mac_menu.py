@@ -142,7 +142,7 @@ class MacMenuTests(unittest.TestCase):
         from types import SimpleNamespace
         opened = []
         # Without Ghostty (test_mac_panel covers the Ghostty window), Terminal hosts Herdr.
-        with patch.object(herdr_source.sys, "platform", "darwin"), patch.dict("os.environ", {"CODEX_QUOTA_HERDR_SESSION": ""}), \
+        with patch.object(herdr_source.sys, "platform", "darwin"), patch.dict("os.environ", {"CIRCLOW_HERDR_SESSION": ""}), \
                 patch.object(herdr_source, "ghostty_app", return_value=None):
             herdr_source.open_window("/opt/homebrew/bin/herdr", lambda args, **_: opened.append(args))
         self.assertEqual(opened[0][:2], ["osascript", "-e"])
@@ -150,7 +150,7 @@ class MacMenuTests(unittest.TestCase):
         terminal = SimpleNamespace(pid=2, exe=lambda: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")
         client = SimpleNamespace(pid=3, info={"name": "herdr", "cmdline": ["/opt/homebrew/bin/herdr"]},
                                  exe=lambda: "/opt/homebrew/bin/herdr", parents=lambda: [terminal])
-        with patch.dict("os.environ", {"CODEX_QUOTA_HERDR_SESSION": ""}):
+        with patch.dict("os.environ", {"CIRCLOW_HERDR_SESSION": ""}):
             self.assertEqual(herdr_source.client_app([client]), "/System/Applications/Utilities/Terminal.app")
         self.assertEqual(herdr_source.terminal_script(['/a b/say "hi"'])[2],
                          'tell application "Terminal" to do script "\'/a b/say \\"hi\\"\'"')

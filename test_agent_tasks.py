@@ -66,7 +66,7 @@ class NotesTests(unittest.TestCase):
 
     def test_codex_follow_up_keeps_the_task_and_tracks_steps(self):
         notes = AgentNotes()
-        notes.codex("s", {"type": "session_meta", "payload": {"cwd": "C:/w/CodexQuotaTray",
+        notes.codex("s", {"type": "session_meta", "payload": {"cwd": "C:/w/Circlow",
                      "source": {"subagent": {"thread_spawn": {"parent_thread_id": "main", "agent_nickname": "Ada"}}}}})
         notes.codex("s", {"type": "event_msg", "timestamp": stamp(100), "payload": {"type": "user_message", "message": "实现气泡面板"}})
         notes.codex("s", {"type": "event_msg", "timestamp": stamp(101), "payload": {"type": "user_message", "message": "继续"}})
@@ -74,7 +74,7 @@ class NotesTests(unittest.TestCase):
         note = notes.notes["s"]
         self.assertEqual((note.prompt, note.action, note.parent, note.role), ("实现气泡面板", "运行测试", "main", "Ada"))
         exported = notes.export({"s": ("codex", 102, "生成中")}, {"s": {"source": "Codex", "model": "gpt-5"}}, {}, 110)
-        self.assertEqual(exported[0]["folder"], "CodexQuotaTray")
+        self.assertEqual(exported[0]["folder"], "Circlow")
         self.assertEqual(exported[0]["doing"], "运行测试")
 
     def test_claude_subagent_is_live_without_its_own_activity_and_lingers_dim(self):
@@ -848,7 +848,7 @@ class HerdrAndHelperTests(unittest.TestCase):
                 return done(1, err='{"error":{"code":"agent_name_taken","message":"taken"}}')
             return done(0, '{"result":{"type":"agent_started"}}')
 
-        with patch.dict(os.environ, {"CODEX_QUOTA_HERDR_SESSION": ""}), \
+        with patch.dict(os.environ, {"CIRCLOW_HERDR_SESSION": ""}), \
                 patch.object(herdr_source.shutil, "which", return_value=r"C:\WindowsApps\wt.exe"):
             name = herdr_source.start_agent("grok", exe="herdr.exe", runner=run, popen=lambda *a, **k: opened.append(a[0]),
                                             window_open=lambda: False, sleep=lambda _s: None, cwd=r"C:\home")
@@ -896,7 +896,7 @@ class HerdrAndHelperTests(unittest.TestCase):
         import herdr_source
         from types import SimpleNamespace
         row = lambda *args: SimpleNamespace(info={"name": "herdr.exe", "cmdline": [r"C:\h\herdr.exe", *args]})
-        with patch.dict(os.environ, {"CODEX_QUOTA_HERDR_SESSION": ""}):
+        with patch.dict(os.environ, {"CIRCLOW_HERDR_SESSION": ""}):
             self.assertTrue(herdr_source.client_open([row("server"), row()]))
             self.assertFalse(herdr_source.client_open([row("server"), row("agent", "list")]))
             self.assertFalse(herdr_source.client_open([SimpleNamespace(info={"name": "python.exe", "cmdline": []})]))
@@ -910,7 +910,7 @@ class HerdrAndHelperTests(unittest.TestCase):
                                    parents=lambda: [SimpleNamespace(pid=p) for p in parents])
         processes = [proc(5, ["server"], [9]), proc(3, [], [2, 1])]      # client in shell 2, terminal 1
         windows = [(70, 9, True, "server host"), (80, 1, False, ""), (81, 1, True, "BL4CK0UT: herdr"), (90, 4, True, "other")]
-        with patch.dict(os.environ, {"CODEX_QUOTA_HERDR_SESSION": ""}):
+        with patch.dict(os.environ, {"CIRCLOW_HERDR_SESSION": ""}):
             self.assertEqual(herdr_source.client_window(processes, windows), 81)
             self.assertIsNone(herdr_source.client_window(processes[:1], windows))     # no client open
 
@@ -958,7 +958,7 @@ class HerdrAndHelperTests(unittest.TestCase):
                 tray.open_provider("claude")
             raise_client.assert_called_once()                                  # ...so Claude Code in Herdr instead
         import os
-        with patch.dict(os.environ, {"CODEX_QUOTA_CLAUDE_APP": "X_y!Claude"}):
+        with patch.dict(os.environ, {"CIRCLOW_CLAUDE_APP": "X_y!Claude"}):
             self.assertEqual(tray_app.provider_registry.claude_desktop_aumid(), "X_y!Claude")
 
     @staticmethod

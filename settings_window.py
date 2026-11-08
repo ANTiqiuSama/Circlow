@@ -403,7 +403,7 @@ class SettingsWindow:
         self.app, self.commands = app, commands
         root = self.root = tk.Tk()
         root.withdraw()
-        root.title("CodexQuotaTray 设置")
+        root.title("环流 · Circlow 设置")
         root.configure(bg=view.BG)
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         S = self.S = lambda value: round(value * self.scale)  # noqa: E731
@@ -998,8 +998,8 @@ class SettingsWindow:
         dots.pack(side="left", anchor="n")
         names = tk.Frame(brand, bg=view.SIDEBAR)
         names.pack(side="left", padx=(S(6), 0))
-        self.label(names, "CodexQuotaTray", 11, weight="bold").pack(anchor="w")
-        self.label(names, "AI 额度与 TPS", 9, view.INK_3).pack(anchor="w")
+        self.label(names, "环流 · Circlow", 11, weight="bold").pack(anchor="w")
+        self.label(names, "AI 额度与 TPS 流速", 9, view.INK_3).pack(anchor="w")
         self.nav = {}
         self.nav_hover = None
         for key, title in PAGES:
@@ -1283,7 +1283,7 @@ class SettingsWindow:
         S = self.S
         hidden = int(getattr(self.app, "hidden_slots", 0) or 0)
         if hidden:
-            text = f"有 {hidden} 个托盘图标收在 ^ 隐藏区，任务栏上会缺少排在最后的来源。请在任务栏设置中打开全部 CodexQuotaTray 图标。"
+            text = f"有 {hidden} 个托盘图标收在 ^ 隐藏区，任务栏上会缺少排在最后的来源。请在任务栏设置中打开全部环流图标。"
             self.set_text(self.tray_notice_text, text)
             if not self.tray_notice.winfo_manager():
                 self.tray_notice.pack(fill="x", pady=(0, S(12)), before=self.card_grid)
@@ -1434,8 +1434,8 @@ class SettingsWindow:
         import providers
         tk, S = self.tk, self.S
         self.heading(page, "来源", "开关在保存后生效并自动重启托盘；MiMo 的登录与手动套餐立即生效。")
-        if os.environ.get("CODEX_QUOTA_PROVIDERS"):
-            self.para(page, f"已设置 CODEX_QUOTA_PROVIDERS={os.environ['CODEX_QUOTA_PROVIDERS']}；本页开关优先于它。", 9, view.WARN).pack(
+        if os.environ.get("CIRCLOW_PROVIDERS"):
+            self.para(page, f"已设置 CIRCLOW_PROVIDERS={os.environ['CIRCLOW_PROVIDERS']}；本页开关优先于它。", 9, view.WARN).pack(
                 anchor="w", fill="x", pady=(0, S(10)))
         states = {state["key"]: state for state in providers.provider_states()}
         self.source_rows = {}
@@ -1536,7 +1536,7 @@ class SettingsWindow:
         if total:
             parts.append(f"套餐 {info.get('plan') or ''} 共 {total / 1e9:.2f}B" + (f"，已用 {used / 1e9:.2f}B" if used is not None else ""))
         if not info.get("browser"):
-            parts.append("未找到 Edge/Chrome：登录需要其中之一，或设置 CODEX_QUOTA_MIMO_BROWSER 指向浏览器")
+            parts.append("未找到 Edge/Chrome：登录需要其中之一，或设置 CIRCLOW_MIMO_BROWSER 指向浏览器")
         warn = info.get("login_result") or info.get("error") or ""
         for widget, text, ink in ((self.mimo_head, head, color), (self.mimo_info, " · ".join(parts), view.INK_3),
                                   (self.mimo_warn, warn, view.WARN)):
@@ -1792,18 +1792,18 @@ class SettingsWindow:
         self.test_button.pack(side="left")
         self.result = tk.StringVar()
         self.label(test, "", 10, view.INK_2, textvariable=self.result).pack(side="left", padx=S(12))
-        if any(os.environ.get("CODEX_QUOTA_SUMMARY_" + name) for name in ("URL", "KEY", "MODEL")):
-            self.para(naming, "已设置 CODEX_QUOTA_SUMMARY_* 环境变量，环境变量优先于本页配置。", 9, view.WARN).pack(
+        if any(os.environ.get("CIRCLOW_SUMMARY_" + name) for name in ("URL", "KEY", "MODEL")):
+            self.para(naming, "已设置 CIRCLOW_SUMMARY_* 环境变量，环境变量优先于本页配置。", 9, view.WARN).pack(
                 anchor="w", fill="x", pady=(S(10), 0))
 
     def _fill_tasks(self):
         herdr = getattr(getattr(self.app, "tps_monitor", None), "herdr", None)
         if herdr is not None:
-            env = os.environ.get("CODEX_QUOTA_HERDR")
+            env = os.environ.get("CIRCLOW_HERDR")
             text = (f"状态：{herdr.status} · {len(herdr.rows)} 个窗格。同一窗格的会话合并为一个气泡，blocked 显示为“等你确认”；"
                     "点击 Grok 图标会在 herdr 新建工作区启动它；Claude 图标打开 Claude App，没装 App 时才在 herdr 启动 Claude Code。")
             if env:
-                text += f"（环境变量 CODEX_QUOTA_HERDR={env} 优先）"
+                text += f"（环境变量 CIRCLOW_HERDR={env} 优先）"
             self.set_text(self.herdr_row.detail, text)
         letters = {provider: letter_of(provider) for provider in PROVIDER_NAMES}
         agents = [agent for agent in (getattr(self.app, "agents", None) or []) if not agent.get("schedule")]

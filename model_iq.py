@@ -22,16 +22,17 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+import app_identity
 
 API_URL = "https://aistupidlevel.info/api/v1/models?period=24h&sortBy=coding"   # the coding board only
 SITE = "https://aistupidlevel.info/"
 SIGNUP = "https://aistupidlevel.info/router/data-keys"
-USER_AGENT = "CodexQuotaTray (+https://github.com/ANTiqiuSama/CodexQuotaTray)"
+USER_AGENT = app_identity.USER_AGENT
 DAILY_LIMIT = 10                 # free key: 10 calls per UTC day
 AUTO_CALLS_PER_DAY = 7           # automatic reads; the other 3 stay for manual refresh
 READ_SECONDS = 3 * 3600          # automatic cadence (7 reads span 21 h)
 HOVER_MAX = 3                    # models on the hover panel line
-ENV_KEY = "CODEX_QUOTA_IQ_KEY"
+ENV_KEY = "CIRCLOW_IQ_KEY"
 
 
 @dataclass

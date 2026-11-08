@@ -16,7 +16,7 @@ import providers as provider_registry
 from quota_sources import save_cached_snapshots
 from tray_icons import make_display_icon
 
-log = logging.getLogger("CodexQuotaTray")
+log = logging.getLogger("Circlow")
 # Tray order is fixed (providers.TRAY_POSITIONS): Claude Code, Codex (GPT),
 # Grok, Gemini, MiMo.  It never changes with remaining quota or exhaustion.
 REORDER_MIN_SECONDS = 2          # after a drag, the order is right again within a few seconds

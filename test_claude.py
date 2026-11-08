@@ -40,7 +40,7 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(providers.enabled_keys("grok;nope"), ["grok"])
 
     def test_installed_claude_waits_for_manual_enable(self):
-        with tempfile.TemporaryDirectory() as home, patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": home, "CODEX_QUOTA_CLAUDE_EXE": ""}):
+        with tempfile.TemporaryDirectory() as home, patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": home, "CIRCLOW_CLAUDE_EXE": ""}):
             with patch.object(providers.shutil, "which", return_value=None), patch.object(providers.Path, "home", return_value=Path(home)):
                 self.assertNotIn("claude", providers.enabled_keys(""))
                 (Path(home) / "projects").mkdir()
@@ -113,7 +113,7 @@ class UsageParsingTests(unittest.TestCase):
     def test_missing_cli_is_reported_not_raised(self):
         with patch.object(providers, "find_claude", return_value=None):
             snapshot = quota_sources.get_claude_quota()
-        self.assertIn("CODEX_QUOTA_CLAUDE_EXE", snapshot.error)
+        self.assertIn("CIRCLOW_CLAUDE_EXE", snapshot.error)
 
 
 class ReaderIsolationTests(unittest.TestCase):
@@ -164,7 +164,7 @@ class ReaderIsolationTests(unittest.TestCase):
                 claude_quota.read_usage("claude.exe")
             process.wait.assert_called_once_with(timeout=45)
             stop.assert_called_once_with(process)
-            self.assertEqual(list((Path(folder) / "CodexQuotaTray/work").iterdir()), [])
+            self.assertEqual(list((Path(folder) / "Circlow/work").iterdir()), [])
 
     def test_worker_transfers_only_parsed_quota_numbers(self):
         with tempfile.TemporaryDirectory() as folder, \

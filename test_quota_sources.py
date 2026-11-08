@@ -107,7 +107,7 @@ class GrokIsolationTests(unittest.TestCase):
                 self.assertEqual(cli_quota.read_usage("grok.exe", "grok", raw)["remaining_percent"], 70)
                 self.assertEqual(raw["next_reset"], "Next reset: October 27, 11:02")
             self.assertNotEqual(commands[0][-1], commands[1][-1])
-            self.assertEqual(list((Path(folder) / "CodexQuotaTray/work").iterdir()), [])
+            self.assertEqual(list((Path(folder) / "Circlow/work").iterdir()), [])
 
     def test_grok_worker_exports_only_quota_lines_without_identity(self):
         text = "private@example.test\nWeekly limit: 30%\nNext reset: October 27, 11:02\nSECRET-TOKEN"

@@ -6,7 +6,7 @@ Adding a provider means one entry here plus a quota reader in
 launchers and accent colours - is derived from this table.
 
 Which providers are shown:
-* `CODEX_QUOTA_PROVIDERS=codex,grok,gemini,claude` picks an explicit list;
+* `CIRCLOW_PROVIDERS=codex,grok,gemini,claude` picks an explicit list;
 * Claude is opt-in through the tray menu or an explicit environment list;
 * otherwise every provider with `default=True` is shown, plus detected MiMo.
 """
@@ -26,7 +26,7 @@ def _local_appdata() -> Path:
 
 
 def _choices_path() -> Path:
-    return _local_appdata() / "CodexQuotaTray/providers.json"
+    return _local_appdata() / "Circlow/providers.json"
 
 
 def provider_choices() -> dict[str, bool]:
@@ -36,7 +36,7 @@ def provider_choices() -> dict[str, bool]:
     except ValueError:
         stored = {}
     choices = {str(key): bool(value) for key, value in (stored.items() if isinstance(stored, dict) else []) if isinstance(value, bool)}
-    legacy = {"enabled": True, "disabled": False}.get(_read(_local_appdata() / "CodexQuotaTray/claude-enabled.txt").strip())
+    legacy = {"enabled": True, "disabled": False}.get(_read(_local_appdata() / "Circlow/claude-enabled.txt").strip())
     if "claude" not in choices and legacy is not None:
         choices["claude"] = legacy
     return choices
@@ -59,7 +59,7 @@ def set_provider_choices(changes: dict[str, bool | None]) -> None:
 
 
 def _write_claude_legacy(enabled: bool) -> None:
-    path = _local_appdata() / "CodexQuotaTray/claude-enabled.txt"
+    path = _local_appdata() / "Circlow/claude-enabled.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("enabled" if enabled else "disabled", encoding="utf-8")
 
@@ -79,7 +79,7 @@ def claude_home() -> Path:
 
 def find_claude() -> Path | None:
     """Claude Code: native installer, npm shim, or an explicit override."""
-    override = os.environ.get("CODEX_QUOTA_CLAUDE_EXE")
+    override = os.environ.get("CIRCLOW_CLAUDE_EXE")
     if override:
         return Path(override)
     candidates = [
@@ -110,7 +110,7 @@ def claude_routes_to_mimo() -> bool:
 
 
 def _mimo_used() -> bool:
-    data = _local_appdata() / "CodexQuotaTray"
+    data = _local_appdata() / "Circlow"
     if (data / "mimo-session.bin").is_file() or (data / "mimo.json").is_file():
         return True
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
@@ -202,7 +202,7 @@ def get(key: str) -> ProviderSpec:
 
 
 def _env_list(env: str | None = None) -> set[str] | None:
-    raw = os.environ.get("CODEX_QUOTA_PROVIDERS") if env is None else env
+    raw = os.environ.get("CIRCLOW_PROVIDERS") if env is None else env
     return {part.strip().lower() for part in raw.replace(";", ",").split(",") if part.strip()} if raw else None
 
 
@@ -239,7 +239,7 @@ def provider_states(env: str | None = None) -> list[dict]:
         if choice is not None:
             reason = "手动开启" if choice else "手动关闭"
         elif listed is not None:
-            reason = "环境变量 CODEX_QUOTA_PROVIDERS " + ("包含" if spec.key in listed else "未包含")
+            reason = "环境变量 CIRCLOW_PROVIDERS " + ("包含" if spec.key in listed else "未包含")
         elif spec.default:
             reason = "默认开启"
         elif spec.key == "claude":
@@ -255,8 +255,8 @@ def claude_desktop_aumid() -> str | None:
     """The installed Claude desktop app's launch id ("Claude_<publisher>!Claude",
     for shell:AppsFolder), or None when it is not installed. The Store package
     keeps its data under %LOCALAPPDATA%\\Packages\\Claude_<publisher>; an
-    explicit id can be given with CODEX_QUOTA_CLAUDE_APP."""
-    override = os.environ.get("CODEX_QUOTA_CLAUDE_APP")
+    explicit id can be given with CIRCLOW_CLAUDE_APP."""
+    override = os.environ.get("CIRCLOW_CLAUDE_APP")
     if override:
         return override
     if sys.platform != "win32":
