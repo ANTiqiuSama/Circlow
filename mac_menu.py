@@ -1,12 +1,13 @@
 """Native macOS menu-bar frontend for the shared quota and TPS readers.
 
-AppKit stays on the main thread.  Slow client reads and local-log scans stay in
-workers; a short timer copies immutable view data into NSStatusItems/NSMenus.
-The Windows hover panel and its Win32 message loop are deliberately separate.
+AppKit stays on the main thread. The data side is the Windows tray's own
+QuotaTray run headless (quotas, TPS, agents, forecasts, reset watch), fed
+stand-in icons (MacIcon) instead of pystray ones; a short timer copies their
+pictures into NSStatusItems/NSMenus. Hovering an item opens the same agent
+panel as on Windows (mac_panel); clicking it opens the native menu.
 """
 from __future__ import annotations
 
-import io
 import logging
 import logging.handlers
 import os
@@ -33,7 +34,6 @@ import herdr_source
 import launchers
 import mimo_usage
 import providers
-import sync_hub
 from agent_panel import compact_usage
 from forecast import reset_distance
 from quota_sources import QuotaSnapshot, collect, load_cached_snapshots, mimo_snapshot, mimo_tracker, placeholder, save_cached_snapshots
@@ -43,6 +43,9 @@ from tray_icons import make_display_icon, quota_exhausted, stale_note
 
 
 HERDR_AGENTS = launchers.HERDR_AGENTS      # "打开来源" starts these in a new Herdr workspace
+LEFT_UP_MASK, RIGHT_UP_MASK = 1 << 2, 1 << 4   # NSEventMaskLeftMouseUp, NSEventMaskRightMouseUp
+RIGHT_UP_TYPE = 4                              # NSEventTypeRightMouseUp
+CONTROL_FLAG = 1 << 18                         # NSEventModifierFlagControl
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "Library/Application Support")) / APP_NAME
 log = logging.getLogger(APP_NAME)
 
@@ -136,32 +139,74 @@ def bar_order(keys: list[str]) -> list[str]:
     return sorted(keys, key=lambda key: rank.get(key, len(rank)), reverse=True)
 
 
-def open_source(key: str, state, popen=subprocess.Popen) -> str | None:
-    """"打开来源": the first of launchers.ways that applies here; returns the
-    kind that was used, None when nothing could be opened."""
+def open_source(key: str, state, popen=subprocess.Popen, run=subprocess.run) -> str | None:
+    """A click on the source's icon (or "打开来源"): the first of
+    launchers.ways that works here. Codex, Gemini and Claude open their
+    desktop clients; Grok starts in a new Herdr workspace (Herdr in Ghostty).
+    Returns the kind that was used, None when nothing could be opened."""
     for way in launchers.ways(key, "darwin"):
         if way.kind == "url":
             webbrowser.open(str(way.target))
         elif way.kind == "mac-app":
-            popen(["open", "-a", way.target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            opened = run(["open", "-b", way.target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            if opened.returncode != 0:
+                log.warning("could not open %s (%s); trying the next way", way.target, opened.returncode)
+                continue
         elif way.kind == "herdr":
             state.open_in_herdr(key)
         elif not open_cli(key, popen):
             continue
         return way.kind
+    log.warning("nothing could open %s", key)
     return None
 
 
 def open_cli(key: str, popen=subprocess.Popen) -> bool:
-    """Claude Code / Grok without Herdr: the CLI itself in a new Terminal window."""
+    """Claude Code / Grok without Herdr: the CLI itself in a new Ghostty
+    (else Terminal) window."""
     path = providers.find_claude() if key == "claude" else shutil.which("grok")
     if not path:
         return False
-    popen(herdr_source.terminal_script([str(path)]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    popen(herdr_source.mac_terminal([str(path)], str(Path.home())), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
 
+def notify(title: str, message: str, popen=subprocess.Popen) -> None:
+    """A Notification Center banner (the Windows balloon)."""
+    def quoted(text: str) -> str:
+        return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    popen(["osascript", "-e", f"display notification {quoted(message)} with title {quoted(title or APP_NAME)}"],
+          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class MacIcon:
+    """Stand-in for a pystray icon in a headless QuotaTray: the tray writes
+    `icon` (PIL image) and `title`; the AppKit timer reads them. The panel
+    sets `details_visible` and an open menu `hover_open`, which the tray's
+    scheduler reads as "pointer on this source" (fastest refresh tier)."""
+
+    def __init__(self, key: str):
+        self.key = key
+        self.icon = None
+        self.title = ""
+        self.visible = True
+        self.details_visible = False
+        self.hover_open = False
+        self.suppress_hover = False
+
+    def update_menu(self) -> None:
+        pass                                   # the AppKit timer rebuilds menu titles itself
+
+    def notify(self, message: str, title: str = "") -> None:
+        notify(title, message)
+
+    def stop(self) -> None:
+        pass
+
+
 class MenuState:
+    """The menu bar's original standalone reader. run_mac now uses QuotaTray;
+    this stays for open_source's Herdr launcher (open_in_herdr)."""
     def __init__(self, keys: list[str] | None = None):
         self.keys = keys if keys is not None else providers.enabled_keys()
         cached = load_cached_snapshots()
@@ -175,7 +220,6 @@ class MenuState:
         self.last_samples: dict[str, float | None] = {}
         self.mimo_ingested = 0
         self.herdr_opening: set[str] = set()
-        self.sync: sync_hub.SyncLoop | None = None
 
     def hover(self, provider: str | None, on: bool):
         """An open status menu reads its source at the hover rate, like the
@@ -284,59 +328,9 @@ class MenuState:
             if snapshot.remaining_percent is not None or self.snapshots["mimo"].remaining_percent is None:
                 self.snapshots["mimo"] = snapshot
 
-    # ----- multi-device sync (sync_hub) ----------------------------------------------------
-
-    def start_sync(self) -> bool:
-        config = sync_hub.load_config()
-        if config is None:
-            return False
-        self.sync = sync_hub.SyncLoop(sync_hub.HubClient(config), config["device"], self.sync_payload, self.sync_merge)
-        threading.Thread(target=self.sync.run, args=(self.stop,), name="mac-sync", daemon=True).start()
-        log.info("sync: on as %s via %s", config["device"], config["url"])
-        return True
-
-    def sync_payload(self, now: float) -> dict:
-        store = self.monitor.store if self.monitor is not None else None
-        with self.lock:
-            snapshots = dict(self.snapshots)
-        return {"label": sync_hub.device_label(), "platform": sys.platform, "sent_at": now,
-                "snapshots": sync_hub.snapshot_payload(snapshots),
-                "usage": store.export_hours(now - sync_hub.USAGE_DAYS * 86400) if store is not None else {},
-                "weekly": {}}
-
-    def accept_snapshot(self, provider: str, snapshot: QuotaSnapshot, _source: str = "") -> bool:
-        with self.lock:
-            current = self.snapshots.get(provider)
-            if current is not None and (snapshot.updated_at or 0) <= (current.updated_at or 0):
-                return False
-            self.snapshots[provider] = snapshot
-        return True
-
-    def sync_merge(self, payloads: dict, now: float) -> None:
-        me = self.sync.device if self.sync is not None else ""
-        with self.lock:
-            current = dict(self.snapshots)
-        taken = sync_hub.merge_snapshots(payloads, me, current, self.accept_snapshot)
-        store = self.monitor.store if self.monitor is not None else None
-        if store is not None:
-            store.keep_remote(payloads)
-            for device, record in payloads.items():
-                if device != me and isinstance(record, dict):
-                    payload = record.get("payload") or {}
-                    store.set_remote(device, str(payload.get("label") or device), payload.get("usage"))
-        if taken:
-            log.info("sync: newer readings from other devices for %s", ", ".join(sorted({p for p, _ in taken})))
-            with self.lock:
-                snapshots = dict(self.snapshots)
-            save_cached_snapshots(snapshots)
-
-    def sync_status(self) -> str:
-        return self.sync.status() if self.sync is not None else "未开启（没有 sync.json）"
-
     def start(self):
         threading.Thread(target=self.quota_loop, name="mac-quota", daemon=True).start()
         threading.Thread(target=self.tps_loop, name="mac-tps", daemon=True).start()
-        self.start_sync()
 
 
 def _logger():
@@ -366,18 +360,29 @@ def run_mac() -> int:
     if handle is None:
         return 0
     _logger()
-    from Cocoa import (NSApplication, NSApplicationActivationPolicyAccessory, NSImage, NSMenu,
+    from Cocoa import (NSApplication, NSApplicationActivationPolicyAccessory, NSMenu,
                        NSMenuItem, NSObject, NSStatusBar, NSVariableStatusItemLength, NSTimer)
-    from Foundation import NSData
+    import objc
+    import settings_mac
+    import tray_app
+    from mac_panel import MacHoverPanel, to_nsimage
 
-    state = MenuState()
+    settings_mac.take_commands(settings_mac.MENU)      # requests left over from an earlier run
+
+    keys = list(tray_app.PROVIDERS)
+    icons = {key: MacIcon(key) for key in keys}
+    tray = tray_app.QuotaTray(icons=icons)
+    launcher = MenuState(keys)        # Herdr launcher for "打开来源"; its readers are not started
 
     class Delegate(NSObject):
         def applicationDidFinishLaunching_(self, _notification):
             self.items = {}
             self.menus = {}
+            self.menu_objs = {}
+            self.order = []
+            self.pictures = {}
             bar = NSStatusBar.systemStatusBar()
-            for key in bar_order(state.keys):
+            for key in bar_order(keys):
                 item = bar.statusItemWithLength_(NSVariableStatusItemLength)
                 menu = NSMenu.alloc().initWithTitle_(key)   # the title names the source for the delegate
                 menu.setAutoenablesItems_(False)
@@ -390,39 +395,62 @@ def run_mac() -> int:
                     menu.addItem_(line)
                     parts[name] = line
                 menu.addItem_(NSMenuItem.separatorItem())
-                for title, action in (("立即刷新", "refreshOne:"), ("打开来源", "openSource:"),
+                for title, action in (("立即刷新", "refreshOne:"), ("打开来源", "openSource:"), ("设置…", "openSettings:"),
                                       ("退出 CodexQuotaTray", "quitApp:")):
                     line = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
                     line.setTarget_(self)
                     line.setRepresentedObject_(key)
                     menu.addItem_(line)
-                item.setMenu_(menu)
+                # Like the Windows tray: left-click opens the source, right-click
+                # (or Control-click) shows the menu. A menu attached to the item
+                # would take every click, so it is attached only while shown.
+                button = item.button()
+                button.setTag_(len(self.order))
+                button.setTarget_(self)
+                button.setAction_("statusClicked:")
+                button.sendActionOn_(LEFT_UP_MASK | RIGHT_UP_MASK)
+                self.order.append(key)
                 self.items[key] = item
                 self.menus[key] = parts
+                self.menu_objs[key] = menu
+            self.hover = MacHoverPanel(tray, self.items, icons, self.panelSettings)
             self.updateUI_(None)
             self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                2.0, self, "updateUI:", None, True)
-            state.start()
+                1.0, self, "updateUI:", None, True)
+            tray.start_workers()
+            self.hover.start(self)
 
         def updateUI_(self, _timer):
-            for key in state.keys:
-                snapshot, performance, refresh = state.view(key)
-                model = menu_model(key, snapshot, performance, refresh)
-                image = status_image(snapshot, providers.get(key).letter, performance)
-                output = io.BytesIO()
-                image.save(output, format="PNG")
-                payload = output.getvalue()
-                native = NSImage.alloc().initWithData_(NSData.dataWithBytes_length_(payload, len(payload)))
-                native.setSize_((20, 20))
+            now = time.time()
+            for command in settings_mac.take_commands(settings_mac.MENU):
+                outcome = settings_mac.handle_menu_command(tray, command, now)
+                log.info("settings command %s -> %s", command.get("name"), outcome or "applied")
+                if outcome == "restart":
+                    subprocess.Popen(settings_mac.relaunch_command(), start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if outcome in ("restart", "quit"):
+                    self.quitApp_(None)
+                    return
+            for key in keys:
+                snapshot = tray.snapshots[key]
+                performance = dict(tray.performance.get("providers", {}).get(key, {}))
+                model = menu_model(key, snapshot, performance, tray.scheduler.describe(key, now), now)
+                # The tray draws the icon each second (TPS loop); until then draw it here.
+                image = icons[key].icon or status_image(snapshot, providers.get(key).letter, performance)
                 button = self.items[key].button()
-                button.setImage_(native)
-                button.setToolTip_("\n".join(part for part in (model["summary"], model["speed"]) if part))
+                if self.pictures.get(key) is not image:
+                    button.setImage_(to_nsimage(image, image.size[0] / 20))
+                    self.pictures[key] = image
+                # Sources with a hover panel skip the native tooltip, which would cover it.
+                tip = "" if tray_app.has_panel(key, snapshot) else "\n".join(
+                    part for part in (model["summary"], model["speed"]) if part)
+                button.setToolTip_(tip)
                 rows = model["quota"][:3]
                 for name, value in (("summary", model["summary"]), ("speed", model["speed"]),
                                     ("updated", model["updated"]), ("error", model["error"])):
                     self.menus[key][name].setTitle_(value)
                     self.menus[key][name].setHidden_(not bool(value))
-                sync = f"同步：{state.sync_status()}" if state.sync is not None else ""
+                sync = f"同步：{tray.sync_status()}" if getattr(tray, "sync", None) is not None else ""
                 self.menus[key]["sync"].setTitle_(sync)
                 self.menus[key]["sync"].setHidden_(not sync)
                 for index in range(3):
@@ -432,20 +460,67 @@ def run_mac() -> int:
                     line.setHidden_(not bool(value))
 
         def menuWillOpen_(self, menu):
-            state.hover(str(menu.title()), True)
+            key = str(menu.title())
+            if key in icons:
+                icons[key].hover_open = True     # open menu = hover: fastest refresh tier
+                tray.wake.set()
+            self.hover.menu_will_open(key)
 
         def menuDidClose_(self, menu):
-            state.hover(str(menu.title()), False)
+            key = str(menu.title())
+            if key in icons:
+                icons[key].hover_open = False
+            self.hover.menu_did_close(key)
+
+        def panelTick_(self, _timer):
+            self.hover.tick()
+
+        def statusClicked_(self, sender):
+            index = int(sender.tag())
+            if not 0 <= index < len(self.order):
+                return
+            key = self.order[index]
+            event = NSApplication.sharedApplication().currentEvent()
+            secondary = event is not None and (int(event.type()) == RIGHT_UP_TYPE
+                                               or int(event.modifierFlags()) & CONTROL_FLAG)
+            if secondary:
+                self.showMenu(key)
+                return
+            self.hover.clicked(key)
+            kind = open_source(key, launcher)
+            log.info("clicked %s: opened via %s", key, kind)
+
+        @objc.python_method
+        def showMenu(self, key):
+            """The source's menu under its item; returns once it has closed."""
+            item = self.items[key]
+            item.setMenu_(self.menu_objs[key])
+            try:
+                item.button().performClick_(None)
+            finally:
+                item.setMenu_(None)
+
+        @objc.python_method
+        def panelSettings(self, provider, page):
+            # The panel's gear, banner and right-click: the settings window
+            # (its own process, see settings_mac), on the page asked for.
+            how = settings_mac.open_settings(page)
+            log.info("settings window %s from the %s panel (page %s)", how, provider, page)
+
+        def openSettings_(self, _sender):
+            how = settings_mac.open_settings(None)
+            log.info("settings window %s from the menu", how)
 
         def refreshOne_(self, sender):
-            state.request(str(sender.representedObject()))
+            tray.scheduler.request([str(sender.representedObject())], time.time())
+            tray.wake.set()
 
         def openSource_(self, sender):
-            open_source(str(sender.representedObject()), state)
+            open_source(str(sender.representedObject()), launcher)
 
         def quitApp_(self, _sender):
-            state.stop.set()
-            state.wake.set()
+            self.hover.stop()
+            tray.exit_app()
             NSApplication.sharedApplication().terminate_(None)
 
     app = NSApplication.sharedApplication()
@@ -455,8 +530,8 @@ def run_mac() -> int:
     try:
         app.run()
     finally:
-        state.stop.set()
-        state.wake.set()
+        tray.stop_event.set()
+        tray.wake.set()
         handle.close()
     return 0
 
@@ -467,6 +542,14 @@ def main() -> int:
     if len(sys.argv) == 4 and sys.argv[1] in ("--grok-quota-worker", "--claude-quota-worker"):
         import cli_quota
         return cli_quota.worker(sys.argv[2], sys.argv[3], "grok" if sys.argv[1] == "--grok-quota-worker" else "claude")
+    if len(sys.argv) in (2, 3) and sys.argv[1] == "--settings":
+        import settings_mac
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(DATA_DIR / "settings-macos.log", maxBytes=500_000,
+                                                       backupCount=1, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(threadName)s: %(message)s"))
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
+        return settings_mac.run_settings(sys.argv[2] if len(sys.argv) == 3 else None)
     return run_mac()
 
 

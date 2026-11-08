@@ -247,20 +247,6 @@ class AppMergeTests(unittest.TestCase):
         self.assertEqual(set(payload["snapshots"]), {"codex", "claude"})
         self.assertEqual(payload["usage"], {})                        # the Mac's hours are not passed on
 
-    def test_the_mac_menu_takes_newer_readings_and_hours(self):
-        import mac_menu
-        with mock.patch.object(mac_menu, "load_cached_snapshots", return_value={}),                 mock.patch.object(mac_menu, "save_cached_snapshots") as saved:
-            state = mac_menu.MenuState(keys=["codex"])
-            state.snapshots["codex"] = reading(at=1000)
-            state.monitor = mock.Mock(store=UsageStore(self.folder / "usage.json.gz"))
-            state.sync = sync_hub.SyncLoop(FakeClient(), "mac-me", state.sync_payload, state.sync_merge)
-            state.sync_merge(self.payloads(), 9500)
-            self.assertEqual(state.snapshots["codex"].used_percent, 80)
-            self.assertEqual(state.monitor.store.by_device(["codex"], 0)[1], ("Mac · air", 300))
-            saved.assert_called_once()
-            self.assertFalse(state.accept_snapshot("codex", reading(at=8000)))
-            self.assertIn("codex", state.sync_payload(9600)["snapshots"])
-
 
 class ServerTests(unittest.TestCase):
     """The hub itself, on a local port."""

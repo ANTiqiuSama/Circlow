@@ -8,7 +8,10 @@ from __future__ import annotations
 import logging
 import time
 
-import hover_details
+try:
+    import hover_details
+except ImportError:   # macOS: the menu bar places its own items; nothing to reorder
+    hover_details = None
 import providers as provider_registry
 from quota_sources import save_cached_snapshots
 from tray_icons import make_display_icon
@@ -88,7 +91,7 @@ class IconSlots:
         The wanted order is fixed, so this only acts when Explorer's own
         layout (startup, reflow, a manual drag) differs from it."""
         icons = getattr(self, "icons", None)
-        if not icons:
+        if not icons or hover_details is None:
             return False
         if not force and now - self.reordered_at < REORDER_MIN_SECONDS:
             return False

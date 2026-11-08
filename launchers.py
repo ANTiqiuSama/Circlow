@@ -17,13 +17,25 @@ import providers
 
 # Sources whose click starts the agent in a new Herdr workspace when Herdr is installed.
 HERDR_AGENTS = frozenset({"claude", "grok"})
-MAC_APPS = {"codex": "Codex", "gemini": "Antigravity", "claude": "Claude"}
+# macOS desktop clients by bundle id (`open -b`): the Codex desktop app now
+# ships as ChatGPT.app, which keeps the com.openai.codex identifier.
+MAC_APPS = {"codex": "com.openai.codex", "gemini": "com.google.antigravity",
+            "claude": "com.anthropic.claudefordesktop"}
+
+
+def mac_app_installed(bundle: str) -> bool:
+    """A desktop client registered with Launch Services (in /Applications or elsewhere)."""
+    try:
+        from AppKit import NSWorkspace
+    except ImportError:
+        return False
+    return NSWorkspace.sharedWorkspace().URLForApplicationWithBundleIdentifier_(bundle) is not None
 
 
 @dataclass(frozen=True)
 class Way:
     kind: str           # "aumid" | "mac-app" | "herdr" | "url" | "cli" | "gui"
-    target: Any         # the launch id, app name, provider, URL, or a callable giving the executable
+    target: Any         # the launch id, bundle id, provider, URL, or a callable giving the executable
     fallback: bool = False   # when it fails, try the next way instead of reporting an error
 
 
@@ -40,7 +52,7 @@ def ways(provider: str, platform: str = sys.platform) -> list[Way]:
             aumid = providers.claude_desktop_aumid()
             if aumid:
                 out.append(Way("aumid", aumid, fallback=True))
-        elif platform == "darwin" and Path("/Applications/Claude.app").is_dir():
+        elif platform == "darwin" and (Path("/Applications/Claude.app").is_dir() or mac_app_installed(MAC_APPS["claude"])):
             out.append(Way("mac-app", MAC_APPS["claude"], fallback=True))
     if provider in HERDR_AGENTS and herdr_source.find_exe():
         out.append(Way("herdr", provider))

@@ -20,6 +20,7 @@ import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from urllib.parse import urlsplit
@@ -393,7 +394,8 @@ class SettingsWindow:
         root.minsize(S(820), S(600))
         root.protocol("WM_DELETE_WINDOW", self.close)
         families = set(tkfont.families(root))
-        self.family = next((name for name in ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", "Noto Sans CJK SC", "Segoe UI")
+        self.family = next((name for name in ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", "Noto Sans CJK SC", "Segoe UI",
+                                              "PingFang SC")
                             if name in families), "TkDefaultFont")
         self.motion = ui_motion.Motion(root)
         root.update_idletasks()
@@ -1775,7 +1777,8 @@ class SettingsWindow:
         box = self.card(page)
         self.vars["startup"] = tk.BooleanVar()
         self.vars["startup"].trace_add("write", lambda *_: self.update_footer())
-        self.setting(box, "开机自启", "登录 Windows 后自动在托盘显示。", self.vars["startup"])
+        self.setting(box, "开机自启", "登录 macOS 后自动在菜单栏显示。" if sys.platform == "darwin"
+                     else "登录 Windows 后自动在托盘显示。", self.vars["startup"])
 
         self.section(page, "额度读取节奏", "光标停在图标或面板上最快，正在使用其次，静默最慢")
         cadence = self.card(page)

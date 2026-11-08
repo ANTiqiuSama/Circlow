@@ -23,7 +23,9 @@ except ImportError:  # psutil is a hard requirement of the app; stay importable.
 
 
 ANSI_RE = re.compile(r"\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])")
-GROK_WEEKLY_RE = re.compile(r"weekly\s+limit\s*[:：-]?\s*(\d+(?:\.\d+)?)\s*%", re.I)
+# "Weekly limit: 56%" (old) or, from Grok 1.0.77, a panel with
+# "Weekly limit (SuperGrok)" over a bar and "76%" on the next row.
+GROK_WEEKLY_RE = re.compile(r"weekly\s+limit[^\d%\n]{0,400}?(\d+(?:\.\d+)?)\s*%", re.I)
 # Grok's own billing service failing ("Couldn't load usage: Internal error:
 # Billing service error ..."). Partial redraws can drop letters, so match
 # the parts that survive.
@@ -31,7 +33,7 @@ GROK_FAILED_RE = re.compile(r"load\s*usage\s*:\s*internal\s+error|billing\s+serv
 GROK_READY_RE = re.compile(r"minimal\s*·\s*/help|\d+(?:\.\d+)?[km]?\s*/\s*\d+(?:\.\d+)?[km]?\s*\(\d+%\)", re.I)
 RESET_PATTERNS = (
     re.compile(r"next\s+reset\s*[:：]\s*(.+)", re.I),
-    re.compile(r"resets?\s+(?:at|in)?\s*[:：]?\s*(.+)", re.I),
+    re.compile(r"resets?(?:\s+(?:at|in)\s*[:：]?|\s*[:：])\s*(.+)", re.I),
 )
 
 
@@ -49,7 +51,9 @@ def parse_reset(text: str) -> int | None:
         match = pattern.search(normalized)
         if not match:
             continue
-        value = match.group(1).strip().split("\n", 1)[0].strip()
+        # Panel rows are joined once cursor moves are stripped: stop at the
+        # box edge or the padding after the date.
+        value = re.split(r"\n|\s{2,}|│", match.group(1).strip(), maxsplit=1)[0].strip()
         for fmt in ("%B %d, %H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
             try:
                 parsed = datetime.strptime(value, fmt)
@@ -136,7 +140,8 @@ class UsageProbe:
     ready_after: float = 4.0                    # send anyway after this long
     retry_every: float = 2.0
     settle: float = 1.2                         # max wait for `complete` after `found`
-    answers: tuple[tuple[re.Pattern, str], ...] = ()   # one-shot prompt replies
+    # One-shot prompt replies: keystrokes, or a tuple of them typed one after another.
+    answers: tuple[tuple[re.Pattern, str | tuple[str, ...]], ...] = ()
     cwd: Callable[[], str | None] = lambda: None
     failed: re.Pattern | None = None            # the CLI says it cannot load usage
     failure: str = ""                           # what that failure tells the user
@@ -151,6 +156,17 @@ GROK_PROBE = UsageProbe(
     failed=GROK_FAILED_RE,
     failure="Grok 官方额度服务出错，暂时读不到额度",
 )
+
+
+KEY_PAUSE = 0.3      # between the keystrokes of one reply, so the TUI sees each
+
+
+def _type_reply(write: Callable[[str], Any], reply: str | tuple[str, ...]) -> None:
+    keys = (reply,) if isinstance(reply, str) else reply
+    for index, key in enumerate(keys):
+        if index:
+            time.sleep(KEY_PAUSE)
+        write(key)
 
 
 def _spawn_target(executable: str, args: list[str]) -> tuple[str, str]:
@@ -189,7 +205,7 @@ def run_temporary_usage(executable: str, args: list[str], timeout: float = 25.0,
             for index, (pattern, reply) in enumerate(probe.answers):
                 if index not in answered and pattern.search(current):
                     answered.add(index)
-                    terminal.write(reply)
+                    _type_reply(terminal.write, reply)
                     last_request_at = None  # the prompt may only appear after this
             if probe.found.search(current):
                 if first_quota_at is None:
@@ -258,7 +274,7 @@ def _run_posix_usage(executable: str, args: list[str], timeout: float, probe: Us
             for index, (pattern, reply) in enumerate(probe.answers):
                 if index not in answered and pattern.search(current):
                     answered.add(index)
-                    child.send(reply)
+                    _type_reply(child.send, reply)
                     last_request_at = None
             if probe.found.search(current):
                 if first_quota_at is None:
@@ -558,8 +574,15 @@ CLAUDE_PROBE = UsageProbe(
     ready_after=6.0,
     retry_every=4.0,
     settle=2.0,
-    answers=((CLAUDE_TRUST_RE, "\r"), (CLAUDE_TRUST_NO_RE, "\x1b[B"), (CLAUDE_TRUST_YES_RE, "\r")),
+    # The folder is the empty claude-probe one. Newer Claude Code redraws only
+    # the ❯ marker after ↓, so "❯ Yes, I trust" never shows: confirm right away.
+    answers=((CLAUDE_TRUST_RE, "\r"), (CLAUDE_TRUST_NO_RE, ("\x1b[B", "\r")), (CLAUDE_TRUST_YES_RE, "\r")),
     cwd=_claude_probe_dir,
 )
 # No MCP servers, no IDE hookup: the session only needs to render /usage.
-CLAUDE_ARGS = ["--strict-mcp-config"]
+# With bypassPermissions as the user's default, Claude Code first asks whether
+# to switch the default to auto mode, preselecting "Yes"; a probe must never
+# answer that, so its own session runs with the plain default mode. (Windows
+# may start Claude through a .cmd shim that mangles the JSON quoting.)
+CLAUDE_ARGS = ["--strict-mcp-config"] + (
+    ["--settings", '{"permissions":{"defaultMode":"default"}}'] if os.name != "nt" else [])
