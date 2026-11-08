@@ -363,8 +363,11 @@ def run_mac() -> int:
     from Cocoa import (NSApplication, NSApplicationActivationPolicyAccessory, NSMenu,
                        NSMenuItem, NSObject, NSStatusBar, NSVariableStatusItemLength, NSTimer)
     import objc
+    import settings_mac
     import tray_app
     from mac_panel import MacHoverPanel, to_nsimage
+
+    settings_mac.take_commands(settings_mac.MENU)      # requests left over from an earlier run
 
     keys = list(tray_app.PROVIDERS)
     icons = {key: MacIcon(key) for key in keys}
@@ -392,7 +395,7 @@ def run_mac() -> int:
                     menu.addItem_(line)
                     parts[name] = line
                 menu.addItem_(NSMenuItem.separatorItem())
-                for title, action in (("立即刷新", "refreshOne:"), ("打开来源", "openSource:"),
+                for title, action in (("立即刷新", "refreshOne:"), ("打开来源", "openSource:"), ("设置…", "openSettings:"),
                                       ("退出 CodexQuotaTray", "quitApp:")):
                     line = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
                     line.setTarget_(self)
@@ -419,6 +422,15 @@ def run_mac() -> int:
 
         def updateUI_(self, _timer):
             now = time.time()
+            for command in settings_mac.take_commands(settings_mac.MENU):
+                outcome = settings_mac.handle_menu_command(tray, command, now)
+                log.info("settings command %s -> %s", command.get("name"), outcome or "applied")
+                if outcome == "restart":
+                    subprocess.Popen(settings_mac.relaunch_command(), start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if outcome in ("restart", "quit"):
+                    self.quitApp_(None)
+                    return
             for key in keys:
                 snapshot = tray.snapshots[key]
                 performance = dict(tray.performance.get("providers", {}).get(key, {}))
@@ -487,11 +499,14 @@ def run_mac() -> int:
 
         @objc.python_method
         def panelSettings(self, provider, page):
-            # The settings window is not ported yet: the panel's gear and
-            # right-click open this source's menu (refresh / open / quit).
-            log.info("panel settings requested (%s, %s): opening the menu", provider, page)
-            if provider in self.items:
-                self.showMenu(provider)
+            # The panel's gear, banner and right-click: the settings window
+            # (its own process, see settings_mac), on the page asked for.
+            how = settings_mac.open_settings(page)
+            log.info("settings window %s from the %s panel (page %s)", how, provider, page)
+
+        def openSettings_(self, _sender):
+            how = settings_mac.open_settings(None)
+            log.info("settings window %s from the menu", how)
 
         def refreshOne_(self, sender):
             tray.scheduler.request([str(sender.representedObject())], time.time())
@@ -524,6 +539,14 @@ def main() -> int:
     if len(sys.argv) == 4 and sys.argv[1] in ("--grok-quota-worker", "--claude-quota-worker"):
         import cli_quota
         return cli_quota.worker(sys.argv[2], sys.argv[3], "grok" if sys.argv[1] == "--grok-quota-worker" else "claude")
+    if len(sys.argv) in (2, 3) and sys.argv[1] == "--settings":
+        import settings_mac
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(DATA_DIR / "settings-macos.log", maxBytes=500_000,
+                                                       backupCount=1, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(threadName)s: %(message)s"))
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
+        return settings_mac.run_settings(sys.argv[2] if len(sys.argv) == 3 else None)
     return run_mac()
 
 
