@@ -41,6 +41,9 @@ class UsageStore:
         self.lock = Lock()
         self.raw: list[tuple] = []                       # Observation fields, oldest first
         self.hours: dict[str, dict[int, list[int]]] = {}  # provider -> hour start -> [output tokens, replies]
+        # Other devices' hours from the sync hub (sync_hub), in memory only:
+        # device -> (label, provider -> hour start -> [output tokens, replies]).
+        self.remote: dict[str, tuple[str, dict[str, dict[int, list[int]]]]] = {}
         self.dirty = False
         self.saved_at = 0.0
         if observation_type is None:
@@ -109,23 +112,66 @@ class UsageStore:
                 self.dirty = True
                 return False
 
-    def hourly(self, providers: Iterable[str], since: float) -> dict[int, int]:
-        """Output tokens per hour start for the given providers since `since`."""
+    def _sources(self, everywhere: bool) -> list[dict[str, dict[int, list[int]]]]:
+        return [self.hours] + ([hours for _label, hours in self.remote.values()] if everywhere else [])
+
+    def hourly(self, providers: Iterable[str], since: float, everywhere: bool = True) -> dict[int, int]:
+        """Output tokens per hour start for the given providers since `since`,
+        on every synced device (everywhere) or this one only."""
         keys = set(providers)
         totals: dict[int, int] = {}
         with self.lock:
-            for provider, hours in self.hours.items():
-                if provider in keys:
-                    for hour, (tokens, _replies) in hours.items():
-                        if hour >= since - 3600:
-                            totals[hour] = totals.get(hour, 0) + tokens
+            for source in self._sources(everywhere):
+                for provider, hours in source.items():
+                    if provider in keys:
+                        for hour, (tokens, _replies) in hours.items():
+                            if hour >= since - 3600:
+                                totals[hour] = totals.get(hour, 0) + tokens
         return totals
 
-    def replies(self, providers: Iterable[str], since: float) -> int:
+    def replies(self, providers: Iterable[str], since: float, everywhere: bool = True) -> int:
         keys = set(providers)
         with self.lock:
-            return sum(replies for provider, hours in self.hours.items() if provider in keys
+            return sum(replies for source in self._sources(everywhere) for provider, hours in source.items() if provider in keys
                        for hour, (_tokens, replies) in hours.items() if hour >= since)
+
+    def export_hours(self, since: float) -> dict[str, dict[str, list[int]]]:
+        """This device's own hours since `since`, for the sync hub (never the
+        other devices' copies, so nothing is echoed back)."""
+        with self.lock:
+            return {provider: {str(hour): list(value) for hour, value in hours.items() if hour >= since}
+                    for provider, hours in self.hours.items() if any(hour >= since for hour in hours)}
+
+    def set_remote(self, device: str, label: str, hours: Any) -> None:
+        """Another device's hours as it last sent them (export_hours)."""
+        parsed: dict[str, dict[int, list[int]]] = {}
+        if isinstance(hours, dict):
+            for provider, rows in hours.items():
+                if not isinstance(rows, dict):
+                    continue
+                try:
+                    parsed[str(provider)] = {int(hour): [int(value[0]), int(value[1])] for hour, value in rows.items()}
+                except (TypeError, ValueError, IndexError):
+                    continue
+        with self.lock:
+            self.remote[device] = (label or device, parsed)
+
+    def keep_remote(self, devices: Iterable[str]) -> None:
+        """Forget synced devices the hub no longer lists."""
+        keep = set(devices)
+        with self.lock:
+            for device in [device for device in self.remote if device not in keep]:
+                del self.remote[device]
+
+    def by_device(self, providers: Iterable[str], since: float) -> list[tuple[str, int]]:
+        """(label, output tokens since `since`) for this device ("本机") and
+        each synced one that did any work."""
+        keys = set(providers)
+        with self.lock:
+            rows = [("本机", self.hours)] + [(label, hours) for label, hours in self.remote.values()]
+            out = [(label, sum(tokens for provider, hours in source.items() if provider in keys
+                               for hour, (tokens, _replies) in hours.items() if hour >= since)) for label, source in rows]
+        return [(label, tokens) for index, (label, tokens) in enumerate(out) if tokens or index == 0]
 
     def hour_rows(self, providers: Iterable[str], since: float, now: float) -> list[Any]:
         """Hourly totals as chart events (one per provider and hour, at the
@@ -313,6 +359,47 @@ class WeeklyLedger:
         with self.lock:
             return list(reversed(self.weeks.get(name, [])[-limit:]))
 
+    def export(self) -> dict[str, list[dict]]:
+        with self.lock:
+            return {name: [dict(row) for row in rows] for name, rows in self.weeks.items()}
+
+    def merge(self, windows: Any) -> bool:
+        """Weeks another device recorded (export): a week this one lacks is
+        added; for one both have, the higher share used and token count win
+        (each device saw part of the week's work). Returns True on a change."""
+        if not isinstance(windows, dict):
+            return False
+        changed = False
+        with self.lock:
+            for name, rows in windows.items():
+                if not isinstance(rows, list):
+                    continue
+                mine = self.weeks.setdefault(str(name), [])
+                for row in rows:
+                    try:
+                        reset_at, used, tokens = float(row["reset_at"]), float(row["used"]), int(row.get("tokens") or 0)
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    same = next((week for week in mine if abs(week["reset_at"] - reset_at) <= 3600), None)
+                    if same is None:
+                        mine.append({"reset_at": reset_at, "used": used, "tokens": tokens})
+                        changed = True
+                    elif used > same["used"] or tokens > same["tokens"]:
+                        same["used"], same["tokens"] = max(used, same["used"]), max(tokens, same["tokens"])
+                        changed = True
+                mine.sort(key=lambda week: week["reset_at"])
+                del mine[:-WEEKLY_KEEP]
+            payload = {"windows": self.weeks}
+        if changed:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+                temporary.replace(self.path)
+            except OSError:
+                pass
+        return changed
+
 
 def weeks_line(weeks: list[dict]) -> str:
     """"近几周：周额度用掉 62% · 71% · 55%（最新在前）" from WeeklyLedger.recent."""
@@ -375,6 +462,9 @@ def insights(store: UsageStore, provider: str, now: float, samples: Iterable[Any
     yesterday = sum(tokens for hour, tokens in hours.items() if yesterday_start <= hour < day)
     so_far = sum(tokens for hour, tokens in hours.items() if yesterday_start <= hour < now - 86400)
     lines = head + [f"今天：{_tokens(today)} tokens · {store.replies([provider], day)} 次回复"]
+    split = store.by_device([provider], day)
+    if len(split) > 1:                              # work on other synced devices today
+        lines.append("设备：" + " · ".join(f"{label} {_tokens(tokens)}" for label, tokens in split))
     if so_far > 0:
         change = (today - so_far) / so_far * 100
         lines.append(f"比昨天此时：{'+' if change >= 0 else ''}{change:.0f}%（昨天全天 {_tokens(yesterday)}）")

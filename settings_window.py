@@ -1799,6 +1799,14 @@ class SettingsWindow:
                            "读取失败按 30 秒、1、2、5 分钟退避；生成刚结束或重置时间一到会提前读取。", 9, view.INK_3).pack(
             anchor="w", fill="x", pady=(S(10), 0))
 
+        self.section(page, "多端同步", "经云服务器与其他设备共享额度读数、用量汇总和每周摘要（只有数字）")
+        sync = self.card(page)
+        self.sync_state = self.label(sync, "", 10, view.INK_2)
+        self.sync_state.pack(anchor="w")
+        self.para(sync, "在数据文件夹的 sync.json 里填写服务器地址与令牌即可开启；把同一份 sync.json 放到另一台电脑的数据文件夹，"
+                        "那台电脑就会加入。服务器暂停或冷却时各自照常运行，连上后自动补同步。", 9, view.INK_3).pack(
+            anchor="w", fill="x", pady=(S(6), 0))
+
         self.section(page, "工具", "")
         tools = self.card(page)
         line = tk.Frame(tools, bg=view.SURFACE)
@@ -1814,6 +1822,8 @@ class SettingsWindow:
     def _fill_general(self):
         scheduler = getattr(self.app, "scheduler", None)
         now = time.time()
+        status = getattr(self.app, "sync_status", None)
+        self.set_text(self.sync_state, status() if status else "未开启")
         for key, widget in self.cadence_next.items():
             text = "未开启"
             if scheduler is not None and key in getattr(scheduler, "providers", ()):

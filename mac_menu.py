@@ -33,6 +33,7 @@ import herdr_source
 import launchers
 import mimo_usage
 import providers
+import sync_hub
 from agent_panel import compact_usage
 from forecast import reset_distance
 from quota_sources import QuotaSnapshot, collect, load_cached_snapshots, mimo_snapshot, mimo_tracker, placeholder, save_cached_snapshots
@@ -174,6 +175,7 @@ class MenuState:
         self.last_samples: dict[str, float | None] = {}
         self.mimo_ingested = 0
         self.herdr_opening: set[str] = set()
+        self.sync: sync_hub.SyncLoop | None = None
 
     def hover(self, provider: str | None, on: bool):
         """An open status menu reads its source at the hover rate, like the
@@ -282,9 +284,59 @@ class MenuState:
             if snapshot.remaining_percent is not None or self.snapshots["mimo"].remaining_percent is None:
                 self.snapshots["mimo"] = snapshot
 
+    # ----- multi-device sync (sync_hub) ----------------------------------------------------
+
+    def start_sync(self) -> bool:
+        config = sync_hub.load_config()
+        if config is None:
+            return False
+        self.sync = sync_hub.SyncLoop(sync_hub.HubClient(config), config["device"], self.sync_payload, self.sync_merge)
+        threading.Thread(target=self.sync.run, args=(self.stop,), name="mac-sync", daemon=True).start()
+        log.info("sync: on as %s via %s", config["device"], config["url"])
+        return True
+
+    def sync_payload(self, now: float) -> dict:
+        store = self.monitor.store if self.monitor is not None else None
+        with self.lock:
+            snapshots = dict(self.snapshots)
+        return {"label": sync_hub.device_label(), "platform": sys.platform, "sent_at": now,
+                "snapshots": sync_hub.snapshot_payload(snapshots),
+                "usage": store.export_hours(now - sync_hub.USAGE_DAYS * 86400) if store is not None else {},
+                "weekly": {}}
+
+    def accept_snapshot(self, provider: str, snapshot: QuotaSnapshot, _source: str = "") -> bool:
+        with self.lock:
+            current = self.snapshots.get(provider)
+            if current is not None and (snapshot.updated_at or 0) <= (current.updated_at or 0):
+                return False
+            self.snapshots[provider] = snapshot
+        return True
+
+    def sync_merge(self, payloads: dict, now: float) -> None:
+        me = self.sync.device if self.sync is not None else ""
+        with self.lock:
+            current = dict(self.snapshots)
+        taken = sync_hub.merge_snapshots(payloads, me, current, self.accept_snapshot)
+        store = self.monitor.store if self.monitor is not None else None
+        if store is not None:
+            store.keep_remote(payloads)
+            for device, record in payloads.items():
+                if device != me and isinstance(record, dict):
+                    payload = record.get("payload") or {}
+                    store.set_remote(device, str(payload.get("label") or device), payload.get("usage"))
+        if taken:
+            log.info("sync: newer readings from other devices for %s", ", ".join(sorted({p for p, _ in taken})))
+            with self.lock:
+                snapshots = dict(self.snapshots)
+            save_cached_snapshots(snapshots)
+
+    def sync_status(self) -> str:
+        return self.sync.status() if self.sync is not None else "未开启（没有 sync.json）"
+
     def start(self):
         threading.Thread(target=self.quota_loop, name="mac-quota", daemon=True).start()
         threading.Thread(target=self.tps_loop, name="mac-tps", daemon=True).start()
+        self.start_sync()
 
 
 def _logger():
@@ -332,7 +384,7 @@ def run_mac() -> int:
                 menu.setDelegate_(self)          # open menu = hover: fastest refresh tier
                 parts = {}
                 for name, title in (("summary", key), ("quota0", ""), ("quota1", ""), ("quota2", ""),
-                                    ("speed", ""), ("updated", ""), ("error", "")):
+                                    ("speed", ""), ("updated", ""), ("error", ""), ("sync", "")):
                     line = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
                     line.setEnabled_(False)
                     menu.addItem_(line)
@@ -370,6 +422,9 @@ def run_mac() -> int:
                                     ("updated", model["updated"]), ("error", model["error"])):
                     self.menus[key][name].setTitle_(value)
                     self.menus[key][name].setHidden_(not bool(value))
+                sync = f"同步：{state.sync_status()}" if state.sync is not None else ""
+                self.menus[key]["sync"].setTitle_(sync)
+                self.menus[key]["sync"].setHidden_(not sync)
                 for index in range(3):
                     value = rows[index] if index < len(rows) else ""
                     line = self.menus[key][f"quota{index}"]
