@@ -175,12 +175,16 @@ def open_cli(key: str, popen=subprocess.Popen) -> bool:
     return True
 
 
-def notify(title: str, message: str, popen=subprocess.Popen) -> None:
-    """A Notification Center banner (the Windows balloon)."""
-    def quoted(text: str) -> str:
-        return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"') + '"'
-    popen(["osascript", "-e", f"display notification {quoted(message)} with title {quoted(title or APP_NAME)}"],
-          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def notify(title: str, message: str, popen=None) -> str:
+    """A Notification Center banner (the Windows balloon): from 环流 itself
+    when packaged (mac_notify), else an osascript banner. Returns how."""
+    import mac_notify
+    if popen is not None:
+        popen(mac_notify.osascript_command(title or APP_NAME, message), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "osascript"
+    how = mac_notify.NOTIFIER.post(title or app_identity.DISPLAY_NAME, message)
+    log.info("notification %r posted (%s)", title, how)
+    return how
 
 
 class MacIcon:
@@ -385,6 +389,12 @@ def run_mac() -> int:
 
     class Delegate(NSObject):
         def applicationDidFinishLaunching_(self, _notification):
+            try:
+                import mac_notify
+                mac_notify.NOTIFIER.setup()  # asks once for permission to notify; banners then come from 环流 itself
+            except Exception:
+                # Notifications must never stop the menu bar from starting; notify() falls back to osascript.
+                log.exception("native notifications could not be set up")
             self.items = {}
             self.menus = {}
             self.menu_objs = {}
@@ -548,6 +558,9 @@ def run_mac() -> int:
 def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "--smoke-menu":
         return smoke_menu()
+    if len(sys.argv) == 2 and sys.argv[1] == "--notify-test":
+        import mac_notify
+        return mac_notify.self_test()
     if len(sys.argv) == 4 and sys.argv[1] in ("--grok-quota-worker", "--claude-quota-worker"):
         import cli_quota
         return cli_quota.worker(sys.argv[2], sys.argv[3], "grok" if sys.argv[1] == "--grok-quota-worker" else "claude")

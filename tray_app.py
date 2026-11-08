@@ -991,6 +991,16 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         except Exception:
             log.exception("notification failed")
 
+    TEST_NOTICE = ("环流 · 测试通知", "通知工作正常：额度重置和全局重置预测会这样提醒你。")
+
+    def test_notification(self, _icon=None, _item=None) -> None:
+        """Settings → 常规 → 测试通知: a sample, sent the same way as a quota reset."""
+        provider = next(iter(self.icons), None)
+        if provider is None:
+            raise OSError("没有可用的托盘图标")
+        log.info("test notification requested")
+        self.notify(provider, *self.TEST_NOTICE)
+
     def apply_reset_outlook(self, outlook: "reset_watch.ResetOutlook", now: float) -> None:
         previous = getattr(self, "reset_outlook", None)
         self.reset_outlook = outlook

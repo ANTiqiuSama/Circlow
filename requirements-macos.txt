@@ -4,3 +4,4 @@ tzdata>=2024.1
 pexpect>=4.9
 pyobjc-framework-Cocoa>=11.0
 pyinstaller>=6.20
+pyobjc-framework-UserNotifications>=11.0

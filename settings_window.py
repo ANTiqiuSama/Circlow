@@ -1975,8 +1975,11 @@ class SettingsWindow:
         tools = self.card(page)
         line = tk.Frame(tools, bg=view.SURFACE)
         line.pack(fill="x")
-        for text, command in (("诊断信息", self.app.open_diagnostics), ("全局重置预测", self.app.open_reset_page),
-                              ("全部 AI 速率", self.app.open_all_performance), ("打开数据文件夹", self.open_data_folder)):
+        tools = [("诊断信息", self.app.open_diagnostics), ("全局重置预测", self.app.open_reset_page),
+                 ("全部 AI 速率", self.app.open_all_performance), ("打开数据文件夹", self.open_data_folder)]
+        if hasattr(self.app, "test_notification"):
+            tools.append(("测试通知", self.test_notification))
+        for text, command in tools:
             self.button(line, text, command).pack(side="left", padx=(0, S(8)))
         danger = self.card(page)
         self.button(danger, "退出全部", self.app.exit_app, "danger").pack(side="right")
@@ -2080,6 +2083,14 @@ class SettingsWindow:
         self.save()
 
     # ----- actions -------------------------------------------------------------------------------
+    def test_notification(self):
+        """A sample notice the tray shows the same way as a quota reset."""
+        try:
+            self.app.test_notification()
+            self.say("✓ 已发送测试通知；没看到时请在系统通知设置里允许本应用")
+        except Exception as error:
+            self.say(f"测试通知未能发送：{error}")
+
     def open_data_folder(self):
         folder = agent_tasks.SUMMARY_CONFIG.parent
         folder.mkdir(parents=True, exist_ok=True)

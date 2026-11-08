@@ -263,6 +263,9 @@ def make_settings_tray():
             send_command(MENU, "quit")
             self.stop_event.set()
 
+        def test_notification(self, _icon=None, _item=None) -> None:
+            send_command(MENU, "test-notify")    # posted by the menu bar, as a real notice would be
+
         # Windows registry / message boxes -> macOS.
         def startup_enabled(self) -> bool:
             return login_item_enabled()
@@ -719,6 +722,8 @@ def handle_menu_command(tray, command: dict, now: float | None = None) -> str | 
             tray.iq_state = model_iq.load_state(tray_app.IQ_STATE_PATH)
             tray.grok_iq = grok_iq.load_state(tray_app.GROK_IQ_PATH)
         tray.iq_wake.set()
+    elif name == "test-notify":
+        tray.test_notification()                  # from the menu bar process: the path a real notice takes
     elif name in ("restart", "quit"):
         return name
     else:
