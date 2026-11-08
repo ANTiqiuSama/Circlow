@@ -88,7 +88,7 @@ def to_nsimage(image, scale: float):
 # than the system default, still clearly glass) so the light figures read on
 # any wallpaper, and the softer 26 pt corners of macOS 26.
 GLASS_TINT = (0, 0, 0, 0.42)
-GLASS_RADIUS = 26.0
+GLASS_RADIUS = agent_panel.GLASS_RADIUS      # the content draws its highlights to the same corner
 
 
 def glass_available() -> bool:

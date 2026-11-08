@@ -226,7 +226,7 @@ class LiquidGlassTest(unittest.TestCase):
     def test_glass_mode_renders_the_content_on_a_transparent_card_of_the_same_size(self):
         import agent_panel
         from PIL import Image
-        content = Image.new("RGBA", (100, 60), (240, 238, 230, 255))
+        content = Image.new("RGBA", (400, 300), (240, 238, 230, 255))
         agent_panel.set_glass(False)
         drawn = agent_panel._card(content, 2.0)
         agent_panel.set_glass(True)
@@ -234,7 +234,18 @@ class LiquidGlassTest(unittest.TestCase):
         self.assertEqual(glass.size, drawn.size)                       # same geometry and margins
         self.assertEqual(glass.getpixel((2, 2))[3], 0)                 # no drawn shadow or surface
         margin = round(MARGIN * 2.0)
-        self.assertEqual(glass.getpixel((margin + 5, margin + 5)), (240, 238, 230, 255))
+        self.assertEqual(glass.getpixel((margin + 200, margin + 150)), (240, 238, 230, 255))   # content as drawn
+        # Specular rim: brightest along the top edge, softer along the bottom, faint down the sides.
+        top, bottom, side = (glass.getpixel((margin + 200, margin + 1))[0], glass.getpixel((margin + 200, margin + 298))[0],
+                             glass.getpixel((margin + 1, margin + 150))[0])
+        self.assertGreater(top, bottom)
+        self.assertGreater(bottom, side)
+        self.assertGreaterEqual(side, 240)
+        # Light falls in at the top and bottom edges, under the content; the middle stays clear.
+        clear = agent_panel._card(Image.new("RGBA", (400, 300), (0, 0, 0, 0)), 2.0)
+        self.assertGreater(clear.getpixel((margin + 200, margin + 6))[3], 10)
+        self.assertGreater(clear.getpixel((margin + 200, margin + 294))[3], 4)
+        self.assertEqual(clear.getpixel((margin + 200, margin + 150))[3], 0)
 
     def test_switching_modes_clears_the_cached_card(self):
         import agent_panel

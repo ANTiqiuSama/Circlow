@@ -1607,12 +1607,54 @@ def set_glass(on: bool) -> None:
             cached.cache_clear()
 
 
+GLASS_RADIUS = 26.0          # the platform card's corner radius (mac_panel sets it on the glass view)
+# Specular highlights on the glass, as Liquid Glass shows them with light from
+# above: a bright rim along the top edge, a softer one along the bottom, faint
+# down the sides, and a little light falling in at the top. The platform's own
+# rim is about a pixel wide and a sixth brighter than the glass: too faint to
+# read on a dark backdrop, so the card draws its own on top.
+RIM_TOP, RIM_SIDE, RIM_BOTTOM = 150, 26, 96          # alpha of the rim stroke, 0-255
+GLOW_TOP, GLOW_BOTTOM = (30, 28.0), (14, 16.0)       # (alpha, points) of the light at the top and bottom edges
+
+
+def _column(height: int, value) -> Image.Image:
+    """A vertical profile as an "L" column: value(row) -> 0-255."""
+    return Image.frombytes("L", (1, height), bytes(max(0, min(255, int(value(y)))) for y in range(height)))
+
+
+@lru_cache(maxsize=16)
+def _highlights(size: tuple[int, int], scale: float) -> tuple[Image.Image, Image.Image]:
+    """(light under the content, rim over it) for a card of `size` pixels."""
+    width, height = size
+    radius, stroke = round(GLASS_RADIUS * scale), max(1, round(1.4 * scale))
+    shape = Image.new("L", size, 0)
+    ImageDraw.Draw(shape).rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=255)
+    ring = Image.new("L", size, 0)
+    ImageDraw.Draw(ring).rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, outline=255, width=stroke)
+    turn = 0.45 * (height - 1)                            # the rim is dimmest a little above the middle
+    rim_profile = _column(height, lambda y: RIM_TOP - (RIM_TOP - RIM_SIDE) * y / turn if y < turn
+                          else RIM_SIDE + (RIM_BOTTOM - RIM_SIDE) * (y - turn) / (height - 1 - turn))
+    rim = Image.new("RGBA", size, (255, 255, 255, 0))
+    rim.putalpha(ImageChops.multiply(ring, rim_profile.resize(size, Image.NEAREST)))
+    top_alpha, top_px = GLOW_TOP[0], GLOW_TOP[1] * scale
+    bottom_alpha, bottom_px = GLOW_BOTTOM[0], GLOW_BOTTOM[1] * scale
+    glow_profile = _column(height, lambda y: top_alpha * (1 - y / top_px) if y < top_px
+                           else bottom_alpha * (y - (height - bottom_px)) / bottom_px if y > height - bottom_px else 0)
+    glow = Image.new("RGBA", size, (255, 255, 255, 0))
+    glow.putalpha(ImageChops.multiply(shape, glow_profile.resize(size, Image.NEAREST)))
+    return glow, rim
+
+
 def _card(content: Image.Image, scale: float) -> Image.Image:
     if not GLASS:
         return _compose(content, scale)
     margin = round(MARGIN * scale)
+    glow, rim = _highlights(content.size, scale)
+    card = glow.copy()
+    card.alpha_composite(content)
+    card.alpha_composite(rim)
     image = Image.new("RGBA", (content.width + 2 * margin, content.height + 2 * margin), (0, 0, 0, 0))
-    image.alpha_composite(content, (margin, margin))
+    image.alpha_composite(card, (margin, margin))
     return image
 
 
