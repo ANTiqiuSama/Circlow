@@ -286,10 +286,13 @@ _VIEW_CLASSES = None
 
 
 def _view_classes():
-    """Click-through NSViews: the overlay only draws; Tk keeps every click."""
+    """The overlay's NSViews: click-through clip and image views (pictures
+    only draw; Tk keeps every click), a clip view that hands clicks to its
+    native control, and the target the native switches report to."""
     global _VIEW_CLASSES
     if _VIEW_CLASSES is None:
-        from AppKit import NSImageView, NSView
+        import objc
+        from AppKit import NSImageView, NSObject, NSView
 
         class PassThroughClip(NSView):
             def hitTest_(self, _point):
@@ -302,8 +305,38 @@ def _view_classes():
             def hitTest_(self, _point):
                 return None
 
-        _VIEW_CLASSES = (PassThroughClip, PassThroughImage)
+        class ControlClip(NSView):
+            def hitTest_(self, point):
+                hit = objc.super(ControlClip, self).hitTest_(point)
+                return None if hit is self else hit     # the control takes clicks; the empty margin does not
+
+            def isFlipped(self):
+                return True
+
+        class SwitchTarget(NSObject):
+            def toggled_(self, sender):
+                callback = getattr(self, "callback", None)
+                if callback is not None:
+                    callback(int(sender.tag()), int(sender.state()) == 1)
+
+        _VIEW_CLASSES = (PassThroughClip, PassThroughImage, ControlClip, SwitchTarget)
     return _VIEW_CLASSES
+
+
+_SWITCH_SIZE = None
+
+
+def native_switch_size() -> tuple[int, int]:
+    """The system switch's own size in points (54 x 24 with Liquid Glass)."""
+    global _SWITCH_SIZE
+    if _SWITCH_SIZE is None:
+        try:
+            from AppKit import NSSwitch
+            size = NSSwitch.alloc().initWithFrame_(((0, 0), (60, 30))).fittingSize()
+            _SWITCH_SIZE = (max(1, round(size.width)), max(1, round(size.height)))
+        except Exception:
+            _SWITCH_SIZE = (40, 22)
+    return _SWITCH_SIZE
 
 
 def intersect(a, b):
@@ -315,16 +348,23 @@ def intersect(a, b):
     return (x0, y0, x1 - x0, y1 - y0) if x1 > x0 and y1 > y0 else None
 
 
-class RetinaOverlay:
-    """Sharp pictures for a Tk window on a 2x screen.
+class NativeOverlay:
+    """Native AppKit views laid over a Tk window, kept in place every frame.
 
-    Tk on macOS shows one image pixel per point, so the settings window's
-    Pillow pictures (cards, buttons, charts) are stretched and soft. The
-    window draws them at f times their size (SettingsWindow.f); this lays a
-    native image view with that original exactly over each picture label,
-    clipped to the label's ancestors (scrolling pages, slides), and passes
-    every click through to Tk. The sidebar's selection bar, a plain frame
-    above the menu pictures, is kept above them as a coloured view."""
+    Sharp pictures (2x screens): Tk on macOS shows one image pixel per point,
+    so the settings window's Pillow pictures (cards, buttons, charts) are
+    stretched and soft. The window draws them at f times their size
+    (SettingsWindow.f); this lays a native image view with that original
+    exactly over each picture label, clipped to the label's ancestors
+    (scrolling pages, slides), and passes every click through to Tk. The
+    sidebar's selection bar, a plain frame above the menu pictures, is kept
+    above them as a coloured view.
+
+    Native switches (all screens): each settings switch is a blank Tk canvas
+    of the system switch's size with an NSSwitch over it (Liquid Glass when
+    the executable is built against the macOS 26 SDK). The NSSwitch takes the
+    clicks, writes the Tk variable and runs the switch's command; a variable
+    changed from Tk (loading saved settings) moves the switch."""
 
     INTERVAL_MS = 16
     RESCAN_SECONDS = 1.0
@@ -335,10 +375,74 @@ class RetinaOverlay:
         self.f = window.f
         self.tracked: dict[str, object] = {}
         self.views: dict[str, list] = {}          # path -> [clip, image view, picture shown]
+        self.switches: dict[str, list] = {}       # path -> [canvas, variable, command, tag, clip, NSSwitch]
+        self.by_tag: dict[int, str] = {}
+        self.target = None
         self.bar = None
         self.content = None
         self.scanned_at = 0.0
-        window.on_picture = self.picture_changed
+        if self.f > 1:
+            window.on_picture = self.picture_changed
+
+    # ----- native switches -------------------------------------------------------
+    def add_switch(self, canvas, variable, command=None):
+        tag = len(self.by_tag) + 1
+        self.by_tag[tag] = str(canvas)
+        self.switches[str(canvas)] = [canvas, variable, command, tag, None, None]
+
+    def switch_toggled(self, tag: int, on: bool):
+        """The user flipped an NSSwitch: the same as clicking the Tk switch."""
+        entry = self.switches.get(self.by_tag.get(tag, ""))
+        if entry is None:
+            return
+        _canvas, variable, command = entry[:3]
+        if bool(variable.get()) != on:
+            variable.set(on)
+        if command:
+            command()
+
+    def make_switch(self, entry):
+        from AppKit import NSAppearance, NSSwitch
+        _, _, control_clip, target_class = _view_classes()
+        if self.target is None:
+            self.target = target_class.alloc().init()
+            self.target.callback = self.switch_toggled
+        width, height = native_switch_size()
+        clip = control_clip.alloc().initWithFrame_(((0, 0), (width, height)))
+        clip.setWantsLayer_(True)
+        clip.layer().setMasksToBounds_(True)
+        control = NSSwitch.alloc().initWithFrame_(((0, 0), (width, height)))
+        control.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua"))   # the window is always dark
+        control.setTag_(entry[3])
+        control.setTarget_(self.target)
+        control.setAction_("toggled:")
+        clip.addSubview_(control)
+        self.content.addSubview_(clip)
+        entry[4], entry[5] = clip, control
+
+    def place_switch(self, path, entry, origin, cache, height):
+        canvas, variable = entry[0], entry[1]
+        if not canvas.winfo_exists():
+            if entry[4] is not None:
+                entry[4].removeFromSuperview()
+            self.switches.pop(path, None)
+            return
+        if entry[4] is None:
+            self.make_switch(entry)
+        clip, control = entry[4], entry[5]
+        rect = self.rect_of(canvas, origin, cache) if canvas.winfo_viewable() else None
+        visible = intersect(rect, self.clip_of(canvas, origin, cache)) if rect else None
+        if visible is None:
+            clip.setHidden_(True)
+            return
+        on = 1 if variable.get() else 0
+        if int(control.state()) != on:
+            control.setState_(on)
+        width, height_ = native_switch_size()
+        clip.setFrame_(self.to_content(visible, height))
+        control.setFrame_(((rect[0] - visible[0] + (rect[2] - width) / 2, rect[1] - visible[1] + (rect[3] - height_) / 2),
+                           (width, height_)))
+        clip.setHidden_(False)
 
     # ----- bookkeeping -----------------------------------------------------------
     def picture_changed(self, widget):
@@ -416,7 +520,7 @@ class RetinaOverlay:
             return
         if str(self.root.state()) == "withdrawn":
             return
-        if time.monotonic() - self.scanned_at >= self.RESCAN_SECONDS:
+        if self.f > 1 and time.monotonic() - self.scanned_at >= self.RESCAN_SECONDS:
             self.rescan()
         height = float(self.content.frame().size.height)
         origin = (self.root.winfo_rootx(), self.root.winfo_rooty())
@@ -429,7 +533,15 @@ class RetinaOverlay:
                 self.place(path, widget, origin, cache, height)
             except Exception:
                 self.drop(path)
-        self.place_bar(origin, cache, height)
+        if self.f > 1:
+            self.place_bar(origin, cache, height)
+        for path, entry in list(self.switches.items()):
+            try:
+                self.place_switch(path, entry, origin, cache, height)
+            except Exception:
+                log.exception("native switch %s failed", path)
+                if entry[4] is not None:
+                    entry[4].setHidden_(True)
 
     def place(self, path, widget, origin, cache, height):
         picture = self.window.hires.get(str(widget.cget("image")))
@@ -453,7 +565,7 @@ class RetinaOverlay:
         clip.setHidden_(False)
 
     def make(self, path):
-        clip_class, image_class = _view_classes()
+        clip_class, image_class, *_ = _view_classes()
         clip = clip_class.alloc().initWithFrame_(((0, 0), (1, 1)))
         clip.setWantsLayer_(True)
         clip.layer().setMasksToBounds_(True)
@@ -471,7 +583,7 @@ class RetinaOverlay:
         if widget is None or not widget.winfo_exists():
             return
         if self.bar is None:
-            _, image_class = _view_classes()
+            _, image_class, *_ = _view_classes()
             view = image_class.alloc().initWithFrame_(((0, 0), (1, 1)))
             view.setImageScaling_(1)              # a one-colour image stretched to the bar
             self.bar = [view, None]
@@ -509,13 +621,27 @@ def make_window(tray, commands):
 
     class MacSettingsWindow(settings_window.SettingsWindow):
         """Closing ends the process (the Windows window only hides, for its tray
-        thread); pictures are laid over sharp on 2x screens (RetinaOverlay)."""
+        thread); native switches and, on 2x screens, sharp pictures are laid
+        over the Tk window (NativeOverlay)."""
 
         def __init__(self, *args, **kwargs):
+            self.overlay = None
+            self.early_switches = []          # switches made while the window builds its pages
             super().__init__(*args, **kwargs)
-            self.overlay = RetinaOverlay(self) if self.f > 1 else None
+            self.overlay = NativeOverlay(self)
+            for canvas, variable, command in self.early_switches:
+                self.overlay.add_switch(canvas, variable, command)
+            self.overlay.start()
+
+        def switch(self, parent, variable, command=None):
+            """A blank canvas the size of the system switch; the NSSwitch over it does the rest."""
+            width, height = native_switch_size()
+            canvas = self.tk.Canvas(parent, width=width, height=height, bg=parent["bg"], highlightthickness=0, bd=0)
             if self.overlay is not None:
-                self.overlay.start()
+                self.overlay.add_switch(canvas, variable, command)
+            else:
+                self.early_switches.append((canvas, variable, command))
+            return canvas
 
         def close(self):
             super().close()

@@ -159,7 +159,7 @@ class RetinaPictureTest(unittest.TestCase):
         self.assertEqual(settings_mac.intersect((0, 0, 10, 10), (5, 5, 10, 10)), (5, 5, 5, 5))
         self.assertIsNone(settings_mac.intersect((0, 0, 10, 10), (10, 0, 5, 5)))
         self.assertIsNone(settings_mac.intersect(None, (0, 0, 1, 1)))
-        overlay = settings_mac.RetinaOverlay.__new__(settings_mac.RetinaOverlay)
+        overlay = settings_mac.NativeOverlay.__new__(settings_mac.NativeOverlay)
         overlay.content = Mock(isFlipped=Mock(return_value=False))
         self.assertEqual(overlay.to_content((10, 20, 30, 40), 760), ((10, 700), (30, 40)))
         overlay.content.isFlipped.return_value = True
@@ -208,6 +208,44 @@ class RetinaPictureTest(unittest.TestCase):
         plain = window.photo(Image.new("RGB", (10, 10)))
         self.assertEqual(plain.size, (10, 10))
         self.assertEqual(window.hires, {})                       # Windows: nothing kept
+
+
+class NativeSwitchTest(unittest.TestCase):
+    """Settings switches as NSSwitch over a blank Tk canvas."""
+
+    def overlay(self):
+        overlay = settings_mac.NativeOverlay.__new__(settings_mac.NativeOverlay)
+        overlay.switches, overlay.by_tag = {}, {}
+        return overlay
+
+    def test_flipping_the_native_switch_sets_the_variable_and_runs_the_command(self):
+        overlay = self.overlay()
+        variable, command = Mock(), Mock()
+        variable.get.return_value = False
+        overlay.add_switch("canvas.a", variable, command)
+        overlay.add_switch("canvas.b", Mock(), None)
+        self.assertEqual(overlay.by_tag, {1: "canvas.a", 2: "canvas.b"})
+        overlay.switch_toggled(1, True)
+        variable.set.assert_called_once_with(True)
+        command.assert_called_once()
+        variable.get.return_value = True
+        overlay.switch_toggled(1, True)                  # already on: no second write
+        variable.set.assert_called_once()
+        overlay.switch_toggled(99, True)                 # unknown tag: ignored
+
+    def test_switches_made_while_the_window_builds_are_queued(self):
+        import settings_window
+        with patch.object(settings_window.SettingsWindow, "__init__", lambda self, *a, **k: None), \
+                patch.object(settings_mac, "NativeOverlay") as overlay_class:
+            window = settings_mac.make_window(None, None)
+        overlay_class.assert_called_once_with(window)
+        overlay_class.return_value.start.assert_called_once()
+        window.tk = Mock()
+        variable = Mock()
+        with patch.object(settings_mac, "native_switch_size", return_value=(54, 24)):
+            canvas = window.switch({"bg": "#202020"}, variable)
+        self.assertEqual(window.tk.Canvas.call_args.kwargs["width"], 54)
+        overlay_class.return_value.add_switch.assert_called_with(canvas, variable, None)
 
 
 if __name__ == "__main__":
