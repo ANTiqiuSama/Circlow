@@ -67,16 +67,16 @@ class MacMenuTests(unittest.TestCase):
         self.assertIn("额度未知", model["summary"])
         self.assertIn("未找到订阅额度", model["error"])
 
-    def test_macos_mimo_reader_uses_manual_plan_not_console(self):
+    def test_macos_mimo_reader_reads_the_console(self):
+        # The Mac keeps the MiMo session in the keychain, so it reads the
+        # console like Windows; without a session refresh() uses the manual plan.
         tracker = Mock()
         tracker.view.return_value = Mock(period_start=None, period_end=None, used_percent=None,
                                          anchor_at=None, error="暂无数据", today_used=None, day=None)
         with patch.object(quota_sources.sys, "platform", "darwin"), \
-                patch.object(quota_sources, "mimo_tracker", return_value=tracker), \
-                patch.object(mac_menu.mimo_usage, "fetch_with_renewal",
-                             side_effect=AssertionError("console credentials accessed")):
+                patch.object(quota_sources, "mimo_tracker", return_value=tracker):
             quota_sources.get_mimo_quota()
-        self.assertIs(tracker.refresh.call_args.args[0], mac_menu.mimo_usage.manual_plan)
+        self.assertIs(tracker.refresh.call_args.args[0], mac_menu.mimo_usage.fetch_with_renewal)
 
     def test_status_item_matches_the_windows_tray_icon(self):
         import tray_icons

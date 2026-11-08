@@ -450,7 +450,9 @@ def get_mimo_quota() -> QuotaSnapshot:
     tracker = mimo_tracker()
     # The macOS menu-bar build has no Keychain-backed console session yet.
     # Use a manual plan and local token ledger; never create an unencrypted cookie file.
-    tracker.refresh(mimo_usage.manual_plan if sys.platform == "darwin" else mimo_usage.fetch_with_renewal)
+    # The console on every platform now (the Mac keeps its session in the
+    # keychain); without a session, refresh() falls back to the manual plan.
+    tracker.refresh(mimo_usage.fetch_with_renewal)
     return mimo_snapshot(tracker.view())
 
 
