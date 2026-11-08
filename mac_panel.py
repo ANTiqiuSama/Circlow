@@ -84,13 +84,14 @@ def to_nsimage(image, scale: float):
     return native
 
 
-# Dark, see-through glass: the clear style (the regular style's frosted
-# material lifts the card to a mid grey, about 51/255 over a dark window,
-# whatever the tint) with a black tint at 60 %, which measures about 18/255
-# over the same window and still shows the blurred backdrop through it. The
-# light figures read on any wallpaper; the drawn highlights (agent_panel)
-# give the glass its edges. Corners: the softer 26 pt of macOS 26.
-GLASS_TINT = (0, 0, 0, 0.60)
+# Dark, see-through glass, the recipe of LumaCenter's menu bar panel: the
+# clear style (the regular style's frosted material lifts the card to a mid
+# grey, about 51/255 over a dark window, whatever the tint) in the dark
+# appearance, with a black tint at 30 %, so the blurred backdrop shows
+# through the card. The light figures read on any wallpaper; the drawn
+# highlights (agent_panel) give the glass its edges. Corners: the softer
+# 26 pt of macOS 26.
+GLASS_TINT = (0, 0, 0, 0.30)
 GLASS_STYLE = "clear"
 GLASS_RADIUS = agent_panel.GLASS_RADIUS      # the content draws its highlights to the same corner
 
