@@ -235,20 +235,34 @@ class LiquidGlassTest(unittest.TestCase):
         self.assertEqual(glass.getpixel((2, 2))[3], 0)                 # no drawn shadow or surface
         margin = round(MARGIN * 2.0)
         self.assertEqual(glass.getpixel((margin + 200, margin + 150)), (240, 238, 230, 255))   # content as drawn
-        # Specular rim: a 22 % hairline along the top edge, softer along the bottom, faint down the sides.
-        _, rim = agent_panel._highlights((400, 300), 2.0)
-        top, bottom, side = rim.getpixel((200, 1))[3], rim.getpixel((200, 298))[3], rim.getpixel((1, 150))[3]
-        self.assertAlmostEqual(top, round(0.22 * 255), delta=2)
-        self.assertAlmostEqual(bottom, agent_panel.RIM_BOTTOM, delta=2)
-        self.assertAlmostEqual(side, agent_panel.RIM_SIDE, delta=4)
-        self.assertGreater(top, bottom)
-        self.assertGreater(bottom, side)
-        self.assertGreaterEqual(glass.getpixel((margin + 200, margin + 1))[0], 240)   # white light over the content
-        # Light falls in at the top and bottom edges, under the content; the middle stays clear.
+        # No sheen under or over the content: the glass shows as it is, and the rim is added by background().
+        self.assertEqual(glass.getpixel((margin + 200, margin + 1)), (240, 238, 230, 255))
         clear = agent_panel._card(Image.new("RGBA", (400, 300), (0, 0, 0, 0)), 2.0)
-        self.assertGreater(clear.getpixel((margin + 200, margin + 6))[3], 10)
-        self.assertGreater(clear.getpixel((margin + 200, margin + 294))[3], 4)
-        self.assertEqual(clear.getpixel((margin + 200, margin + 150))[3], 0)
+        self.assertEqual(clear.getpixel((margin + 200, margin + 6))[3], 0)
+        self.assertEqual(clear.getpixel((margin + 200, margin + 294))[3], 0)
+        # The rim, LumaCenter's GlassRim: a one-point hairline, white at 22 % along the top edge,
+        # 12 % along the bottom, 3 % at the middle of the sides.
+        rim = agent_panel._rim((400, 300), 2.0)
+        top, bottom, side = rim.getpixel((200, 0))[3], rim.getpixel((200, 299))[3], rim.getpixel((0, 150))[3]
+        self.assertAlmostEqual(top, round(0.22 * 255), delta=1)
+        self.assertAlmostEqual(bottom, round(0.12 * 255), delta=1)
+        self.assertAlmostEqual(side, round(0.03 * 255), delta=1)
+        self.assertAlmostEqual(rim.getpixel((200, 1))[3], top, delta=1)   # one point: two pixels at 2x
+        self.assertEqual(rim.getpixel((200, 2))[3], 0)
+        self.assertEqual(rim.getpixel((200, 150))[3], 0)             # nothing inside the hairline
+
+    def test_the_rendered_card_carries_the_rim_at_its_final_height(self):
+        import agent_panel
+        agent_panel.set_glass(True)
+        model = agent_panel.PanelModel("codex", "C", "GPT / Codex", "2 个在工作", (("5 小时", 70.0), ("每周", 40.0)), 80.0, ())
+        scene = agent_panel.Scene()
+        scene.set_model(model, 0)
+        frame = scene.render(2.0)
+        margin, x = round(MARGIN * 2.0), frame.width // 2
+        self.assertAlmostEqual(frame.getpixel((x, margin))[3], round(0.22 * 255), delta=1)                        # top edge
+        self.assertAlmostEqual(frame.getpixel((x, frame.height - margin - 1))[3], round(0.12 * 255), delta=1)     # bottom edge
+        self.assertAlmostEqual(frame.getpixel((margin, frame.height // 2))[3], round(0.03 * 255), delta=2)        # mid side
+        self.assertEqual(frame.getpixel((x, margin + 4))[3], 0)                                                   # no sheen inside
 
     def test_switching_modes_clears_the_cached_card(self):
         import agent_panel
