@@ -17,7 +17,12 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-import pystray
+try:
+    import pystray
+    import hover_details
+    from hover_details import HoverDetails, HoverIcon
+except ImportError:   # macOS: mac_menu drives QuotaTray headless with its own icons and panel
+    pystray = hover_details = HoverDetails = HoverIcon = None
 from PIL import Image
 
 import agent_panel
@@ -25,7 +30,6 @@ import agent_tasks
 import agent_hints
 import forecast as forecast_module
 from forecast import Forecast, QuotaHistory, duration_text, reset_distance
-from hover_details import HoverDetails, HoverIcon
 import quota_sources
 from quota_sources import (
     mimo_snapshot,
@@ -46,7 +50,6 @@ import launchers
 from local_sync import LocalSync, PERFORMANCE_SAVE_SECONDS  # noqa: F401
 from quota_charts import ChartData, provider_letter, weekly_series_name, window_label  # noqa: F401
 from tray_slots import IconSlots, REORDER_MIN_SECONDS  # noqa: F401
-import hover_details
 import mimo_usage
 import providers as provider_registry
 import model_iq
@@ -223,7 +226,11 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         """The shown sources and their icon letters (PROVIDERS)."""
         return PROVIDERS
 
-    def __init__(self) -> None:
+    def __init__(self, icons: dict | None = None) -> None:
+        """`icons`: per-source stand-ins from another frontend (mac_menu), which
+        runs this tray headless: no pystray icons, no Windows startup entry.
+        Each needs the attributes the mixins touch: icon, title, visible,
+        details_visible, hover_open, update_menu(), notify(), stop()."""
         # Show cached values immediately; reading the CLIs can take ~25 s.
         cached = load_cached_snapshots()
         self.snapshots = {provider: cached.get(provider) or placeholder(provider) for provider in PROVIDERS}
@@ -259,6 +266,10 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         # Cached figures may use a different alert threshold.  Notify once
         # after a fresh high forecast arrives, then suppress repeats this run.
         self.reset_alerted = "unknown"
+        if icons is not None:
+            self.icons = icons
+            self.slots = list(icons.values())
+            return
         self.migrate_startup()
         self.icons = {
             provider: HoverIcon(
@@ -1177,7 +1188,8 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         for icon in self.icons.values():
             icon.stop()
 
-    def run(self) -> None:
+    def start_workers(self) -> None:
+        """The background readers: quotas, TPS and agents, reset watch, model IQ."""
         if "claude" in PROVIDERS:
             import claude_status
             if claude_status.refresh_receiver():
@@ -1187,6 +1199,9 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         if reset_watch.ENABLED and "codex" in PROVIDERS:
             threading.Thread(target=self.reset_loop, name="codex-reset-watch", daemon=True).start()
         threading.Thread(target=self.iq_loop, name="model-iq", daemon=True).start()
+
+    def run(self) -> None:
+        self.start_workers()
         hover = HoverDetails(self.icons, self.hover_text, self.stop_event, agents=self)
         threading.Thread(target=hover.run, name="hover-details", daemon=True).start()
         ready = [threading.Event() for _ in self.slots]

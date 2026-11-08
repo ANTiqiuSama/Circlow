@@ -74,7 +74,8 @@ def _font_dirs() -> list[Path]:
     if local:
         dirs.append(Path(local) / "Microsoft/Windows/Fonts")
     dirs += [Path("/usr/share/fonts/msttcore"), Path("/usr/share/fonts/liberation-serif"),
-             Path("/usr/share/fonts/liberation-sans"), Path("/usr/share/fonts/google-noto")]
+             Path("/usr/share/fonts/liberation-sans"), Path("/usr/share/fonts/google-noto"),
+             Path("/System/Library/Fonts/Supplemental")]   # macOS
     return dirs
 
 
@@ -104,6 +105,8 @@ SERIF = (
     ("cambriab.ttf", None),
     ("palab.ttf", None),
     ("georgiab.ttf", None),
+    ("Times New Roman Bold.ttf", None),   # macOS: lining figures, so ahead of Georgia
+    ("Georgia Bold.ttf", None),
     ("LiberationSerif-Bold.ttf", None),
     ("LiberationSans-Bold.ttf", None),
 )

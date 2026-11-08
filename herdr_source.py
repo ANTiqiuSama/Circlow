@@ -250,13 +250,41 @@ def terminal_script(command: list[str]) -> list[str]:
             "-e", 'tell application "Terminal" to activate']
 
 
+GHOSTTY_BUNDLE = "com.mitchellh.ghostty"
+
+
+def ghostty_app() -> str | None:
+    """macOS: the Ghostty.app bundle path when Ghostty is installed."""
+    override = os.environ.get("CODEX_QUOTA_GHOSTTY_APP")
+    if override:
+        return override if Path(override).is_dir() else None
+    try:
+        from AppKit import NSWorkspace
+        url = NSWorkspace.sharedWorkspace().URLForApplicationWithBundleIdentifier_(GHOSTTY_BUNDLE)
+        if url is not None:
+            return str(url.path())
+    except ImportError:
+        pass
+    default = Path("/Applications/Ghostty.app")
+    return str(default) if default.is_dir() else None
+
+
+def mac_terminal(command: list[str], cwd: str | None = None, ghostty: str | None = "auto") -> list[str]:
+    """macOS: arguments that run `command` in a new terminal window, in front:
+    a new Ghostty window when Ghostty is installed, else Terminal."""
+    app = ghostty_app() if ghostty == "auto" else ghostty
+    if app:
+        return ["open", "-na", app, "--args", f"--working-directory={cwd or Path.home()}", "-e", *command]
+    return terminal_script(command)
+
+
 def open_window(exe: str, popen=subprocess.Popen) -> None:
-    """A new terminal window showing Herdr (Windows Terminal when available,
-    Terminal on macOS)."""
+    """A new terminal window showing Herdr (Windows Terminal when available;
+    Ghostty, else Terminal, on macOS)."""
     command = [exe] + _session_args()
     home = str(Path.home())
     if sys.platform == "darwin":
-        popen(terminal_script(command), cwd=home, close_fds=True)
+        popen(mac_terminal(command, home), cwd=home, close_fds=True)
         return
     terminal = shutil.which("wt") if os.name == "nt" else None
     if terminal:

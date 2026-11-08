@@ -1,5 +1,6 @@
 import time
 import os
+from datetime import datetime
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -231,6 +232,20 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(parsed["used_percent"], 56.0)
         self.assertEqual(parsed["remaining_percent"], 44.0)
         self.assertIsNotNone(parsed["resets_at"])
+
+    def test_cli_usage_parser_reads_grok_panel_layout(self):
+        # Grok 1.0.77 draws /usage as a panel: title, bar + percent, reset row,
+        # each placed with a cursor move instead of a newline.
+        box = "\x1b[38;2;88;88;88m│"
+        text = (f"\x1b[14;31H{box}  \x1b[1mWeekly limit (SuperGrok)\x1b[22m          {box}"
+                f"\x1b[16;31H{box}  ███████████████████████░░░░░░░  76%          {box}"
+                f"\x1b[17;31H{box}  Resets: November 10, 11:02          {box}"
+                f"\x1b[18;31H{box}  Loading session usage   {box}")
+        parsed = parse_grok_usage(text)
+        self.assertEqual(parsed["used_percent"], 76.0)
+        self.assertEqual(parsed["remaining_percent"], 24.0)
+        reset = datetime.fromtimestamp(parsed["resets_at"])
+        self.assertEqual((reset.month, reset.day, reset.hour, reset.minute), (11, 10, 11, 2))
 
     @unittest.skipUnless(os.name == "nt", "Windows pywinpty behavior")
     def test_grok_waits_for_slow_session_and_retries_unavailable_usage(self):

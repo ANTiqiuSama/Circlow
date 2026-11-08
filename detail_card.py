@@ -28,6 +28,7 @@ def _font_dirs() -> list[Path]:
     if local:
         dirs.append(Path(local) / "Microsoft/Windows/Fonts")
     dirs.append(Path("/usr/share/fonts/google-noto-cjk"))  # Preview hosts only.
+    dirs.append(Path("/System/Library/Fonts"))             # macOS
     return dirs
 
 
@@ -47,18 +48,22 @@ def _load(candidates, size: int):
     return ImageFont.load_default(size)
 
 
-# Microsoft YaHei UI (index 1 of the collection) covers CJK and Latin alike.
+# Microsoft YaHei UI (index 1 of the collection) covers CJK and Latin alike;
+# on macOS Hiragino Sans GB does (W3 is index 0, W6 index 2).
 @lru_cache(maxsize=32)
 def ui_font(size: int, weight: str = "regular"):
     if weight == "bold":
-        return _load((("msyhbd.ttc", 1, None), ("msyhbd.ttc", 0, None), ("NotoSansSC-Medium.otf", 0, None)), size)
-    return _load((("msyh.ttc", 1, None), ("msyh.ttc", 0, None), ("NotoSansSC-Regular.otf", 0, None)), size)
+        return _load((("msyhbd.ttc", 1, None), ("msyhbd.ttc", 0, None), ("NotoSansSC-Medium.otf", 0, None),
+                      ("Hiragino Sans GB.ttc", 2, None)), size)
+    return _load((("msyh.ttc", 1, None), ("msyh.ttc", 0, None), ("NotoSansSC-Regular.otf", 0, None),
+                  ("Hiragino Sans GB.ttc", 0, None)), size)
 
 
 @lru_cache(maxsize=16)
 def figure_font(size: int):
     return _load((("SegUIVar.ttf", 0, "Display Semibold"), ("segoeuisb.ttf", 0, None),
-                  ("msyhbd.ttc", 1, None), ("NotoSansSC-Medium.otf", 0, None)), size)
+                  ("msyhbd.ttc", 1, None), ("NotoSansSC-Medium.otf", 0, None),
+                  ("SFNS.ttf", 0, "Semibold"), ("Hiragino Sans GB.ttc", 2, None)), size)
 
 
 def _wrap(draw, text: str, face, width: float) -> list[str]:

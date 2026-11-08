@@ -141,7 +141,9 @@ class MacMenuTests(unittest.TestCase):
         import herdr_source
         from types import SimpleNamespace
         opened = []
-        with patch.object(herdr_source.sys, "platform", "darwin"), patch.dict("os.environ", {"CODEX_QUOTA_HERDR_SESSION": ""}):
+        # Without Ghostty (test_mac_panel covers the Ghostty window), Terminal hosts Herdr.
+        with patch.object(herdr_source.sys, "platform", "darwin"), patch.dict("os.environ", {"CODEX_QUOTA_HERDR_SESSION": ""}), \
+                patch.object(herdr_source, "ghostty_app", return_value=None):
             herdr_source.open_window("/opt/homebrew/bin/herdr", lambda args, **_: opened.append(args))
         self.assertEqual(opened[0][:2], ["osascript", "-e"])
         self.assertIn('do script "/opt/homebrew/bin/herdr"', opened[0][2])

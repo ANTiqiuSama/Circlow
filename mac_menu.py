@@ -1,12 +1,13 @@
 """Native macOS menu-bar frontend for the shared quota and TPS readers.
 
-AppKit stays on the main thread.  Slow client reads and local-log scans stay in
-workers; a short timer copies immutable view data into NSStatusItems/NSMenus.
-The Windows hover panel and its Win32 message loop are deliberately separate.
+AppKit stays on the main thread. The data side is the Windows tray's own
+QuotaTray run headless (quotas, TPS, agents, forecasts, reset watch), fed
+stand-in icons (MacIcon) instead of pystray ones; a short timer copies their
+pictures into NSStatusItems/NSMenus. Hovering an item opens the same agent
+panel as on Windows (mac_panel); clicking it opens the native menu.
 """
 from __future__ import annotations
 
-import io
 import logging
 import logging.handlers
 import os
@@ -42,6 +43,9 @@ from tray_icons import make_display_icon, quota_exhausted, stale_note
 
 
 HERDR_AGENTS = launchers.HERDR_AGENTS      # "打开来源" starts these in a new Herdr workspace
+LEFT_UP_MASK, RIGHT_UP_MASK = 1 << 2, 1 << 4   # NSEventMaskLeftMouseUp, NSEventMaskRightMouseUp
+RIGHT_UP_TYPE = 4                              # NSEventTypeRightMouseUp
+CONTROL_FLAG = 1 << 18                         # NSEventModifierFlagControl
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "Library/Application Support")) / APP_NAME
 log = logging.getLogger(APP_NAME)
 
@@ -135,32 +139,74 @@ def bar_order(keys: list[str]) -> list[str]:
     return sorted(keys, key=lambda key: rank.get(key, len(rank)), reverse=True)
 
 
-def open_source(key: str, state, popen=subprocess.Popen) -> str | None:
-    """"打开来源": the first of launchers.ways that applies here; returns the
-    kind that was used, None when nothing could be opened."""
+def open_source(key: str, state, popen=subprocess.Popen, run=subprocess.run) -> str | None:
+    """A click on the source's icon (or "打开来源"): the first of
+    launchers.ways that works here. Codex, Gemini and Claude open their
+    desktop clients; Grok starts in a new Herdr workspace (Herdr in Ghostty).
+    Returns the kind that was used, None when nothing could be opened."""
     for way in launchers.ways(key, "darwin"):
         if way.kind == "url":
             webbrowser.open(str(way.target))
         elif way.kind == "mac-app":
-            popen(["open", "-a", way.target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            opened = run(["open", "-b", way.target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            if opened.returncode != 0:
+                log.warning("could not open %s (%s); trying the next way", way.target, opened.returncode)
+                continue
         elif way.kind == "herdr":
             state.open_in_herdr(key)
         elif not open_cli(key, popen):
             continue
         return way.kind
+    log.warning("nothing could open %s", key)
     return None
 
 
 def open_cli(key: str, popen=subprocess.Popen) -> bool:
-    """Claude Code / Grok without Herdr: the CLI itself in a new Terminal window."""
+    """Claude Code / Grok without Herdr: the CLI itself in a new Ghostty
+    (else Terminal) window."""
     path = providers.find_claude() if key == "claude" else shutil.which("grok")
     if not path:
         return False
-    popen(herdr_source.terminal_script([str(path)]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    popen(herdr_source.mac_terminal([str(path)], str(Path.home())), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
 
+def notify(title: str, message: str, popen=subprocess.Popen) -> None:
+    """A Notification Center banner (the Windows balloon)."""
+    def quoted(text: str) -> str:
+        return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    popen(["osascript", "-e", f"display notification {quoted(message)} with title {quoted(title or APP_NAME)}"],
+          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class MacIcon:
+    """Stand-in for a pystray icon in a headless QuotaTray: the tray writes
+    `icon` (PIL image) and `title`; the AppKit timer reads them. The panel
+    sets `details_visible` and an open menu `hover_open`, which the tray's
+    scheduler reads as "pointer on this source" (fastest refresh tier)."""
+
+    def __init__(self, key: str):
+        self.key = key
+        self.icon = None
+        self.title = ""
+        self.visible = True
+        self.details_visible = False
+        self.hover_open = False
+        self.suppress_hover = False
+
+    def update_menu(self) -> None:
+        pass                                   # the AppKit timer rebuilds menu titles itself
+
+    def notify(self, message: str, title: str = "") -> None:
+        notify(title, message)
+
+    def stop(self) -> None:
+        pass
+
+
 class MenuState:
+    """The menu bar's original standalone reader. run_mac now uses QuotaTray;
+    this stays for open_source's Herdr launcher (open_in_herdr)."""
     def __init__(self, keys: list[str] | None = None):
         self.keys = keys if keys is not None else providers.enabled_keys()
         cached = load_cached_snapshots()
@@ -314,18 +360,26 @@ def run_mac() -> int:
     if handle is None:
         return 0
     _logger()
-    from Cocoa import (NSApplication, NSApplicationActivationPolicyAccessory, NSImage, NSMenu,
+    from Cocoa import (NSApplication, NSApplicationActivationPolicyAccessory, NSMenu,
                        NSMenuItem, NSObject, NSStatusBar, NSVariableStatusItemLength, NSTimer)
-    from Foundation import NSData
+    import objc
+    import tray_app
+    from mac_panel import MacHoverPanel, to_nsimage
 
-    state = MenuState()
+    keys = list(tray_app.PROVIDERS)
+    icons = {key: MacIcon(key) for key in keys}
+    tray = tray_app.QuotaTray(icons=icons)
+    launcher = MenuState(keys)        # Herdr launcher for "打开来源"; its readers are not started
 
     class Delegate(NSObject):
         def applicationDidFinishLaunching_(self, _notification):
             self.items = {}
             self.menus = {}
+            self.menu_objs = {}
+            self.order = []
+            self.pictures = {}
             bar = NSStatusBar.systemStatusBar()
-            for key in bar_order(state.keys):
+            for key in bar_order(keys):
                 item = bar.statusItemWithLength_(NSVariableStatusItemLength)
                 menu = NSMenu.alloc().initWithTitle_(key)   # the title names the source for the delegate
                 menu.setAutoenablesItems_(False)
@@ -344,27 +398,41 @@ def run_mac() -> int:
                     line.setTarget_(self)
                     line.setRepresentedObject_(key)
                     menu.addItem_(line)
-                item.setMenu_(menu)
+                # Like the Windows tray: left-click opens the source, right-click
+                # (or Control-click) shows the menu. A menu attached to the item
+                # would take every click, so it is attached only while shown.
+                button = item.button()
+                button.setTag_(len(self.order))
+                button.setTarget_(self)
+                button.setAction_("statusClicked:")
+                button.sendActionOn_(LEFT_UP_MASK | RIGHT_UP_MASK)
+                self.order.append(key)
                 self.items[key] = item
                 self.menus[key] = parts
+                self.menu_objs[key] = menu
+            self.hover = MacHoverPanel(tray, self.items, icons, self.panelSettings)
             self.updateUI_(None)
             self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                2.0, self, "updateUI:", None, True)
-            state.start()
+                1.0, self, "updateUI:", None, True)
+            tray.start_workers()
+            self.hover.start(self)
 
         def updateUI_(self, _timer):
-            for key in state.keys:
-                snapshot, performance, refresh = state.view(key)
-                model = menu_model(key, snapshot, performance, refresh)
-                image = status_image(snapshot, providers.get(key).letter, performance)
-                output = io.BytesIO()
-                image.save(output, format="PNG")
-                payload = output.getvalue()
-                native = NSImage.alloc().initWithData_(NSData.dataWithBytes_length_(payload, len(payload)))
-                native.setSize_((20, 20))
+            now = time.time()
+            for key in keys:
+                snapshot = tray.snapshots[key]
+                performance = dict(tray.performance.get("providers", {}).get(key, {}))
+                model = menu_model(key, snapshot, performance, tray.scheduler.describe(key, now), now)
+                # The tray draws the icon each second (TPS loop); until then draw it here.
+                image = icons[key].icon or status_image(snapshot, providers.get(key).letter, performance)
                 button = self.items[key].button()
-                button.setImage_(native)
-                button.setToolTip_("\n".join(part for part in (model["summary"], model["speed"]) if part))
+                if self.pictures.get(key) is not image:
+                    button.setImage_(to_nsimage(image, image.size[0] / 20))
+                    self.pictures[key] = image
+                # Sources with a hover panel skip the native tooltip, which would cover it.
+                tip = "" if tray_app.has_panel(key, snapshot) else "\n".join(
+                    part for part in (model["summary"], model["speed"]) if part)
+                button.setToolTip_(tip)
                 rows = model["quota"][:3]
                 for name, value in (("summary", model["summary"]), ("speed", model["speed"]),
                                     ("updated", model["updated"]), ("error", model["error"])):
@@ -377,20 +445,64 @@ def run_mac() -> int:
                     line.setHidden_(not bool(value))
 
         def menuWillOpen_(self, menu):
-            state.hover(str(menu.title()), True)
+            key = str(menu.title())
+            if key in icons:
+                icons[key].hover_open = True     # open menu = hover: fastest refresh tier
+                tray.wake.set()
+            self.hover.menu_will_open(key)
 
         def menuDidClose_(self, menu):
-            state.hover(str(menu.title()), False)
+            key = str(menu.title())
+            if key in icons:
+                icons[key].hover_open = False
+            self.hover.menu_did_close(key)
+
+        def panelTick_(self, _timer):
+            self.hover.tick()
+
+        def statusClicked_(self, sender):
+            index = int(sender.tag())
+            if not 0 <= index < len(self.order):
+                return
+            key = self.order[index]
+            event = NSApplication.sharedApplication().currentEvent()
+            secondary = event is not None and (int(event.type()) == RIGHT_UP_TYPE
+                                               or int(event.modifierFlags()) & CONTROL_FLAG)
+            if secondary:
+                self.showMenu(key)
+                return
+            self.hover.clicked(key)
+            kind = open_source(key, launcher)
+            log.info("clicked %s: opened via %s", key, kind)
+
+        @objc.python_method
+        def showMenu(self, key):
+            """The source's menu under its item; returns once it has closed."""
+            item = self.items[key]
+            item.setMenu_(self.menu_objs[key])
+            try:
+                item.button().performClick_(None)
+            finally:
+                item.setMenu_(None)
+
+        @objc.python_method
+        def panelSettings(self, provider, page):
+            # The settings window is not ported yet: the panel's gear and
+            # right-click open this source's menu (refresh / open / quit).
+            log.info("panel settings requested (%s, %s): opening the menu", provider, page)
+            if provider in self.items:
+                self.showMenu(provider)
 
         def refreshOne_(self, sender):
-            state.request(str(sender.representedObject()))
+            tray.scheduler.request([str(sender.representedObject())], time.time())
+            tray.wake.set()
 
         def openSource_(self, sender):
-            open_source(str(sender.representedObject()), state)
+            open_source(str(sender.representedObject()), launcher)
 
         def quitApp_(self, _sender):
-            state.stop.set()
-            state.wake.set()
+            self.hover.stop()
+            tray.exit_app()
             NSApplication.sharedApplication().terminate_(None)
 
     app = NSApplication.sharedApplication()
@@ -400,8 +512,8 @@ def run_mac() -> int:
     try:
         app.run()
     finally:
-        state.stop.set()
-        state.wake.set()
+        tray.stop_event.set()
+        tray.wake.set()
         handle.close()
     return 0
 
