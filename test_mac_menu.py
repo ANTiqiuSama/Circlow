@@ -85,6 +85,10 @@ class MacMenuTests(unittest.TestCase):
             self.assertEqual(mac_menu.status_image(snap, "C", performance).tobytes(),
                              tray_icons.make_display_icon(snap, "C", performance).tobytes())
 
+    def test_status_items_have_stable_autosave_names(self):
+        names = {mac_menu.autosave_name(key) for key in ("claude", "codex", "gemini", "grok", "mimo")}
+        self.assertEqual(names, {"Circlow.claude", "Circlow.codex", "Circlow.gemini", "Circlow.grok", "Circlow.mimo"})
+
     def test_status_items_read_in_tray_order_left_to_right(self):
         # macOS puts each new item to the left, so creation runs right to left.
         created = mac_menu.bar_order(["mimo", "codex", "grok", "claude", "gemini"])

@@ -143,6 +143,14 @@ def bar_order(keys: list[str]) -> list[str]:
     return sorted(keys, key=lambda key: rank.get(key, len(rank)), reverse=True)
 
 
+def autosave_name(key: str) -> str:
+    """A stable name per source, so macOS remembers where the user put the
+    item (Cmd-drag, or a menu bar manager such as Thaw) across restarts and
+    source changes. Without one, AppKit numbers items in creation order and
+    saves nothing, so every restart puts the items back at the far left."""
+    return f"Circlow.{key}"
+
+
 def open_source(key: str, state, popen=subprocess.Popen, run=subprocess.run) -> str | None:
     """A click on the source's icon (or "打开来源"): the first of
     launchers.ways that works here. Codex, Gemini and Claude open their
@@ -403,6 +411,7 @@ def run_mac() -> int:
             bar = NSStatusBar.systemStatusBar()
             for key in bar_order(keys):
                 item = bar.statusItemWithLength_(NSVariableStatusItemLength)
+                item.setAutosaveName_(autosave_name(key))
                 menu = NSMenu.alloc().initWithTitle_(key)   # the title names the source for the delegate
                 menu.setAutoenablesItems_(False)
                 menu.setDelegate_(self)          # open menu = hover: fastest refresh tier
