@@ -7,8 +7,8 @@ native sessions belong to the same pane, so everything one agent process does
 agents without readable local logs still get a bubble.
 
 Nothing here is required: without herdr the agents pass through unchanged.
-Set CODEX_QUOTA_HERDR=0 to switch it off, CODEX_QUOTA_HERDR_EXE to point at
-the executable and CODEX_QUOTA_HERDR_SESSION to read a named herdr session.
+Set CIRCLOW_HERDR=0 to switch it off, CIRCLOW_HERDR_EXE to point at
+the executable and CIRCLOW_HERDR_SESSION to read a named herdr session.
 """
 from __future__ import annotations
 
@@ -99,7 +99,7 @@ def session_ids(row: dict) -> set[str]:
 
 def find_exe() -> str | None:
     """herdr on PATH, or in the folders its installers use."""
-    found = os.environ.get("CODEX_QUOTA_HERDR_EXE") or shutil.which("herdr")
+    found = os.environ.get("CIRCLOW_HERDR_EXE") or shutil.which("herdr")
     if not found and os.name == "nt":
         local, home = os.environ.get("LOCALAPPDATA"), os.environ.get("USERPROFILE")
         for candidate in ((Path(local) / "Programs" / "Herdr" / "bin" / "herdr.exe") if local else None,
@@ -118,7 +118,7 @@ SERVER_WAIT_SECONDS = 15     # a freshly opened Herdr window starts its server
 
 
 def _session_args() -> list[str]:
-    session = os.environ.get("CODEX_QUOTA_HERDR_SESSION", "").strip()
+    session = os.environ.get("CIRCLOW_HERDR_SESSION", "").strip()
     return ["--session", session] if session else []
 
 
@@ -255,7 +255,7 @@ GHOSTTY_BUNDLE = "com.mitchellh.ghostty"
 
 def ghostty_app() -> str | None:
     """macOS: the Ghostty.app bundle path when Ghostty is installed."""
-    override = os.environ.get("CODEX_QUOTA_GHOSTTY_APP")
+    override = os.environ.get("CIRCLOW_GHOSTTY_APP")
     if override:
         return override if Path(override).is_dir() else None
     try:
@@ -325,7 +325,7 @@ def start_agent(kind: str, *, exe: str | None = None, runner: Callable | None = 
     its name (kind, kind-2, ...). Raises OSError with a readable message."""
     exe = exe or find_exe()
     if not exe:
-        raise FileNotFoundError("未找到 herdr，可设置 CODEX_QUOTA_HERDR_EXE")
+        raise FileNotFoundError("未找到 herdr，可设置 CIRCLOW_HERDR_EXE")
     runner = runner or process_jail.run
     if not (window_open or client_open)():
         open_window(exe, popen)           # the window starts the server if it was stopped
@@ -362,10 +362,10 @@ def start_agent(kind: str, *, exe: str | None = None, runner: Callable | None = 
 class Herdr:
     def __init__(self, exe: str | None = None, runner: Callable | None = None, enabled: bool | None = None):
         if enabled is None:
-            enabled = os.environ.get("CODEX_QUOTA_HERDR", "1").strip().lower() not in ("0", "false", "off", "no")
+            enabled = os.environ.get("CIRCLOW_HERDR", "1").strip().lower() not in ("0", "false", "off", "no")
         self.enabled = enabled
-        self.exe = exe or os.environ.get("CODEX_QUOTA_HERDR_EXE") or None
-        self.session = os.environ.get("CODEX_QUOTA_HERDR_SESSION", "").strip()
+        self.exe = exe or os.environ.get("CIRCLOW_HERDR_EXE") or None
+        self.session = os.environ.get("CIRCLOW_HERDR_SESSION", "").strip()
         self.runner = runner or process_jail.run
         self.rows: list[dict[str, Any]] = []
         self.polled_at = 0.0

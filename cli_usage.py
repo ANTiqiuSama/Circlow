@@ -560,7 +560,7 @@ def parse_claude_usage(text: str) -> dict[str, Any]:
 def _claude_probe_dir() -> str:
     """An empty, app-owned folder: trusting it grants Claude Code nothing."""
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, "CodexQuotaTray", "claude-probe")
+    folder = os.path.join(base, "Circlow", "claude-probe")
     os.makedirs(folder, exist_ok=True)
     return folder
 

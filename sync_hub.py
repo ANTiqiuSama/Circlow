@@ -11,7 +11,7 @@ Each device puts one payload of its own figures and reads everyone's back:
 Only numbers leave the machine: no conversation text, paths or credentials.
 The hub sits behind Instabox's gate for private ports ("Authorization:
 Bearer <link token>") and checks its own token ("X-Sync-Token"). Settings
-come from sync.json in the data folder, or CODEX_QUOTA_SYNC_URL /
+come from sync.json in the data folder, or CIRCLOW_SYNC_URL /
 _SYNC_LINK_TOKEN / _SYNC_TOKEN / _SYNC_DEVICE. While the box is paused or
 cooling down every call fails; the loop backs off and both sides go on
 locally.
@@ -34,8 +34,8 @@ from typing import Any, Callable
 
 from quota_sources import QuotaSnapshot
 
-log = logging.getLogger("CodexQuotaTray")
-DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray"
+log = logging.getLogger("Circlow")
+DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow"
 CONFIG_PATH = DATA_DIR / "sync.json"
 SYNC_EVERY = 120          # seconds between rounds
 HEARTBEAT = 600           # an unchanged payload is still sent this often
@@ -53,7 +53,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict | None:
     except (OSError, ValueError):
         config = {}
     for key, name in (("url", "URL"), ("link_token", "LINK_TOKEN"), ("token", "TOKEN"), ("device", "DEVICE")):
-        value = os.environ.get(f"CODEX_QUOTA_SYNC_{name}")
+        value = os.environ.get(f"CIRCLOW_SYNC_{name}")
         if value:
             config[key] = value
     if not config.get("url") or not config.get("token"):

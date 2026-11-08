@@ -19,7 +19,7 @@ import time
 import agent_panel
 from detail_card import MARGIN
 
-log = logging.getLogger("CodexQuotaTray")
+log = logging.getLogger("Circlow")
 
 DWELL = 0.4                 # pointer rest on an item before its panel opens
 GAP = 6                     # menu bar bottom to the card's top edge, in points

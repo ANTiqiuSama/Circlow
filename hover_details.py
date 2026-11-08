@@ -289,8 +289,8 @@ def enable_thread_dpi_awareness() -> bool:
     """Per-monitor v2 for the hover thread only, so the card is drawn at the
     monitor's real DPI instead of being bitmap-stretched (blurry) by DWM. All
     coordinates this thread reads (cursor, icon rect, monitor) become physical
-    together. CODEX_QUOTA_LEGACY_DPI=1 keeps the previous behaviour."""
-    if os.environ.get("CODEX_QUOTA_LEGACY_DPI") == "1":
+    together. CIRCLOW_LEGACY_DPI=1 keeps the previous behaviour."""
+    if os.environ.get("CIRCLOW_LEGACY_DPI") == "1":
         return False
     try:
         function = user.SetThreadDpiAwarenessContext
@@ -322,7 +322,7 @@ class TrackingTooltip:
     def __init__(self):
         common.InitCommonControls()
         self.owner = user.CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            "STATIC", "CodexQuotaTray hover controller", 0x80000000,
+            "STATIC", "Circlow hover controller", 0x80000000,
             0, 0, 0, 0, None, None, None, None)
         self.hwnd = user.CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
             "tooltips_class32", "AI 数据详情", 0x80000000 | 1 | 2 | 0x10 | 0x20,

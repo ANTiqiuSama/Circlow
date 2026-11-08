@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - 'mac_menu.py'
+      - 'app_identity.py'
+      - 'test_app_identity.py'
+      - 'sync_hub.py'
+      - 'usage_store.py'
       - 'build-macos.sh'
       - 'requirements-macos.txt'
       - 'cli_usage.py'
@@ -44,6 +48,10 @@ on:
   pull_request:
     paths:
       - 'mac_menu.py'
+      - 'app_identity.py'
+      - 'test_app_identity.py'
+      - 'sync_hub.py'
+      - 'usage_store.py'
       - 'build-macos.sh'
       - 'requirements-macos.txt'
       - 'cli_usage.py'
@@ -105,13 +113,13 @@ jobs:
         run: bash build-macos.sh
       - name: Check bundle metadata
         run: |
-          test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' dist-macos/CodexQuotaTray.app/Contents/Info.plist)" = true
-          file dist-macos/CodexQuotaTray.app/Contents/MacOS/CodexQuotaTray
-          dist-macos/CodexQuotaTray.app/Contents/MacOS/CodexQuotaTray --smoke-menu
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' dist-macos/Circlow.app/Contents/Info.plist)" = true
+          file dist-macos/Circlow.app/Contents/MacOS/Circlow
+          dist-macos/Circlow.app/Contents/MacOS/Circlow --smoke-menu
       - name: Package app
-        run: ditto -c -k --sequesterRsrc --keepParent dist-macos/CodexQuotaTray.app "CodexQuotaTray-macos-${{ matrix.arch }}.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent dist-macos/Circlow.app "Circlow-macos-${{ matrix.arch }}.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: CodexQuotaTray-macos-${{ matrix.arch }}
-          path: CodexQuotaTray-macos-${{ matrix.arch }}.zip
+          name: Circlow-macos-${{ matrix.arch }}
+          path: Circlow-macos-${{ matrix.arch }}.zip
           if-no-files-found: error

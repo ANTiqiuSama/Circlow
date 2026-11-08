@@ -20,7 +20,7 @@ import process_jail
 from cli_usage import run_agy_usage
 
 
-CACHE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray" / "state.json"
+CACHE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow" / "state.json"
 
 
 @dataclass
@@ -86,7 +86,7 @@ def _unknown(provider: str, label: str, window_minutes: int | None, error: str) 
 
 
 def _codex_executable() -> str | None:
-    configured = os.environ.get("CODEX_QUOTA_CODEX_EXE")
+    configured = os.environ.get("CIRCLOW_CODEX_EXE")
     if configured and Path(configured).is_file():
         return configured
     found = shutil.which("codex")
@@ -239,14 +239,14 @@ def parse_codex_session_limits(limits: dict[str, Any], moment: float) -> QuotaSn
 def get_codex_quota(raw: dict | None = None) -> QuotaSnapshot:
     executable = _codex_executable()
     if not executable:
-        return _unknown("codex", "Codex", None, "未找到 Codex CLI（可设置 CODEX_QUOTA_CODEX_EXE）")
+        return _unknown("codex", "Codex", None, "未找到 Codex CLI（可设置 CIRCLOW_CODEX_EXE）")
     rpc: _JsonRpcProcess | None = None
     try:
         rpc = _JsonRpcProcess([executable, "app-server", "--stdio"])
         rpc.request(
             "initialize",
             {
-                "clientInfo": {"name": "CodexQuotaTray", "title": "Codex Quota Tray", "version": "1.0.0"},
+                "clientInfo": {"name": "Circlow", "title": "Circlow", "version": "1.0.0"},
                 "capabilities": {"optOutNotificationMethods": ["account/rateLimits/updated"]},
             },
         )
@@ -265,7 +265,7 @@ def get_codex_quota(raw: dict | None = None) -> QuotaSnapshot:
 
 def get_grok_quota(raw: dict | None = None) -> QuotaSnapshot:
     default = "grok" if sys.platform == "darwin" else "grok.exe"
-    executable = os.environ.get("CODEX_QUOTA_GROK_EXE") or shutil.which("grok") or str(Path.home() / ".grok/bin" / default)
+    executable = os.environ.get("CIRCLOW_GROK_EXE") or shutil.which("grok") or str(Path.home() / ".grok/bin" / default)
     try:
         parsed = cli_quota.read_usage(executable, "grok", raw)
         return QuotaSnapshot("grok", "Grok", parsed["window_minutes"], parsed["used_percent"], parsed["remaining_percent"], parsed["resets_at"], time.time(), False, None)
@@ -274,7 +274,7 @@ def get_grok_quota(raw: dict | None = None) -> QuotaSnapshot:
 
 
 def get_gemini_quota() -> QuotaSnapshot:
-    executable = os.environ.get("CODEX_QUOTA_GEMINI_EXE") or shutil.which("agy") or str(
+    executable = os.environ.get("CIRCLOW_GEMINI_EXE") or shutil.which("agy") or str(
         Path.home() / (".local/bin/agy" if sys.platform == "darwin" else "AppData/Local/agy/bin/agy.exe"))
     try:
         parsed = run_agy_usage(executable)
@@ -330,7 +330,7 @@ def _claude_native(report: dict) -> QuotaSnapshot:
 def _claude_probe() -> QuotaSnapshot:
     executable = providers.find_claude()
     if executable is None:
-        return _unknown("claude", "Claude", 300, "未找到 Claude Code（claude.exe / claude.cmd），可设置 CODEX_QUOTA_CLAUDE_EXE")
+        return _unknown("claude", "Claude", 300, "未找到 Claude Code（claude.exe / claude.cmd），可设置 CIRCLOW_CLAUDE_EXE")
     try:
         parsed = cli_quota.read_usage(str(executable))
         return QuotaSnapshot("claude", "Claude Code", parsed["window_minutes"], parsed["used_percent"], parsed["remaining_percent"],

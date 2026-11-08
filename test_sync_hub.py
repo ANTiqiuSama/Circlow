@@ -51,7 +51,7 @@ class ConfigTests(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {}, clear=False)
         self.env.start()
         for name in ("URL", "LINK_TOKEN", "TOKEN", "DEVICE"):
-            os.environ.pop(f"CODEX_QUOTA_SYNC_{name}", None)
+            os.environ.pop(f"CIRCLOW_SYNC_{name}", None)
 
     def tearDown(self):
         self.env.stop()
@@ -65,7 +65,7 @@ class ConfigTests(unittest.TestCase):
         config = sync_hub.load_config(self.path)
         self.assertEqual(config["url"], "https://hub.example")
         self.assertEqual(config["device"], "my-pc")
-        os.environ["CODEX_QUOTA_SYNC_DEVICE"] = "mac-air"
+        os.environ["CIRCLOW_SYNC_DEVICE"] = "mac-air"
         self.assertEqual(sync_hub.load_config(self.path)["device"], "mac-air")
 
     def test_a_token_is_required(self):

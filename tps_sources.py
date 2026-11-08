@@ -30,7 +30,7 @@ from herdr_source import Herdr
 from agent_tasks import AgentNotes, RECUR_SPREAD, clean as clean_request, read_schedules, tool_action
 
 
-PERFORMANCE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray/performance.json"
+PERFORMANCE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow/performance.json"
 RECENT_SECONDS = 86400          # Only files touched within a day can matter.
 FORGET_SECONDS = 2 * 86400      # Readers idle this long are released.
 SLOW_DISCOVERY_SECONDS = 30     # Process list and full-history globbing.
@@ -1236,8 +1236,8 @@ def _find_text(value: Any, wanted: str) -> str:
 
 
 # Antigravity keeps the Cascade step enum: 14 is the user's message, 15 the
-# model's reply. CODEX_QUOTA_AGY_USER_STEPS overrides (comma separated).
-AGY_USER_STEPS = {int(part) for part in (os.environ.get("CODEX_QUOTA_AGY_USER_STEPS") or "14").split(",") if part.strip().isdigit()}
+# model's reply. CIRCLOW_AGY_USER_STEPS overrides (comma separated).
+AGY_USER_STEPS = {int(part) for part in (os.environ.get("CIRCLOW_AGY_USER_STEPS") or "14").split(",") if part.strip().isdigit()}
 AGY_REPLY_STEP = 15
 STEP_PAYLOAD_COLUMNS = ("step_payload", "step", "data", "payload", "content", "proto", "value", "blob")
 

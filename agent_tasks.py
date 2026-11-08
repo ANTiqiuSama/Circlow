@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray"
+DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow"
 GROUPS_PATH = DATA_DIR / "agent_groups.json"
 SUMMARY_CONFIG = DATA_DIR / "agent_summary.json"
 LIVE_SECONDS = 45          # A sub-agent without its own activity flag counts as working this long.
@@ -760,8 +760,8 @@ def is_mimo_url(url: str) -> bool:
 
 def summary_config() -> dict | None:
     """OpenAI-compatible chat completions endpoint, opt-in only."""
-    config = {"url": os.environ.get("CODEX_QUOTA_SUMMARY_URL", ""), "key": os.environ.get("CODEX_QUOTA_SUMMARY_KEY", ""),
-              "model": os.environ.get("CODEX_QUOTA_SUMMARY_MODEL", "")}
+    config = {"url": os.environ.get("CIRCLOW_SUMMARY_URL", ""), "key": os.environ.get("CIRCLOW_SUMMARY_KEY", ""),
+              "model": os.environ.get("CIRCLOW_SUMMARY_MODEL", "")}
     if not config["url"]:
         try:
             stored = json.loads(SUMMARY_CONFIG.read_text(encoding="utf-8"))

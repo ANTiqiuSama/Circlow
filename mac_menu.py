@@ -21,7 +21,9 @@ from datetime import datetime
 from pathlib import Path
 
 
-APP_NAME = "CodexQuotaTray"
+import app_identity  # first: adopts the old CODEX_QUOTA_* settings before other modules read them
+
+APP_NAME = app_identity.APP_NAME
 if sys.platform == "darwin":
     # Shared readers use LOCALAPPDATA as their configurable data root.
     os.environ.setdefault("LOCALAPPDATA", str(Path.home() / "Library/Application Support"))
@@ -29,6 +31,8 @@ if sys.platform == "darwin":
     extra = ["/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local/bin"),
              str(Path.home() / ".grok/bin")]
     os.environ["PATH"] = os.pathsep.join(dict.fromkeys(os.environ.get("PATH", "").split(os.pathsep) + extra))
+if __name__ == "__main__":
+    app_identity.migrate_data_dir()   # ~/Library/Application Support/CodexQuotaTray -> Circlow, before anything reads it
 
 import herdr_source
 import launchers
@@ -368,6 +372,11 @@ def run_mac() -> int:
     from mac_panel import MacHoverPanel, to_nsimage
 
     settings_mac.take_commands(settings_mac.MENU)      # requests left over from an earlier run
+    try:
+        if settings_mac.migrate_login_item():
+            log.info("login item moved to %s", settings_mac.LAUNCH_AGENT_LABEL)
+    except OSError:
+        log.warning("login item migration skipped", exc_info=True)
 
     keys = list(tray_app.PROVIDERS)
     icons = {key: MacIcon(key) for key in keys}
@@ -396,7 +405,7 @@ def run_mac() -> int:
                     parts[name] = line
                 menu.addItem_(NSMenuItem.separatorItem())
                 for title, action in (("立即刷新", "refreshOne:"), ("打开来源", "openSource:"), ("设置…", "openSettings:"),
-                                      ("退出 CodexQuotaTray", "quitApp:")):
+                                      ("退出 环流 (Circlow)", "quitApp:")):
                     line = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
                     line.setTarget_(self)
                     line.setRepresentedObject_(key)
@@ -564,9 +573,9 @@ def smoke_menu() -> int:
     bar = NSStatusBar.systemStatusBar()
     item = bar.statusItemWithLength_(NSVariableStatusItemLength)
     try:
-        menu = NSMenu.alloc().initWithTitle_("CodexQuotaTray smoke")
+        menu = NSMenu.alloc().initWithTitle_("Circlow smoke")
         item.setMenu_(menu)
-        assert item.button() is not None and str(item.menu().title()) == "CodexQuotaTray smoke"
+        assert item.button() is not None and str(item.menu().title()) == "Circlow smoke"
     finally:
         bar.removeStatusItem_(item)
     print("macOS menu bar AppKit smoke passed")

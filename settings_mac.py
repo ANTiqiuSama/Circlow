@@ -2,7 +2,7 @@
 own process.
 
 Tk needs the main thread, which the menu bar's AppKit loop already owns, so
-the menu bar starts `CodexQuotaTray --settings [page]` instead. That process
+the menu bar starts `Circlow --settings [page]` instead. That process
 builds a headless QuotaTray from the same data files (no readers of its own
 beyond a light refresh of cached figures and local TPS), so the pages show
 what the menu bar shows. Actions that concern the running menu bar (refresh,
@@ -23,11 +23,12 @@ import threading
 import time
 import uuid
 from pathlib import Path
+import app_identity
 
-APP_NAME = "CodexQuotaTray"
+APP_NAME = app_identity.APP_NAME
 log = logging.getLogger(APP_NAME)
 
-LAUNCH_AGENT_LABEL = "com.antiqiusama.codexquotatray"
+LAUNCH_AGENT_LABEL = app_identity.BUNDLE_ID
 MENU, SETTINGS = "menu", "settings"
 
 
@@ -142,6 +143,17 @@ def set_login_item(enabled: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as handle:
         plistlib.dump({"Label": LAUNCH_AGENT_LABEL, "ProgramArguments": program, "RunAtLoad": True}, handle)
+
+
+def migrate_login_item() -> bool:
+    """Before the rename the LaunchAgent was com.antiqiusama.codexquotatray
+    and opened CodexQuotaTray.app: put this build's in its place."""
+    old = launch_agent_path().with_name(f"{app_identity.LEGACY_BUNDLE_ID}.plist")
+    if not old.is_file():
+        return False
+    old.unlink(missing_ok=True)
+    set_login_item(True)
+    return True
 
 
 # ----- macOS stand-ins for Windows shell calls ---------------------------------------
@@ -293,7 +305,7 @@ def make_window(tray, commands):
 
 
 def run_settings(page: str | None = None) -> int:
-    """`CodexQuotaTray --settings [page]`: one settings window per user."""
+    """`Circlow --settings [page]`: one settings window per user."""
     import fcntl
     folder = data_dir()
     folder.mkdir(parents=True, exist_ok=True)

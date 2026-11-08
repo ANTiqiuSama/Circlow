@@ -8,18 +8,43 @@ import time
 import sys
 from pathlib import Path
 
+import app_identity
 import providers
 
 
+RECEIVER = "circlow-statusline.ps1"
+LEGACY_RECEIVER = "codexquotatray-statusline.ps1"     # before the rename to Circlow
+
+
 def data_dir() -> Path:
-    return providers._local_appdata() / "CodexQuotaTray"
+    return providers._local_appdata() / app_identity.APP_NAME
+
+
+def _ours(command: str) -> bool:
+    return RECEIVER in command or LEGACY_RECEIVER in command
+
+
+def _command(receiver: Path) -> str:
+    return f'powershell.exe -NoLogo -NoProfile -NonInteractive -File "{receiver.as_posix()}"'
+
+
+def _settings() -> tuple[Path, dict]:
+    path = providers.claude_home() / "settings.json"
+    return path, (json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {})
+
+
+def _save_settings(path: Path, settings: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".quota-tray.tmp")
+    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def bridge_installed() -> bool:
     try:
-        settings = json.loads((providers.claude_home() / "settings.json").read_text(encoding="utf-8-sig"))
+        _path, settings = _settings()
         command = (settings.get("statusLine") or {}).get("command", "")
-        return "codexquotatray-statusline.ps1" in command and (data_dir() / "codexquotatray-statusline.ps1").is_file()
+        return _ours(command) and (data_dir() / RECEIVER).is_file()
     except (OSError, ValueError, AttributeError):
         return False
 
@@ -29,18 +54,29 @@ def _bundled_receiver() -> Path:
 
 
 def refresh_receiver() -> bool:
-    """Keep an installed receiver in step with this build; never installs one."""
+    """Keep an installed receiver in step with this build; never installs one.
+    A status line set up before the rename (codexquotatray-statusline.ps1 in
+    the old CodexQuotaTray folder) is pointed at this build's receiver."""
     try:
-        if not bridge_installed():
+        path, settings = _settings()
+        command = (settings.get("statusLine") or {}).get("command", "")
+        if not _ours(command):
             return False
-        receiver, bundled = data_dir() / "codexquotatray-statusline.ps1", _bundled_receiver().read_bytes()
-        if receiver.read_bytes() == bundled:
-            return False
-        temporary = receiver.with_suffix(".tmp")
-        temporary.write_bytes(bundled)
-        os.replace(temporary, receiver)
-        return True
-    except OSError:
+        receiver, bundled = data_dir() / RECEIVER, _bundled_receiver().read_bytes()
+        changed = False
+        if not receiver.is_file() or receiver.read_bytes() != bundled:
+            receiver.parent.mkdir(parents=True, exist_ok=True)
+            temporary = receiver.with_suffix(".tmp")
+            temporary.write_bytes(bundled)
+            os.replace(temporary, receiver)
+            changed = True
+        if command != _command(receiver):
+            settings["statusLine"] = {**settings["statusLine"], "command": _command(receiver)}
+            _save_settings(path, settings)
+            (data_dir() / LEGACY_RECEIVER).unlink(missing_ok=True)
+            changed = True
+        return changed
+    except (OSError, ValueError, AttributeError, TypeError):
         return False
 
 
@@ -48,22 +84,17 @@ def install() -> None:
     """Explicit installation. Preserve unrelated settings and custom status lines."""
     if os.name != "nt":
         raise OSError("当前实时额度接入脚本适用于 Windows")
-    path = providers.claude_home() / "settings.json"
-    settings = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+    path, settings = _settings()
     previous = settings.get("statusLine") or {}
-    command = previous.get("command", "")
-    if previous and "codexquotatray-statusline.ps1" not in command:
+    if previous and not _ours(previous.get("command", "")):
         raise ValueError("已有自定义 Claude statusLine，保留现有配置；请手动接入 claude_status.ps1")
     folder = data_dir()
     folder.mkdir(parents=True, exist_ok=True)
-    receiver = folder / "codexquotatray-statusline.ps1"
+    receiver = folder / RECEIVER
     receiver.write_bytes(_bundled_receiver().read_bytes())
-    settings["statusLine"] = {"type": "command", "command":
-        f'powershell.exe -NoLogo -NoProfile -NonInteractive -File "{receiver.as_posix()}"'}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".quota-tray.tmp")
-    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    (folder / LEGACY_RECEIVER).unlink(missing_ok=True)
+    settings["statusLine"] = {"type": "command", "command": _command(receiver)}
+    _save_settings(path, settings)
 
 
 WINDOWS = ("five_hour", "seven_day")
@@ -271,7 +302,7 @@ def _furthest(rows: list[tuple[float, float, int | None]]) -> tuple[float, float
 
 
 def desktop_roots() -> list[Path]:
-    override = os.environ.get("CODEX_QUOTA_CLAUDE_DESKTOP_DIR")
+    override = os.environ.get("CIRCLOW_CLAUDE_DESKTOP_DIR")
     if override:
         return [Path(override)]
     roots = []

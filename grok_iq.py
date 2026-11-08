@@ -18,6 +18,7 @@ import urllib.request
 from dataclasses import asdict, dataclass
 
 from model_iq import short_name
+import app_identity
 
 SITE = "https://livebench.ai/"
 ORIGIN = "https://livebench.ai"
@@ -25,7 +26,7 @@ MODEL_ID = "grok-4.7"
 LABEL = "智商"
 CAPTION = "Grok 4.7"
 READ_SECONDS = 3 * 3600
-USER_AGENT = "CodexQuotaTray (+https://github.com/ANTiqiuSama/CodexQuotaTray)"
+USER_AGENT = app_identity.USER_AGENT
 
 
 @dataclass

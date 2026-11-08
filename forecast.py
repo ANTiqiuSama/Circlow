@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Iterable
 
-HISTORY_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "CodexQuotaTray" / "history.json"
+HISTORY_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow" / "history.json"
 KEEP_SECONDS = 8 * 86400        # Longer than the longest (weekly) window.
 KEEP_SAMPLES = 2000             # Per window key; repeated readings are folded (see add), so this spans the week.
 LOOKBACK_SECONDS = 3 * 3600     # Recent pace matters more than the whole window.

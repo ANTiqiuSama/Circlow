@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import app_identity  # first: adopts the old CODEX_QUOTA_* settings before other modules read them
+if __name__ == "__main__":
+    app_identity.migrate_data_dir()   # before any module reads its files (PROVIDERS below reads providers.json)
 import ctypes
 import dataclasses
 import itertools
@@ -65,7 +68,7 @@ from tps_sources import PERFORMANCE_PATH, TpsMonitor, performance_signature, sav
 from usage_store import UsageStore, WeeklyLedger, hint_line as usage_hint_line, insights as usage_insights
 
 
-APP_NAME = "CodexQuotaTray"
+APP_NAME = app_identity.APP_NAME
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / APP_NAME
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 # Shown providers (key -> icon letter), in registry order; see providers.py.
@@ -173,7 +176,7 @@ IQ_STATE_PATH = DATA_DIR / "model_iq.json"
 IQ_CONFIG_PATH = DATA_DIR / "model_iq_config.json"     # AI Stupid Level key + chosen models
 GROK_IQ_PATH = DATA_DIR / "grok_iq.json"               # LiveBench overall for the Grok column
 # Providers whose quota resets raise a Windows notification.
-RESET_NOTIFY = {part.strip().lower() for part in (os.environ.get("CODEX_QUOTA_RESET_NOTIFY") or "codex,grok,claude").split(",") if part.strip()}
+RESET_NOTIFY = {part.strip().lower() for part in (os.environ.get("CIRCLOW_RESET_NOTIFY") or "codex,grok,claude").split(",") if part.strip()}
 RESET_NOTIFY_MIN_GAIN = 10.0     # percentage points regained before it counts as a reset
 
 
@@ -562,7 +565,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                 self.toggle_startup,
                 checked=lambda _: self.startup_enabled(),
             ),
-            pystray.MenuItem(lambda _: "退出全部", self.exit_app),
+            pystray.MenuItem(lambda _: "退出 环流 (Circlow)", self.exit_app),
         )
 
     def menu_quota(self, provider: str) -> str:
@@ -1053,38 +1056,44 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
     @staticmethod
     def startup_path() -> Path:
         """Legacy Startup-folder script written by earlier versions."""
-        return Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Startup" / f"{APP_NAME}.cmd"
+        return Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Startup" / f"{app_identity.LEGACY_NAME}.cmd"
 
     @staticmethod
-    def _run_value() -> str | None:
+    def _run_value(name: str = APP_NAME) -> str | None:
         import winreg
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-                return winreg.QueryValueEx(key, APP_NAME)[0]
+                return winreg.QueryValueEx(key, name)[0]
         except OSError:
             return None
 
     @staticmethod
-    def _set_run_value(command: str | None) -> None:
+    def _set_run_value(command: str | None, name: str = APP_NAME) -> None:
         import winreg
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             if command is None:
                 try:
-                    winreg.DeleteValue(key, APP_NAME)
+                    winreg.DeleteValue(key, name)
                 except FileNotFoundError:
                     pass
             else:
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, command)
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, command)
 
     def startup_enabled(self) -> bool:
         return self._run_value() is not None or self.startup_path().is_file()
 
     def migrate_startup(self) -> None:
         try:
+            # Older builds started from a Startup-folder script, and before
+            # the rename the Run value was named CodexQuotaTray (pointing at
+            # CodexQuotaTray.exe): either becomes this build's Run value.
             legacy = self.startup_path()
-            if legacy.is_file():
+            renamed = self._run_value(app_identity.LEGACY_NAME) is not None
+            if legacy.is_file() or renamed:
                 self._set_run_value(startup_command())
-                legacy.unlink()
+                legacy.unlink(missing_ok=True)
+                if renamed:
+                    self._set_run_value(None, app_identity.LEGACY_NAME)
         except (OSError, KeyError, ImportError):
             log.warning("startup migration skipped", exc_info=True)
 
@@ -1156,7 +1165,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
 
     def apply_preferences(self, prefs: dict) -> None:
         """Settings-page choices; an explicitly set environment variable still wins."""
-        if not os.environ.get("CODEX_QUOTA_HERDR") and "herdr" in prefs:
+        if not os.environ.get("CIRCLOW_HERDR") and "herdr" in prefs:
             herdr = self.tps_monitor.herdr
             herdr.enabled = bool(prefs["herdr"])
             herdr.status = herdr.status if herdr.enabled else "未启用"

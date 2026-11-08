@@ -14,7 +14,7 @@ try {
     $destination = Join-Path $PSScriptRoot 'claude-status.json'
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
     # Several sessions redraw their status lines at once; one writer at a time.
-    $mutex = New-Object System.Threading.Mutex($false, 'Local\CodexQuotaTrayClaudeStatus')
+    $mutex = New-Object System.Threading.Mutex($false, 'Local\CirclowClaudeStatus')
     $held = $false
     try { $held = $mutex.WaitOne(3000) } catch [System.Threading.AbandonedMutexException] { $held = $true }
     try {
