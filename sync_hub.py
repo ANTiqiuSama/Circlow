@@ -252,7 +252,9 @@ def combine(performance: dict, live: dict[str, dict], hub_now: float, me: str, n
     """`performance` (this device's, from TpsMonitor.poll) with the other
     devices' live TPS folded in, so every device shows the same figures:
 
-    - the TPS shown is the most recent reply's, on whichever device it ran;
+    - the TPS shown is the total: the speeds of every device generating right
+      now (working, with a reply in the last SAMPLE_AGE seconds) add up; with
+      none generating, the most recent reply's, on whichever device it ran;
     - the 60 s output and the number of working sessions add up;
     - each source keeps this device's own figure as local_tps / local_active
       / local_output_tps_60, and names the other working devices in `devices`.
@@ -275,6 +277,7 @@ def combine(performance: dict, live: dict[str, dict], hub_now: float, me: str, n
         local_tps, local_active, local_tokens = data.get("display_tps"), int(data.get("active_sessions") or 0), int(data.get("output_tokens_60") or 0)
         sample = data.get("last_sample_at")
         best = (now - sample, local_tps, data.get("display_model")) if sample and local_tps is not None else None
+        running = [best] if best is not None and local_active and best[0] <= SAMPLE_AGE else []
         active, tokens, devices = local_active, local_tokens, []
         for label, late, rows in others:
             remote = rows.get(provider)
@@ -288,13 +291,22 @@ def combine(performance: dict, live: dict[str, dict], hub_now: float, me: str, n
                 continue
             active += remote_active
             tokens += remote_tokens
-            if remote_tps is not None and age is not None and age <= SAMPLE_AGE and (best is None or age < best[0]):
-                best = (age, remote_tps, remote.get("model"))
+            if remote_tps is not None and age is not None and age <= SAMPLE_AGE:
+                if best is None or age < best[0]:
+                    best = (age, remote_tps, remote.get("model"))
+                if remote_active:
+                    running.append((age, remote_tps, remote.get("model")))
             if remote_active or remote_tokens or (remote_tps is not None and age is not None and age <= SAMPLE_AGE):
                 devices.append({"label": label, "tps": remote_tps, "active": remote_active})
         row.update(local_tps=local_tps, local_active=local_active, local_output_tps_60=data.get("output_tps_60", 0.0),
                    devices=devices, active_sessions=active, output_tokens_60=tokens, output_tps_60=round(tokens / 60, 2))
-        if best is not None:
+        if running:
+            # Several devices generating at once: their speeds add up.
+            age, _tps, model = min(running, key=lambda item: item[0])
+            tps = round(sum(item[1] for item in running), 1)
+            row.update(display_tps=tps, generation_tps=tps, display_model=model or data.get("display_model"),
+                       last_sample_at=now - age)
+        elif best is not None:
             age, tps, model = best
             row.update(display_tps=tps, generation_tps=tps, display_model=model or data.get("display_model"),
                        last_sample_at=now - age)

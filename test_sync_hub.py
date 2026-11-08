@@ -332,12 +332,13 @@ class LiveTpsTests(unittest.TestCase):
         payload = sync_hub.live_payload(perf({"codex": (90.0, 9_990.0, 1, 600), "grok": (None, None, 0, 0)}), self.NOW, "PC")
         self.assertEqual(payload["providers"], {"codex": {"active": 1, "tps": 90.0, "age": 10.0, "model": "codex-model", "tokens_60": 600}})
 
-    def test_every_device_shows_the_newest_reply_and_the_summed_output(self):
+    def test_every_device_shows_the_total_tps_and_the_summed_output(self):
         local = perf({"codex": (60.0, self.NOW - 40, 1, 1200), "claude": (30.0, self.NOW - 20, 0, 0)})
         live, hub_now = self.remote({"codex": (95.0, 7_000.0 - 5, 2, 600)}, late=2.0)
         merged = sync_hub.combine(local, live, hub_now, "win-pc", self.NOW)
         codex = merged["providers"]["codex"]
-        self.assertEqual(codex["display_tps"], 95.0)                    # the Mac's reply is newer (7 s vs 40 s)
+        self.assertEqual(codex["display_tps"], 155.0)                   # both generating: 60 + 95
+        self.assertEqual(codex["generation_tps"], 155.0)
         self.assertEqual(codex["display_model"], "codex-model")
         self.assertAlmostEqual(codex["last_sample_at"], self.NOW - 7)
         self.assertEqual((codex["active_sessions"], codex["output_tokens_60"], codex["output_tps_60"]), (3, 1800, 30.0))
@@ -347,6 +348,29 @@ class LiveTpsTests(unittest.TestCase):
         self.assertEqual(merged["providers"]["claude"]["devices"], [])
         self.assertEqual((merged["total_output_tps_60"], merged["local_total_output_tps_60"]), (30.0, 20.0))
         self.assertEqual(local["providers"]["codex"]["display_tps"], 60.0)      # the input is left alone
+
+    def test_only_devices_generating_now_add_up(self):
+        # The Mac finished a reply 7 s ago and is idle; this PC is generating: 60, not 155.
+        local = perf({"codex": (60.0, self.NOW - 40, 1, 1200)})
+        live, hub_now = self.remote({"codex": (95.0, 7_000.0 - 5, 0, 0)}, late=2.0)
+        codex = sync_hub.combine(local, live, hub_now, "win-pc", self.NOW)["providers"]["codex"]
+        self.assertEqual((codex["display_tps"], codex["local_tps"]), (60.0, 60.0))
+        # Nobody generating: the most recent reply's speed, wherever it ran.
+        local = perf({"codex": (60.0, self.NOW - 40, 0, 0)})
+        codex = sync_hub.combine(local, live, hub_now, "win-pc", self.NOW)["providers"]["codex"]
+        self.assertEqual(codex["display_tps"], 95.0)
+        # A working device whose last reply is too old to show adds nothing.
+        local = perf({"codex": (60.0, self.NOW - sync_hub.SAMPLE_AGE - 1, 1, 0)})
+        live, hub_now = self.remote({"codex": (95.0, 7_000.0 - 5, 1, 600)}, late=2.0)
+        codex = sync_hub.combine(local, live, hub_now, "win-pc", self.NOW)["providers"]["codex"]
+        self.assertEqual(codex["display_tps"], 95.0)
+        # Three devices at once.
+        live["mac-mini"] = {"received_at": hub_now - 1, "payload": sync_hub.live_payload(
+            perf({"codex": (40.5, 7_000.0 - 3, 1, 300)}), 7_000.0, "Mac · mini")}
+        local = perf({"codex": (60.0, self.NOW - 2, 1, 1200)})
+        codex = sync_hub.combine(local, live, hub_now, "win-pc", self.NOW)["providers"]["codex"]
+        self.assertEqual(codex["display_tps"], 195.5)
+        self.assertEqual(codex["local_tps"], 60.0)
 
     def test_both_devices_agree(self):
         """Windows folds in the Mac and the Mac folds in Windows: the same figures."""
@@ -404,7 +428,7 @@ class LiveTpsTests(unittest.TestCase):
         tray.live = mock.Mock(device="win-pc")
         tray.live.view.return_value = self.remote({"codex": (95.0, 7_000.0 - 5, 2, 600)})
         merged = tray.with_other_devices(perf({"codex": (60.0, self.NOW - 40, 1, 1200)}), self.NOW)
-        self.assertEqual(merged["providers"]["codex"]["display_tps"], 95.0)
+        self.assertEqual(merged["providers"]["codex"]["display_tps"], 155.0)       # both generating: the total
         tray.live = None
         local = perf({"codex": (60.0, self.NOW - 40, 1, 1200)})
         self.assertIs(tray.with_other_devices(local, self.NOW), local)

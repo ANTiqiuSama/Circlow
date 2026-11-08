@@ -4,8 +4,9 @@ borderless, non-activating NSPanel under its menu bar item.
 Same model as hover_details.HoverDetails: a timer on the AppKit main thread
 polls the pointer and mouse buttons, opens the panel after a short dwell on a
 status item, steps the scene with that input and presents a frame only when
-something moved. The panel never takes focus; it closes once the pointer has
-left both the item and the panel for PANEL_GRACE seconds.
+something moved. The panel never takes focus; it disappears the moment the
+pointer is on neither the item, the visible card, nor the short bridge between
+them: no grace period and no fade-out.
 
 Geometry is kept in screen points with Cocoa's bottom-left origin; the scene
 works in panel points with a top-left origin (its logical units), so the
@@ -23,6 +24,9 @@ log = logging.getLogger("Circlow")
 
 DWELL = 0.4                 # pointer rest on an item before its panel opens
 GAP = 6                     # menu bar bottom to the card's top edge, in points
+CARD_SLACK = 2              # points around the visible card that still count as on it
+BRIDGE_SLACK = 16           # either side of the item: the way down to the card
+SWITCH_SECONDS = 0.35       # back on an item this soon after leaving: no dwell
 
 
 def contains(frame, point, slack: float = 0.0) -> bool:
@@ -42,6 +46,22 @@ def panel_origin(anchor, size, visible) -> tuple[float, float]:
     x = max(vx, min(x, vx + vw - width))
     top = ay - GAP + MARGIN
     return x, max(vy, top - height)
+
+
+def over_panel(point, frame, anchor) -> bool:
+    """On the visible card (the panel frame minus its transparent shadow
+    margin) or on the strip between the item and the card's top edge, a little
+    wider than the item, so moving down from the item never drops the panel."""
+    if point is None or frame is None:
+        return False
+    (x, y), (w, h) = frame
+    if contains(((x + MARGIN, y + MARGIN), (w - 2 * MARGIN, h - 2 * MARGIN)), point, CARD_SLACK):
+        return True
+    if anchor is None:
+        return False
+    (ax, ay), (aw, _ah) = anchor
+    top = y + h - MARGIN
+    return contains(((ax - BRIDGE_SLACK, top), (aw + 2 * BRIDGE_SLACK, max(0.0, ay - top) + 1)), point)
 
 
 def local_point(frame, point) -> tuple[float, float]:
@@ -125,7 +145,7 @@ def panel_class():
 class PanelWindow:
     """One NSPanel reused for every source; the scene is rebuilt on open."""
 
-    OPEN_SECONDS, CLOSE_SECONDS = 0.2, 0.14
+    OPEN_SECONDS = 0.2
     AMBIENT_SECONDS = 1 / 30 - 0.004
 
     def __init__(self):
@@ -174,7 +194,7 @@ class PanelWindow:
         self.anchor = None
         self.visible_frame = None
         self.scale = 2.0
-        self.opened_at = self.closing_at = None
+        self.opened_at = None
         self.frame = None            # ((x, y), (w, h)) as last placed
         self.size = None             # current image size in points
         self.drawn_at = 0.0
@@ -185,9 +205,9 @@ class PanelWindow:
         return self.provider is not None
 
     def open(self, provider, model, anchor, screen, now):
-        if self.provider is None or self.closing_at is not None:
+        if self.provider is None:
             self.scene = agent_panel.Scene()
-            self.opened_at, self.closing_at = now, None
+            self.opened_at = now
             self.has_image = False
         scale = float(screen.backingScaleFactor()) if screen is not None else 2.0
         if scale != self.scale or anchor != self.anchor:
@@ -203,9 +223,8 @@ class PanelWindow:
     def contains(self, point, slack: float = 6) -> bool:
         return self.frame is not None and contains(self.frame, point, slack)
 
-    def close(self, now):
-        if self.provider is not None and self.closing_at is None:
-            self.closing_at = now
+    def over(self, point) -> bool:
+        return over_panel(point, self.frame, self.anchor)
 
     def step(self, point, left, right, now):
         """Advance the scene and present a frame if one is due; returns its events."""
@@ -213,15 +232,8 @@ class PanelWindow:
         scene = self.scene
         local = local_point(self.frame, point) if self.frame is not None and (inside or scene.dragging) else None
         events = scene.step(now, local, left and (inside or bool(scene.press)), right and inside)
-        if self.closing_at is not None:
-            progress = min(1.0, (now - self.closing_at) / self.CLOSE_SECONDS)
-            if progress >= 1:
-                self.hide()
-                return []
-            alpha, lift = 1 - progress, -4 * progress
-        else:
-            progress = agent_panel.ease_out_cubic((now - self.opened_at) / self.OPEN_SECONDS)
-            alpha, lift = progress, 10 * (1 - progress)
+        progress = agent_panel.ease_out_cubic((now - self.opened_at) / self.OPEN_SECONDS)
+        alpha, lift = progress, 10 * (1 - progress)
         if (not self.has_image or scene.dirty or scene.animating
                 or scene.ambient and now - self.drawn_at >= self.AMBIENT_SECONDS):
             image = scene.render(self.scale)
@@ -245,7 +257,7 @@ class PanelWindow:
 
     def hide(self):
         self.panel.orderOut_(None)
-        self.provider = self.frame = self.closing_at = None
+        self.provider = self.frame = None
         self.has_image = False
 
 
@@ -257,7 +269,6 @@ class MacHoverPanel:
     source for the refresh scheduler; on_settings(provider, page) handles the
     panel's settings gear and right-click."""
 
-    PANEL_GRACE = 0.45
     PANEL_REFRESH = 0.5
     RETRY_SECONDS = 2.0
     FAST, SLOW = 1 / 60, 0.1
@@ -267,8 +278,8 @@ class MacHoverPanel:
         self.window: PanelWindow | None = None
         self.candidate = None
         self.entered_at = 0.0
-        self.panel_seen = 0.0
         self.panel_built = 0.0
+        self.left_at = -1e9                  # when the pointer last moved off a shown panel
         self.retry_at = 0.0
         self.menu_open: str | None = None    # a status menu is tracking: no panel meanwhile
         self.suppressed: set[str] = set()    # clicked items stay quiet until the pointer leaves them
@@ -375,11 +386,12 @@ class MacHoverPanel:
                 elif window is not None:
                     if provider != self.candidate:
                         self.candidate, self.entered_at = provider, now
-                    if provider and now - self.entered_at >= DWELL:
+                    # Sliding from one item to the next reopens at once.
+                    if provider and (now - self.entered_at >= DWELL or now - self.left_at <= SWITCH_SECONDS):
                         model = self.tray.panel(provider)
                         if model is not None:
                             window.open(provider, model, anchor, screen, now)
-                            self.panel_seen = self.panel_built = now
+                            self.panel_built = now
                             window.step(point, left, right, now)
                 shown = window.provider if window is not None and window.active else None
         except Exception:
@@ -403,19 +415,19 @@ class MacHoverPanel:
         if provider and provider != window.provider and not window.scene.dragging:
             model = self.tray.panel(provider)
             if model is None:
-                window.close(now)
+                window.hide()
                 return
             window.open(provider, model, anchor, screen, now)
-        over = window.contains(point) or provider == window.provider
-        if over or window.scene.dragging:
-            self.panel_seen = now
-        elif now - self.panel_seen > self.PANEL_GRACE or (left or right) and not window.contains(point, 40):
-            window.close(now)
-        if (now - self.panel_built >= self.PANEL_REFRESH and window.closing_at is None
+        if provider != window.provider and not window.over(point) and not window.scene.dragging:
+            # Off the item and the card: gone at once, no grace period or fade.
+            window.hide()
+            self.left_at = now
+            return
+        if (now - self.panel_built >= self.PANEL_REFRESH
                 and not window.scene.press and not window.scene.dragging):
             model = self.tray.panel(window.provider)
             if model is None:
-                window.close(now)
+                window.hide()
                 return
             window.refresh(model, now)
             self.panel_built = now

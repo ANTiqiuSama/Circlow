@@ -372,7 +372,10 @@ class SceneTests(unittest.TestCase):
         y = round(agent_panel.MARGIN + agent_panel.METER_TOP + agent_panel.header_offset(shared) + 55)
         box = (x, y, x + 40, y + 12)
         self.assertNotEqual(frames[0].crop(box).tobytes(), frames[1].crop(box).tobytes())
-        self.assertEqual(shared.header, mine.header)       # drawn per frame, not in the cached background
+        # The figure is drawn per frame; the cached background only knows sync is on.
+        self.assertEqual(mine.header, replace(mine, local_tps=80.0).header)
+        self.assertEqual((shared.tps_label, mine.tps_label), ("TPS", "总 TPS"))
+        self.assertEqual(replace(mine, provider="gemini").tps_label, "")
 
     def test_daily_usage_switches_units_and_promotes_rounded_boundaries(self):
         cases = [(None, ("—", "")), (0, ("0", "")), (999, ("999", "")), (1000, ("1", "K")),

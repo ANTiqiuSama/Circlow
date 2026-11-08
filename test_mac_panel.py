@@ -42,6 +42,20 @@ class GeometryTest(unittest.TestCase):
         self.assertTrue(mac_panel.contains(frame, (114, 30), slack=6))
 
 
+    def test_only_the_card_and_the_way_down_to_it_keep_the_panel(self):
+        size = (448.0, 467.0)
+        frame = (mac_panel.panel_origin(self.ANCHOR, size, self.VISIBLE), size)
+        (x, y), (w, h) = frame
+        card_top = y + h - MARGIN
+        self.assertTrue(mac_panel.over_panel((x + w / 2, y + h / 2), frame, self.ANCHOR))       # the card
+        self.assertTrue(mac_panel.over_panel((1078, card_top + 3), frame, self.ANCHOR))          # gap under the item
+        self.assertTrue(mac_panel.over_panel((1063 - 10, card_top + 3), frame, self.ANCHOR))     # a little to its side
+        self.assertFalse(mac_panel.over_panel((x + MARGIN / 2, y + h / 2), frame, self.ANCHOR))  # shadow margin only
+        self.assertFalse(mac_panel.over_panel((x + 40, card_top + 3), frame, self.ANCHOR))       # gap far from the item
+        self.assertFalse(mac_panel.over_panel((x + w / 2, y + MARGIN - 6), frame, self.ANCHOR))  # under the card
+        self.assertFalse(mac_panel.over_panel(None, frame, self.ANCHOR))
+
+
 class HoverPanelLogicTest(unittest.TestCase):
     def controller(self):
         icons = {"codex": Mock(details_visible=False), "grok": Mock(details_visible=False)}

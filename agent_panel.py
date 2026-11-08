@@ -136,7 +136,15 @@ class PanelModel:
                 tuple((item[0], item[2] if len(item) > 2 else "", self.tone_of(slot)) for slot, item in enumerate(self.quota[:3])),
                 (self.banner, self.banner_alert, self.intel, self.intel_note),
                 (self.forecast, self.forecast_tone), self.provider == "mimo", chart_extra_for(self),
-                self.column_iq, self.provider != "gemini")
+                self.column_iq, self.tps_label)
+
+    @property
+    def tps_label(self) -> str:
+        """The TPS column's title; empty when there is none (Gemini). With
+        multi-device sync the figure is every device's total, "本机" its own."""
+        if self.provider == "gemini":
+            return ""
+        return "总 TPS" if self.local_tps is not None else "TPS"
 
 
 METER_TOP = PAD + 32        # Top of the quota / TPS row.
@@ -1748,14 +1756,14 @@ def _background(header: tuple, field_h: int, scale: float) -> Image.Image:
     y = METER_TOP + header_offset(model)
     label_font, small = ui_font(px(11)), ui_font(px(10))
     columns = meter_columns(len(meters) + daily, show_tps)
-    labels = tuple(meters) + ((("今日用量", "", ""),) if daily else ()) + ((("TPS", "", ""),) if show_tps else ())
+    labels = tuple(meters) + ((("今日用量", "", ""),) if daily else ()) + (((show_tps, "", "tps"),) if show_tps else ())
     for (x, end), (label, reset, column_tone) in zip(columns, labels):
         draw.text((px(x), px(y)), label, font=label_font, fill=MUTED_TEXT, anchor="lt")
         if daily and label == "今日用量":
             if reset:
                 draw.text((px(x), px(y + 51)), reset, font=small, fill=MUTED_TEXT, anchor="lt")
             continue
-        if label != "TPS":
+        if column_tone != "tps":
             draw.rounded_rectangle((px(x), px(y + 45), px(end), px(y + 49)), radius=px(2), fill=TRACK)
             if reset:
                 ink = {"active": accent(letter), "paid": PAID, "blocked": CLAY}.get(column_tone, MUTED_TEXT)
