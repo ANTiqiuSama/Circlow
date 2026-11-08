@@ -181,6 +181,31 @@ class HoverTests(unittest.TestCase):
         for slot in tray.slots:
             slot.ensure_registered.assert_called_once()
 
+    def test_only_newer_readings_replace_the_one_shown(self):
+        now = time.time()
+        tray = QuotaTray.__new__(QuotaTray)
+        shown = QuotaSnapshot("claude", "Claude Code", 300, 30, 70, int(now + 3600), now, False, None)
+        tray.snapshots = {"claude": shown}
+        older = QuotaSnapshot("claude", "Claude Code", 300, 20, 80, int(now + 3600), now - 60, False, None)
+        self.assertFalse(tray.accept_snapshot("claude", older, "status line"))      # an idle session's old figure
+        self.assertIs(tray.snapshots["claude"], shown)
+        newer = QuotaSnapshot("claude", "Claude Code", 300, 35, 65, int(now + 3600), now + 5, False, None)
+        self.assertTrue(tray.accept_snapshot("claude", newer, "refresh"))
+        same_time = QuotaSnapshot("claude", "Claude Code", 300, 35, 65, int(now + 3600), now + 5, True, "读取超时")
+        self.assertTrue(tray.accept_snapshot("claude", same_time, "refresh"))       # a stale carry-forward of it
+        failed = QuotaSnapshot("gemini", "Gemini", None, None, None, None, None, False, "读取 /usage 失败")
+        tray.snapshots["gemini"] = QuotaSnapshot("gemini", "Gemini", 300, 10, 90, int(now + 3600), now, False, None)
+        self.assertTrue(tray.accept_snapshot("gemini", failed, "refresh"))          # an error always shows
+        self.assertTrue(tray.accept_snapshot("grok", older, "refresh"))             # nothing shown yet
+        with patch("tray_app.collect", return_value={"claude": older}):
+            tray.scheduler = Mock(running={"claude"}, completed=Mock())
+            tray.scheduler.providers = ["claude"]
+            tray.history, tray.icons, tray.scheduler.duration = None, {}, {}
+            tray.announce_resets = Mock()
+            tray.update_ui = Mock()
+            tray.refresh_providers(["claude"])
+        self.assertIs(tray.snapshots["claude"], same_time)                        # the refresh thread cannot go back either
+
     def test_build_stamp_reads_the_builds_json_with_its_bom_or_says_source(self):
         import tempfile
         from pathlib import Path
@@ -234,7 +259,7 @@ class HoverTests(unittest.TestCase):
         live = slot_type()
         live.icon_failed, live.title, live.details_visible = True, "", False
         tray.icons = {"codex": live}
-        with patch.object(tray_app, "make_display_icon", return_value=same):
+        with patch("tray_slots.make_display_icon", return_value=same):
             tray.update_icon("codex", "C")
             live.icon_failed = False
             tray.update_icon("codex", "C")             # ...but not when the Shell took it
@@ -256,10 +281,10 @@ class HoverTests(unittest.TestCase):
         tray.snapshots = {"codex": None}
         tray.performance = {"providers": {"codex": {}}}
         tray.tooltip = Mock(return_value="details")
-        with patch("tray_app.make_display_icon", return_value=image.copy()):
+        with patch("tray_slots.make_display_icon", return_value=image.copy()):
             tray.update_icon("codex", "C")
         self.assertIs(icon.icon, image)
-        with patch("tray_app.make_display_icon", return_value=Image.new("RGBA", (64, 64), "red")):
+        with patch("tray_slots.make_display_icon", return_value=Image.new("RGBA", (64, 64), "red")):
             tray.update_icon("codex", "C")
         self.assertNotEqual(icon.icon, image)
 
@@ -296,7 +321,7 @@ class HoverTests(unittest.TestCase):
         tray.performance = {"providers": {"codex": {"active_sessions": 1, "display_tps": 200.0}}}
         tray.tooltip = Mock(return_value="最近TPS 200.0")
         tps = Image.new("RGBA", (64, 64), "red")
-        with patch("tray_app.make_display_icon", return_value=tps):
+        with patch("tray_slots.make_display_icon", return_value=tps):
             tray.update_icon("codex", "C")                 # generation started while the panel was open
         self.assertIs(icon.icon, tps)
         self.assertEqual(icon.title, "最近TPS 200.0")
@@ -428,7 +453,7 @@ class SteadyStateCostTests(unittest.TestCase):
         tracker = SimpleNamespace(ledger=ledger, view=lambda now=None: None)
         app = SimpleNamespace(tps_monitor=monitor, mimo_ingested=0, mimo_view_at=time.time(),
                               snapshots={"mimo": SimpleNamespace(remaining_percent=None)})
-        with patch.object(tray_app, "mimo_tracker", return_value=tracker):
+        with patch("local_sync.mimo_tracker", return_value=tracker):
             QuotaTray.update_mimo_locally(app, time.time())
             events.append(SimpleNamespace(identity="5", provider="mimo"))
             monitor.added_total = 6

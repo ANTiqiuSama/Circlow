@@ -30,6 +30,7 @@ if sys.platform == "darwin":
     os.environ["PATH"] = os.pathsep.join(dict.fromkeys(os.environ.get("PATH", "").split(os.pathsep) + extra))
 
 import herdr_source
+import launchers
 import mimo_usage
 import providers
 from agent_panel import compact_usage
@@ -40,8 +41,7 @@ from tps_sources import TpsMonitor, save_performance
 from tray_icons import make_display_icon, quota_exhausted, stale_note
 
 
-# Sources whose "打开来源" starts the agent in a new Herdr workspace.
-HERDR_AGENTS = {"claude", "grok"}
+HERDR_AGENTS = launchers.HERDR_AGENTS      # "打开来源" starts these in a new Herdr workspace
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "Library/Application Support")) / APP_NAME
 log = logging.getLogger(APP_NAME)
 
@@ -133,6 +133,22 @@ def bar_order(keys: list[str]) -> list[str]:
     Gemini, Grok, MiMo from left to right, like the Windows tray."""
     rank = {key: index for index, key in enumerate(providers.TRAY_POSITIONS)}
     return sorted(keys, key=lambda key: rank.get(key, len(rank)), reverse=True)
+
+
+def open_source(key: str, state, popen=subprocess.Popen) -> str | None:
+    """"打开来源": the first of launchers.ways that applies here; returns the
+    kind that was used, None when nothing could be opened."""
+    for way in launchers.ways(key, "darwin"):
+        if way.kind == "url":
+            webbrowser.open(str(way.target))
+        elif way.kind == "mac-app":
+            popen(["open", "-a", way.target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif way.kind == "herdr":
+            state.open_in_herdr(key)
+        elif not open_cli(key, popen):
+            continue
+        return way.kind
+    return None
 
 
 def open_cli(key: str, popen=subprocess.Popen) -> bool:
@@ -370,16 +386,7 @@ def run_mac() -> int:
             state.request(str(sender.representedObject()))
 
         def openSource_(self, sender):
-            key = str(sender.representedObject())
-            if key == "mimo":
-                webbrowser.open("https://platform.xiaomimimo.com/console/plan-manage")
-            elif key in ("codex", "gemini"):
-                name = "Codex" if key == "codex" else "Antigravity"
-                subprocess.Popen(["open", "-a", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif key in HERDR_AGENTS and herdr_source.find_exe():
-                state.open_in_herdr(key)
-            else:
-                open_cli(key)
+            open_source(str(sender.representedObject()), state)
 
         def quitApp_(self, _sender):
             state.stop.set()

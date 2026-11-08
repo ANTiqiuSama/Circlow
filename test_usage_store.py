@@ -146,6 +146,42 @@ class UsageStoreTests(unittest.TestCase):
         self.assertTrue(lines[0].startswith("周额度：1 天后重置"))
         self.assertFalse(any(line.startswith("周额度") for line in insights(store, "grok", now, weekly=idle, weekly_quota=(15, reset))))
 
+    def test_completed_weeks_are_recorded_once_and_inform_the_weekly_tips(self):
+        from usage_store import WeeklyLedger, last_completed_week, weeks_line
+        now = time.mktime((2026, 11, 7, 15, 0, 0, 0, 0, -1))
+        week = 7 * 86400
+        reset = int(time.mktime((2026, 11, 3, 11, 2, 0, 0, 0, -1)))
+        readings = [Sample(reset - week + 3600 * k, min(62, k), reset) for k in range(0, 160, 8)]
+        readings += [Sample(reset - 600, 62, reset), Sample(reset + 600, 0, reset + week), Sample(now, 30, reset + week)]
+        done = last_completed_week(readings)
+        self.assertEqual((done["reset_at"], done["used"], done["left"]), (reset, 62, 38))
+        self.assertIsNone(last_completed_week(readings[:-2]))                                  # no reset yet
+        store = UsageStore(self.path)
+        for day in range(1, 6):
+            store.note(reply(f"w{day}", reset - day * 86400, 10_000, provider="grok"))
+        ledger = WeeklyLedger(self.folder / "weekly.json")
+        self.assertTrue(ledger.note("grok", "grok", readings, store))
+        self.assertFalse(ledger.note("grok", "grok", readings, store))                        # recorded once
+        earlier = [Sample(reset - 2 * week + 3600 * k, min(85, k), reset - week) for k in range(0, 168, 8)]
+        earlier += [Sample(reset - week - 300, 85, reset - week), Sample(reset - week + 300, 0, reset)]
+        self.assertTrue(ledger.note("grok", "grok", earlier, store))                           # an older week, by its reset
+        again = WeeklyLedger(self.folder / "weekly.json")                                       # saved to disk
+        recent = again.recent("grok")
+        self.assertEqual([(row["used"], row["tokens"]) for row in recent], [(62.0, 50_000), (85.0, 0)])   # newest first
+        self.assertEqual(weeks_line(recent), "近几周：周额度用掉 62% · 85%（最新在前）")
+        self.assertEqual(weeks_line(recent[:1]), "近几周：周额度用掉 62%")
+        self.assertEqual(weeks_line([]), "")
+        leftover = usage_store.weekly_leftover(readings, reset + 3600)
+        line = usage_store.weekly_line(store, "grok", leftover, reset + 3600, recent)
+        self.assertIn("；近 2 周有 1 周没用完，本周可多用", line)
+        flat = [Sample(now - 7200, 40, int(now + 86400)), Sample(now, 40, int(now + 86400))]
+        spare = usage_store.weekly_spare(flat, now, 60, int(now + 86400))
+        full = [{"reset_at": 1.0, "used": 95.0, "tokens": 0}, {"reset_at": 2.0, "used": 90.0, "tokens": 0}]
+        self.assertIn("；近 2 周都用完了，趁重置前多用", usage_store.spare_line(store, "grok", spare, now, full))
+        lines = insights(store, "grok", now, weekly=flat, weekly_quota=(60, int(now + 86400)), weeks=recent)
+        self.assertTrue(lines[0].startswith("周额度：1 天后重置"))
+        self.assertEqual(lines[1], "近几周：周额度用掉 62% · 85%（最新在前）")
+
     def test_a_weekly_reset_with_much_left_unused_is_pointed_out(self):
         now = time.mktime((2026, 11, 3, 15, 0, 0, 0, 0, -1))
         reset = int(time.mktime((2026, 11, 3, 11, 2, 0, 0, 0, -1)))

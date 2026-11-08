@@ -921,6 +921,7 @@ class HerdrAndHelperTests(unittest.TestCase):
         threads = []
         with patch.object(herdr_source, "find_exe", return_value="herdr.exe"), \
                 patch.object(herdr_source, "raise_client") as raise_client, \
+                patch.object(tray_app.provider_registry, "claude_desktop_aumid", return_value=None), \
                 patch.object(tray_app.threading, "Thread") as thread:
             thread.side_effect = lambda **kwargs: threads.append(kwargs) or Mock()
             for provider in ("claude", "claude", "grok"):
@@ -930,6 +931,35 @@ class HerdrAndHelperTests(unittest.TestCase):
         with patch.object(herdr_source, "start_agent", return_value="claude"):
             tray.open_in_herdr("claude")
         self.assertNotIn("claude", tray.herdr_opening)                                # finished: clicks work again
+
+    def test_the_claude_icon_opens_the_claude_app_when_it_is_installed(self):
+        import herdr_source
+        import tray_app
+        tray = tray_app.QuotaTray.__new__(tray_app.QuotaTray)
+        shell = Mock(return_value=42)
+        with patch.object(tray_app.provider_registry, "claude_desktop_aumid", return_value="Claude_pzs8sxrjxfjjc!Claude"), \
+                patch.object(herdr_source, "find_exe", return_value="herdr.exe"), \
+                patch.object(herdr_source, "raise_client") as raise_client, \
+                patch("ctypes.windll.shell32.ShellExecuteW", shell):
+            import launchers
+            self.assertEqual([(w.kind, w.fallback) for w in launchers.ways("claude", "win32")],
+                             [("aumid", True), ("herdr", False), ("cli", False)])
+            self.assertEqual([w.kind for w in launchers.ways("grok", "win32")], ["herdr", "cli"])
+            self.assertEqual([w.kind for w in launchers.ways("codex", "win32")], ["aumid"])
+            self.assertEqual([(w.kind, w.target) for w in launchers.ways("mimo", "darwin")],
+                             [("url", "https://platform.xiaomimimo.com/console/plan-manage")])
+            self.assertEqual([w.kind for w in launchers.ways("gemini", "darwin")], ["mac-app"])
+            tray.open_provider("claude")
+            self.assertEqual(shell.call_args.args[2], "shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude")
+            raise_client.assert_not_called()                                   # no Herdr workspace started
+            shell.return_value = 2                                             # the app would not start...
+            with patch.object(tray_app.threading, "Thread") as thread:
+                thread.return_value = Mock()
+                tray.open_provider("claude")
+            raise_client.assert_called_once()                                  # ...so Claude Code in Herdr instead
+        import os
+        with patch.dict(os.environ, {"CODEX_QUOTA_CLAUDE_APP": "X_y!Claude"}):
+            self.assertEqual(tray_app.provider_registry.claude_desktop_aumid(), "X_y!Claude")
 
     @staticmethod
     def agent(key, **extra):

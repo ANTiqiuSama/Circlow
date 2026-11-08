@@ -216,41 +216,127 @@ def weekly_spare(samples: Iterable[Any], now: float, remaining: float | None, re
     return {"reset_at": float(resets_at), "spare": spare, "remaining": float(remaining), "rate": rate}
 
 
-def spare_line(store: UsageStore, provider: str, spare: dict, now: float) -> str:
-    """"周额度：…" for a weekly window that will reset with quota unused, and
-    what that is worth in this week's own output, when that is known."""
+def spare_line(store: UsageStore, provider: str, spare: dict, now: float, weeks: list[dict] = ()) -> str:
+    """"周额度：…" for a weekly window that will reset with quota unused, what
+    that is worth in this week's own output when known, and how the last
+    weeks went (WeeklyLedger.recent)."""
     text = f"周额度：{duration_text(spare['reset_at'] - now)}后重置，按现在的用法到时还剩约 {spare['spare']:.0f}%"
     used = 100.0 - spare["remaining"]
     week = sum(tokens for hour, tokens in store.hourly([provider], spare["reset_at"] - 7 * 86400).items() if hour < now)
     if used >= 10 and week > 0:
         text += f"（约 {_tokens(week / used * spare['spare'])} 输出 tokens）"
-    return text + "，趁重置前多用"
+    note = _weeks_note(list(weeks))
+    return text + (f"；{note}" if note else "") + "，趁重置前多用"
 
 
-def weekly_leftover(samples: Iterable[Any], now: float) -> dict | None:
-    """The weekly window that reset lately with plenty left: {"reset_at",
-    "left", "used", "since"} from the weekly window's quota readings
-    (forecast.Sample, glitches already out), or None. Only the latest reset
-    counts, it must be within WEEKLY_RECENT, the old week's last reading
-    within WEEKLY_LAST_READ of it, and at least WEEKLY_LEFTOVER left."""
+def last_completed_week(samples: Iterable[Any]) -> dict | None:
+    """The latest weekly reset in a window's quota readings (forecast.Sample,
+    glitches already out): {"reset_at", "used", "left", "since"}, with
+    "used" the old week's last reading. None when no reset is recorded, the
+    latest window change is not a reset (the window went back, or use did
+    not start over), or the old week's last reading is more than
+    WEEKLY_LAST_READ before the reset, so its end is unknown."""
     ordered = sorted(samples, key=lambda s: s.at)
     for before, after in reversed(list(zip(ordered, ordered[1:]))):
         if same_window(before.resets_at, after.resets_at):
             continue
         if (after.resets_at or 0) <= (before.resets_at or 0) or after.used >= before.used:
-            return None              # not a reset (the window went back, or use did not start over)
+            return None
         # An early reset (Codex can reset before schedule) lands at the first new reading.
         reset_at = min(before.resets_at, after.at) if before.resets_at else after.at
-        left = 100.0 - before.used
-        if now - reset_at > WEEKLY_RECENT or reset_at - before.at > WEEKLY_LAST_READ or left < WEEKLY_LEFTOVER:
+        if reset_at - before.at > WEEKLY_LAST_READ:
             return None
-        return {"reset_at": float(reset_at), "left": left, "used": before.used, "since": float(before.at)}
+        return {"reset_at": float(reset_at), "used": before.used, "left": 100.0 - before.used, "since": float(before.at)}
     return None
 
 
-def weekly_line(store: UsageStore, provider: str, leftover: dict, now: float) -> str:
-    """"周额度：…" for a weekly reset with quota left over, and what that
-    leftover was worth in last week's own output, when that is known."""
+def weekly_leftover(samples: Iterable[Any], now: float) -> dict | None:
+    """The weekly window that reset lately with plenty left (see
+    last_completed_week): within WEEKLY_RECENT, at least WEEKLY_LEFTOVER left."""
+    week = last_completed_week(samples)
+    if week is None or now - week["reset_at"] > WEEKLY_RECENT or week["left"] < WEEKLY_LEFTOVER:
+        return None
+    return week
+
+
+WEEKLY_PATH = USAGE_PATH.with_name("weekly.json")
+WEEKLY_KEEP = 26               # completed weeks kept per window
+
+
+class WeeklyLedger:
+    """One line per completed week of each weekly quota window: when it
+    reset, how much of it was used, and the output tokens it paid for. The
+    quota readings themselves are kept for days; this is what lets the
+    weekly tips look back over the last weeks."""
+
+    def __init__(self, path: Path = WEEKLY_PATH):
+        self.path = path
+        self.lock = Lock()
+        self.weeks: dict[str, list[dict]] = {}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            for name, rows in payload.get("windows", {}).items():
+                self.weeks[name] = [{"reset_at": float(row["reset_at"]), "used": float(row["used"]), "tokens": int(row.get("tokens") or 0)}
+                                    for row in rows]
+        except (OSError, ValueError, TypeError, KeyError):
+            self.weeks = {}
+
+    def note(self, name: str, provider: str, samples: Iterable[Any], store: UsageStore | None) -> bool:
+        """Record window `name`'s latest completed week (from its readings) if
+        it is not recorded yet; the tokens are the provider's output over
+        that week. Returns True when a week was added."""
+        week = last_completed_week(samples)
+        if week is None:
+            return False
+        with self.lock:
+            rows = self.weeks.setdefault(name, [])
+            if any(abs(row["reset_at"] - week["reset_at"]) <= 3600 for row in rows):
+                return False
+            tokens = 0
+            if store is not None:
+                tokens = sum(t for hour, t in store.hourly([provider], week["reset_at"] - 7 * 86400).items() if hour < week["reset_at"])
+            rows.append({"reset_at": week["reset_at"], "used": float(week["used"]), "tokens": int(tokens)})
+            rows.sort(key=lambda row: row["reset_at"])
+            del rows[:-WEEKLY_KEEP]
+            payload = {"windows": self.weeks}
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+                temporary.replace(self.path)
+            except OSError:
+                pass
+        return True
+
+    def recent(self, name: str, limit: int = 4) -> list[dict]:
+        """The last `limit` completed weeks, newest first."""
+        with self.lock:
+            return list(reversed(self.weeks.get(name, [])[-limit:]))
+
+
+def weeks_line(weeks: list[dict]) -> str:
+    """"近几周：周额度用掉 62% · 71% · 55%（最新在前）" from WeeklyLedger.recent."""
+    if not weeks:
+        return ""
+    used = " · ".join(f"{row['used']:.0f}%" for row in weeks)
+    return f"近几周：周额度用掉 {used}" + ("（最新在前）" if len(weeks) > 1 else "")
+
+
+def _weeks_note(weeks: list[dict]) -> str:
+    """How the last weeks went, for the weekly tips: "近 4 周有 3 周没用完" or
+    "近 4 周都用完了"; empty with fewer than two weeks."""
+    if len(weeks) < 2:
+        return ""
+    spare = sum(1 for row in weeks if 100.0 - row["used"] >= WEEKLY_LEFTOVER)
+    if spare == 0:
+        return f"近 {len(weeks)} 周都用完了"
+    return f"近 {len(weeks)} 周有 {spare} 周没用完"
+
+
+def weekly_line(store: UsageStore, provider: str, leftover: dict, now: float, weeks: list[dict] = ()) -> str:
+    """"周额度：…" for a weekly reset with quota left over, what that leftover
+    was worth in last week's own output when known, and how the weeks before
+    went (WeeklyLedger.recent, the week just ended included)."""
     moment = time.localtime(leftover["reset_at"])
     when = time.strftime("%H:%M" if local_day(leftover["reset_at"]) == local_day(now) else "%m-%d %H:%M", moment)
     text = f"周额度：{when} 刚重置；上周还剩 {leftover['left']:.0f}% 没用完"
@@ -258,11 +344,12 @@ def weekly_line(store: UsageStore, provider: str, leftover: dict, now: float) ->
                if hour < leftover["reset_at"])
     if leftover["used"] >= 10 and week > 0:
         text += f"（约 {_tokens(week / leftover['used'] * leftover['left'])} 输出 tokens）"
-    return text + "，本周可多用"
+    note = _weeks_note(list(weeks))
+    return text + (f"；{note}" if note else "") + "，本周可多用"
 
 
 def insights(store: UsageStore, provider: str, now: float, samples: Iterable[Any] = (), window: str = "",
-             weekly: Iterable[Any] = (), weekly_quota: tuple | None = None) -> list[str]:
+             weekly: Iterable[Any] = (), weekly_quota: tuple | None = None, weeks: list[dict] = ()) -> list[str]:
     """"标题：内容" lines about one provider's own output: a weekly window
     about to reset with quota to spare, or one that just reset with much of
     it unused; today against yesterday; the week's daily average and busiest
@@ -274,10 +361,13 @@ def insights(store: UsageStore, provider: str, now: float, samples: Iterable[Any
     day = local_day(now)
     week_start = local_day(day - 7 * 86400 + 3600)
     hours = store.hourly([provider], week_start)
+    weeks = list(weeks)
     spare = weekly_spare(weekly, now, *(weekly_quota or (None, None)))
     leftover = None if spare else weekly_leftover(weekly, now)
-    head = ([spare_line(store, provider, spare, now)] if spare
-            else [weekly_line(store, provider, leftover, now)] if leftover else [])
+    head = ([spare_line(store, provider, spare, now, weeks)] if spare
+            else [weekly_line(store, provider, leftover, now, weeks)] if leftover else [])
+    if weeks:
+        head.append(weeks_line(weeks))
     if not any(hours.values()):
         return head + ["记录：暂无输出；开始使用后在此统计（保存在本机，重启后保留）"]
     today = sum(tokens for hour, tokens in hours.items() if hour >= day)

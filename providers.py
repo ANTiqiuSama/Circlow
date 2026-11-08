@@ -249,3 +249,21 @@ def provider_states(env: str | None = None) -> list[dict]:
         states.append({"key": spec.key, "letter": spec.letter, "label": spec.label, "enabled": spec.key in shown,
                        "reason": reason, "manual": choice is not None, "description": DESCRIPTIONS.get(spec.key, "")})
     return states
+
+
+def claude_desktop_aumid() -> str | None:
+    """The installed Claude desktop app's launch id ("Claude_<publisher>!Claude",
+    for shell:AppsFolder), or None when it is not installed. The Store package
+    keeps its data under %LOCALAPPDATA%\\Packages\\Claude_<publisher>; an
+    explicit id can be given with CODEX_QUOTA_CLAUDE_APP."""
+    override = os.environ.get("CODEX_QUOTA_CLAUDE_APP")
+    if override:
+        return override
+    if sys.platform != "win32":
+        return None
+    packages = _local_appdata() / "Packages"
+    try:
+        families = sorted(path.name for path in packages.glob("Claude_*") if path.is_dir())
+    except OSError:
+        return None
+    return f"{families[0]}!Claude" if families else None

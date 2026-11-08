@@ -1755,7 +1755,7 @@ class SettingsWindow:
         if herdr is not None:
             env = os.environ.get("CODEX_QUOTA_HERDR")
             text = (f"状态：{herdr.status} · {len(herdr.rows)} 个窗格。同一窗格的会话合并为一个气泡，blocked 显示为“等你确认”；"
-                    "点击 Claude Code 或 Grok 图标会在 herdr 新建工作区启动它。")
+                    "点击 Grok 图标会在 herdr 新建工作区启动它；Claude 图标打开 Claude App，没装 App 时才在 herdr 启动 Claude Code。")
             if env:
                 text += f"（环境变量 CODEX_QUOTA_HERDR={env} 优先）"
             self.set_text(self.herdr_row.detail, text)
