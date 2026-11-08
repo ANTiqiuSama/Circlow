@@ -235,12 +235,15 @@ class LiquidGlassTest(unittest.TestCase):
         self.assertEqual(glass.getpixel((2, 2))[3], 0)                 # no drawn shadow or surface
         margin = round(MARGIN * 2.0)
         self.assertEqual(glass.getpixel((margin + 200, margin + 150)), (240, 238, 230, 255))   # content as drawn
-        # Specular rim: brightest along the top edge, softer along the bottom, faint down the sides.
-        top, bottom, side = (glass.getpixel((margin + 200, margin + 1))[0], glass.getpixel((margin + 200, margin + 298))[0],
-                             glass.getpixel((margin + 1, margin + 150))[0])
+        # Specular rim: a 22 % hairline along the top edge, softer along the bottom, faint down the sides.
+        _, rim = agent_panel._highlights((400, 300), 2.0)
+        top, bottom, side = rim.getpixel((200, 1))[3], rim.getpixel((200, 298))[3], rim.getpixel((1, 150))[3]
+        self.assertAlmostEqual(top, round(0.22 * 255), delta=2)
+        self.assertAlmostEqual(bottom, agent_panel.RIM_BOTTOM, delta=2)
+        self.assertAlmostEqual(side, agent_panel.RIM_SIDE, delta=4)
         self.assertGreater(top, bottom)
         self.assertGreater(bottom, side)
-        self.assertGreaterEqual(side, 240)
+        self.assertGreaterEqual(glass.getpixel((margin + 200, margin + 1))[0], 240)   # white light over the content
         # Light falls in at the top and bottom edges, under the content; the middle stays clear.
         clear = agent_panel._card(Image.new("RGBA", (400, 300), (0, 0, 0, 0)), 2.0)
         self.assertGreater(clear.getpixel((margin + 200, margin + 6))[3], 10)

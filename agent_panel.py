@@ -1612,8 +1612,9 @@ GLASS_RADIUS = 26.0          # the platform card's corner radius (mac_panel sets
 # above: a bright rim along the top edge, a softer one along the bottom, faint
 # down the sides, and a little light falling in at the top. The platform's own
 # rim is about a pixel wide and a sixth brighter than the glass: too faint to
-# read on a dark backdrop, so the card draws its own on top.
-RIM_TOP, RIM_SIDE, RIM_BOTTOM = 150, 26, 96          # alpha of the rim stroke, 0-255
+# read on a dark backdrop, so the card draws its own on top: a hairline at
+# 22 % along the top edge, the bottom and sides in the same proportion.
+RIM_TOP, RIM_SIDE, RIM_BOTTOM = 56, 10, 36           # alpha of the rim stroke, 0-255 (22 %, 4 %, 14 %)
 GLOW_TOP, GLOW_BOTTOM = (30, 28.0), (14, 16.0)       # (alpha, points) of the light at the top and bottom edges
 
 
