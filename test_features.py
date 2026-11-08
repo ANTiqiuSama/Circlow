@@ -147,6 +147,63 @@ class ForecastTests(unittest.TestCase):
         self.assertTrue(steps)
 
 
+class OutlookTests(unittest.TestCase):
+    """One forecast line per source: the window running out first, else what is
+    left at the next reset (forecast.outlook)."""
+    NOW = 1_800_000_000.0
+
+    def week(self, used_now, per_hour_day, burst=0.0, hours=30, reset_in=0.2 * 3600):
+        """Weekly readings: an even day-long pace, plus a burst over the last three hours."""
+        reset = int(self.NOW + reset_in)
+        samples = [Sample(self.NOW - h * 3600, used_now - per_hour_day * h - (burst * (3 - h) if h < 3 else burst * 3), reset)
+                   for h in range(hours, -1, -1)]
+        samples[-1] = Sample(self.NOW, used_now, reset)
+        return samples, reset
+
+    def test_a_weekly_window_is_paced_by_the_whole_day_not_the_last_burst(self):
+        samples, reset = self.week(used_now=90, per_hour_day=0.8, burst=1.5, reset_in=100 * 3600)
+        weekly = forecast(samples, self.NOW, 10, reset, 10080)
+        burst = forecast(samples, self.NOW, 10, reset)                     # the old three-hour pace
+        self.assertIn("近一天的平均用量", weekly.text)
+        self.assertGreater(weekly.exhausts_at, burst.exhausts_at)          # the burst ran the week out sooner
+        self.assertAlmostEqual(weekly.rate_per_hour, (samples[-1].used - samples[-25].used) / 24, places=3)
+        five_hour = forecast(samples[-4:], self.NOW, 10, reset, 300)
+        self.assertNotIn("近一天", five_hour.text)                           # 5-hour windows keep the recent pace
+
+    def test_the_line_names_the_next_reset_and_what_will_be_left(self):
+        import forecast as module
+        weekly_samples, weekly_reset = self.week(used_now=66, per_hour_day=1.4, reset_in=12 * 60)
+        five_reset = int(self.NOW + 1.9 * 3600)
+        five_samples = [Sample(self.NOW - 3600 * h, 63 - 19 * h, five_reset) for h in (2, 1.5, 1, 0.5, 0)]
+        windows = [("5 小时", forecast(five_samples, self.NOW, 37, five_reset, 300), 37, five_reset, 300),
+                   ("每周", forecast(weekly_samples, self.NOW, 34, weekly_reset, 10080), 34, weekly_reset, 10080)]
+        text, tone = module.outlook(windows, self.NOW)
+        # The weekly window resets first: lead with it, then the 5-hour window that will end nearly empty.
+        self.assertTrue(text.startswith("每周额度 12 分钟后重置，预计剩 34%，可多用"), text)
+        self.assertIn("；5 小时额度到重置时约剩", text)
+        self.assertEqual(tone, "warn")
+        self.assertEqual(text.count("预计"), 1)                               # one forecast, not one per window
+
+    def test_a_window_running_out_before_its_reset_comes_first(self):
+        import forecast as module
+        reset_5h, reset_week = int(self.NOW + 75 * 60), int(self.NOW + 115 * 3600)
+        five = forecast([Sample(self.NOW - 3600 * h, 75 - 30 * h, reset_5h) for h in (1, .5, 0)], self.NOW, 25, reset_5h, 300)
+        week = forecast(self.week(90, 1.2, reset_in=115 * 3600)[0], self.NOW, 10, reset_week, 10080)
+        text, tone = module.outlook([("5 小时", five, 25, reset_5h, 300), ("每周", week, 10, reset_week, 10080)], self.NOW)
+        self.assertTrue(text.startswith("5 小时额度：") and "后用完" in text, text)
+        self.assertEqual(tone, "danger")
+
+    def test_single_window_and_quiet_cases(self):
+        import forecast as module
+        reset = int(self.NOW + 20 * 3600)
+        flat = [Sample(self.NOW - 7200, 40, reset), Sample(self.NOW - 3600, 40, reset), Sample(self.NOW, 40, reset)]
+        text, tone = module.outlook([("每周", forecast(flat, self.NOW, 60, reset, 10080), 60, reset, 10080)], self.NOW)
+        self.assertEqual((text, tone), ("每周额度 20 小时后重置，预计剩 60%，可多用", "ok"))
+        unknown = forecast([], self.NOW, 60, reset, 10080)
+        self.assertEqual(module.outlook([("每周", unknown, 60, reset, 10080)], self.NOW), (unknown.text, "unknown"))
+        self.assertEqual(module.outlook([], self.NOW), ("", "unknown"))
+
+
 class SchedulerTests(unittest.TestCase):
     def snapshot(self, error=None, resets_at=None, secondary=None):
         return SimpleNamespace(error=error, resets_at=resets_at, secondary_resets_at=secondary)

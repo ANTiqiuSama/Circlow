@@ -296,7 +296,11 @@ def make_settings_tray():
 
         def open_all_performance(self, _icon=None, _item=None) -> None:
             performance = self.performance
-            sections = [f"本机合计 · 最近60秒：{performance.get('total_output_tps_60', 0.0):.1f} tok/s", ""]
+            if "local_total_output_tps_60" in performance:          # multi-device sync on
+                sections = [f"全部设备 · 最近60秒：{performance.get('total_output_tps_60', 0.0):.1f} tok/s",
+                            f"本机 · 最近60秒：{performance['local_total_output_tps_60']:.1f} tok/s", ""]
+            else:
+                sections = [f"本机合计 · 最近60秒：{performance.get('total_output_tps_60', 0.0):.1f} tok/s", ""]
             for provider, data in performance.get("providers", {}).items():
                 if provider == "gemini":
                     continue

@@ -173,7 +173,7 @@ class ChartData:
                 recorded = max((self.history.samples(name) for name in names),
                                key=lambda items: len(forecast_module.current_window(items, resets_at)))
                 samples = forecast_module.current_window(recorded, resets_at)
-                outlook = forecast_module.forecast(samples, now, remaining, resets_at)
+                outlook = forecast_module.forecast(samples, now, remaining, resets_at, minutes)   # the same pace as the headline
                 rate = outlook.rate_per_hour
                 if key == "mimo":
                     view = mimo_tracker().view(now)

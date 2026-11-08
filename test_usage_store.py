@@ -103,7 +103,8 @@ class UsageStoreTests(unittest.TestCase):
         reset = int(now + 20 * 3600)
         flat = [Sample(now - 7200, 40, reset), Sample(now - 3600, 40, reset), Sample(now, 40, reset)]
         weekly = {"grok": (flat, 60, reset)}                                            # 60% left, reset tomorrow
-        self.assertEqual(usage_store.hint_line(store, keys, now, weekly), "Grok 周额度 20 小时后重置，预计剩 60%，可多用")
+        # The quota forecast lives in the panel's forecast line only (forecast.outlook): the hint never repeats it.
+        self.assertEqual(usage_store.hint_line(store, keys, now, weekly), "今天输出 16K，Claude 占 75%")
         solo = UsageStore(self.folder / "solo.json.gz")
         solo.note(reply("s1", day - 2 * 86400 + 14 * 3600, 9_000, provider="grok"))
         self.assertEqual(usage_store.hint_line(solo, keys, now), "近 7 天 14–16 点最忙")

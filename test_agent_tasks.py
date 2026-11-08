@@ -358,6 +358,22 @@ class SceneTests(unittest.TestCase):
         for scale in (1, 1.25, 1.5):
             self.assertIsNotNone(scene.render(scale))
 
+    def test_the_local_tps_line_sits_under_the_shared_figure(self):
+        from dataclasses import replace
+        shared = panel()
+        mine = replace(shared, local_tps=35.0)
+        frames = []
+        for model in (shared, mine):
+            scene = agent_panel.Scene()
+            scene.set_model(model, 0)
+            frames.append(scene.render(1))
+        columns = agent_panel.meter_columns(len(shared.quota))
+        x = round(agent_panel.MARGIN + columns[-1][0])
+        y = round(agent_panel.MARGIN + agent_panel.METER_TOP + agent_panel.header_offset(shared) + 55)
+        box = (x, y, x + 40, y + 12)
+        self.assertNotEqual(frames[0].crop(box).tobytes(), frames[1].crop(box).tobytes())
+        self.assertEqual(shared.header, mine.header)       # drawn per frame, not in the cached background
+
     def test_daily_usage_switches_units_and_promotes_rounded_boundaries(self):
         cases = [(None, ("—", "")), (0, ("0", "")), (999, ("999", "")), (1000, ("1", "K")),
                  (12500, ("12.5", "K")), (999500, ("1", "M")), (1250000, ("1.25", "M")),

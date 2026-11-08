@@ -26,6 +26,12 @@ LOW_SPARE_PERCENT = 5.0
 CLAUDE_DROP_TOLERANCE = 5.0   # same reset: reject partial recovery, retain >=95% full resets
 RESET_TOLERANCE = 180           # Reset timestamps jitter a little between reads.
 IDLE_RATE = 0.05                # %/hour treated as "no measurable use".
+# Windows a day long or more (weekly) are paced by the last day's average,
+# idle hours included: their use comes in bursts with nights in between, and
+# a three-hour burst carried across days ran out the week in hours.
+DAY_PACE_MINUTES = 1440
+DAY_LOOKBACK_SECONDS = 24 * 3600
+DAY_MIN_SPAN_SECONDS = 6 * 3600
 
 
 @dataclass(frozen=True)
@@ -189,13 +195,30 @@ def slope_per_hour(samples: list[Sample]) -> float:
     return cov / var * 3600
 
 
-def forecast(samples: Iterable[Sample], now: float, remaining: float | None, resets_at: int | None) -> Forecast:
+def day_pace(window: list[Sample], now: float) -> float | None:
+    """%/hour over the last day of a window's readings (from its start when
+    younger), idle time included; None with under DAY_MIN_SPAN_SECONDS."""
+    day = [s for s in window if s.at >= now - DAY_LOOKBACK_SECONDS]
+    if len(day) < 2 or day[-1].at - day[0].at < DAY_MIN_SPAN_SECONDS:
+        return None
+    return max(0.0, day[-1].used - day[0].used) / ((day[-1].at - day[0].at) / 3600)
+
+
+def forecast(samples: Iterable[Sample], now: float, remaining: float | None, resets_at: int | None,
+             window_minutes: int | None = None) -> Forecast:
+    """When `remaining` runs out at the window's pace, against its reset.
+    The pace is the last three hours' (a sustained burst can raise it) or,
+    for windows of a day or more, the last day's average."""
     if remaining is None:
         return Forecast("unknown", "额度未知，暂无法预测")
     if remaining <= 0.5:
         tail = f"，{duration_text(resets_at - now)}后重置" if resets_at and resets_at > now else ""
         return Forecast("danger", f"额度已用完{tail}", exhausts_at=now, before_reset=True)
     window = current_window(samples, resets_at)
+    if window_minutes and window_minutes >= DAY_PACE_MINUTES:
+        rate = day_pace(window, now)
+        if rate is not None:
+            return _project(rate, "按近一天的平均用量", now, remaining, resets_at)
     recent = [s for s in window if s.at >= now - LOOKBACK_SECONDS]
     if len(recent) < 2 or recent[-1].at - recent[0].at < MIN_SPAN_SECONDS:
         recent = window  # Fall back to the whole window when recent data is thin.
@@ -211,7 +234,10 @@ def forecast(samples: Iterable[Sample], now: float, remaining: float | None, res
     fast_rate = slope_per_hour(fast) if fast_ready else 0.0
     short_pace = fast_ready and fast_rate > regular_rate * 1.2
     rate = fast_rate if short_pace else regular_rate
-    pace = "按近期较快用量估算，" if short_pace else "按当前速度"
+    return _project(rate, "按近期较快用量估算，" if short_pace else "按当前速度", now, remaining, resets_at)
+
+
+def _project(rate: float, pace: str, now: float, remaining: float, resets_at: int | None) -> Forecast:
     if rate < IDLE_RATE:
         return Forecast("idle", "近期几乎没有消耗，重置前够用", rate)
     exhausts_at = now + remaining / rate * 3600
@@ -226,6 +252,63 @@ def forecast(samples: Iterable[Sample], now: float, remaining: float | None, res
         tone = "danger" if left < 3600 else "warn"
         return Forecast(tone, f"{pace}约 {duration_text(left)}后用完，早于重置 {duration_text(gap)}", rate, exhausts_at, True)
     return Forecast("warn" if left < 3 * 3600 else "ok", f"{pace}约 {duration_text(left)}后用完", rate, exhausts_at, None)
+
+
+def left_at_reset(outlook: Forecast, now: float, remaining: float | None, resets_at: int | None) -> float | None:
+    """% expected to be left when the window resets, at the outlook's pace;
+    None when unknown or the window runs out first."""
+    if remaining is None or not resets_at or resets_at <= now or outlook.tone == "unknown" or outlook.before_reset:
+        return None
+    rate = max(0.0, outlook.rate_per_hour or 0.0)
+    return max(0.0, remaining - rate * (resets_at - now) / 3600)
+
+
+SPARE_AHEAD = 36 * 3600         # a weekly reset this close with this much to spare: say "可多用"
+SPARE_PERCENT = 20.0
+
+
+def outlook(windows: Iterable[tuple], now: float) -> tuple[str, str]:
+    """One forecast line for a source's quota windows, each (label, Forecast,
+    remaining %, resets_at, minutes), and its tone:
+
+    - a window on course to run out before its reset: the earliest of them,
+      "5 小时额度：按当前速度约 49 分钟后用完，早于重置 26 分钟";
+    - otherwise the window that resets next and what will be left of it,
+      "每周额度 12 分钟后重置，预计剩 34%"; "，可多用" when it is a weekly
+      window resetting within SPARE_AHEAD with at least SPARE_PERCENT to
+      spare; and, after it, any other window expected to end nearly empty.
+
+    Every window is judged by the same forecast, so the line, the chart's
+    dashed lines and the usage tips never disagree."""
+    rows = [row for row in windows if row[1] is not None]
+    single = len(rows) == 1
+    name = lambda label: f"{label}额度" if label else "额度"           # noqa: E731
+    running_out = sorted((row for row in rows if row[1].before_reset or row[1].tone == "danger"),
+                         key=lambda row: row[1].exhausts_at or now)
+    if running_out:
+        label, chosen = running_out[0][0], running_out[0][1]
+        return (chosen.text if single else f"{name(label)}：{chosen.text}"), chosen.tone
+    known = [(row, left_at_reset(row[1], now, row[2], row[3])) for row in rows]
+    known = [(row, left) for row, left in known if left is not None]
+    if not known:
+        rest = [row[1] for row in rows]
+        if not rest:
+            return "", "unknown"
+        chosen = next((item for item in rest if item.tone != "unknown"), rest[0])
+        return chosen.text, chosen.tone
+    (label, _chosen, _remaining, resets_at, minutes), left = min(known, key=lambda item: item[0][3])
+    text = f"{name(label)} {duration_text(resets_at - now)}后重置，预计剩 {left:.0f}%"
+    tone = "ok"
+    if left <= LOW_SPARE_PERCENT:
+        text, tone = f"{name(label)} {duration_text(resets_at - now)}后重置，到时可能接近用尽（约剩 {left:.0f}%）", "warn"
+    elif (minutes or 0) >= DAY_PACE_MINUTES and resets_at - now <= SPARE_AHEAD and left >= SPARE_PERCENT:
+        text += "，可多用"
+    tight = [(other_label, other_left) for (other_label, _f, _r, other_reset, _m), other_left in known
+             if other_reset != resets_at and other_left <= LOW_SPARE_PERCENT]
+    for other_label, other_left in tight[:1]:
+        text += f"；{name(other_label)}到重置时约剩 {other_left:.0f}%"
+        tone = "warn"
+    return text, tone
 
 
 class QuotaHistory:
@@ -327,5 +410,7 @@ class QuotaHistory:
     def forecast_for(self, snapshot: Any, now: float, secondary: bool = False) -> Forecast:
         if secondary:
             return forecast(self.samples(f"{snapshot.provider}:secondary"), now,
-                            snapshot.secondary_remaining_percent, snapshot.secondary_resets_at)
-        return forecast(self.samples(snapshot.provider), now, snapshot.remaining_percent, snapshot.resets_at)
+                            snapshot.secondary_remaining_percent, snapshot.secondary_resets_at,
+                            snapshot.secondary_window_minutes)
+        return forecast(self.samples(snapshot.provider), now, snapshot.remaining_percent, snapshot.resets_at,
+                        snapshot.window_minutes)
