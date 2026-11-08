@@ -1579,6 +1579,29 @@ def compact_usage(value: float | None) -> tuple[str, str]:
 REFERENCE_FIELD = 160       # Field height the background slices are cut from.
 SLICE_INSET = 20            # Cut this far inside the field: past every rounded corner.
 
+# macOS draws the card itself as Liquid Glass (mac_panel); the panel then
+# renders only its content, on a transparent canvas of the same size so every
+# position, hit test and margin stays as it is.
+GLASS = False
+
+
+def set_glass(on: bool) -> None:
+    """Card drawn by the platform (True) or by us: shadow and dark surface (False)."""
+    global GLASS
+    if GLASS != bool(on):
+        GLASS = bool(on)
+        for cached in (_background, _slices, background):
+            cached.cache_clear()
+
+
+def _card(content: Image.Image, scale: float) -> Image.Image:
+    if not GLASS:
+        return _compose(content, scale)
+    margin = round(MARGIN * scale)
+    image = Image.new("RGBA", (content.width + 2 * margin, content.height + 2 * margin), (0, 0, 0, 0))
+    image.alpha_composite(content, (margin, margin))
+    return image
+
 
 @lru_cache(maxsize=12)
 def _slices(header: tuple, scale: float) -> tuple[Image.Image, Image.Image, Image.Image, int]:
@@ -1758,4 +1781,4 @@ def _background(header: tuple, field_h: int, scale: float) -> Image.Image:
     lines = forecast_lines(model.forecast or "正在积累用量，稍后给出预测", px(WIDTH - 2 * PAD - 48), face, draw)
     for index, line in enumerate(lines):
         draw.text((px(PAD + 18), px(middle + (index - (len(lines) - 1) / 2) * 17)), line, font=face, fill=tint, anchor="lm")
-    return _compose(content, scale)
+    return _card(content, scale)

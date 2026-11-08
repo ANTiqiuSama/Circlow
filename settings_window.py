@@ -1603,8 +1603,10 @@ class SettingsWindow:
         self.button(line, "退出登录", self.mimo_logout).pack(side="left", padx=S(8))
         self.mimo_toggle = self.link(line, "手动填写套餐 ▸", self.toggle_mimo_manual)
         self.mimo_toggle.pack(side="left", padx=S(8))
-        self.para(block, "登录会打开一个独立的 Edge/Chrome 窗口进入 platform.xiaomimimo.com；进入套餐页后自动读取并关闭。"
-                         "会话用 Windows 加密保存在本机（mimo-session.bin），不保存账号密码。", 9, view.INK_3).pack(
+        stored = ("会话保存在 macOS 钥匙串（“环流 · 小米 MiMo 控制台会话”），不保存账号密码。" if sys.platform == "darwin"
+                  else "会话用 Windows 加密保存在本机（mimo-session.bin），不保存账号密码。")
+        self.para(block, "登录会打开一个独立的 Chrome/Edge 窗口进入 platform.xiaomimimo.com；进入套餐页后自动读取并关闭。"
+                         + stored, 9, view.INK_3).pack(
             anchor="w", fill="x", pady=(S(8), 0))
         self.mimo_drawer = tk.Frame(block, bg=view.FIELD, height=1)     # slides open around the form
         self.mimo_open = False

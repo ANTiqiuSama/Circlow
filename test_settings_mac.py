@@ -4,6 +4,7 @@ import os
 import plistlib
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -143,17 +144,44 @@ class SettingsTrayTest(TempData):
         self.assertEqual(settings_mac.take_commands(settings_mac.MENU), [{"name": "restart"}, {"name": "restart"}])
         self.assertFalse(tray.stop_event.is_set())                # the window stays open while the menu bar restarts
 
-    def test_startup_switch_uses_the_login_item_and_mimo_login_explains(self):
+    def test_startup_switch_uses_the_login_item(self):
         tray = self.settings_tray()
         with patch.object(settings_mac, "login_item_enabled", return_value=False), \
                 patch.object(settings_mac, "set_login_item") as set_item:
             self.assertFalse(tray.startup_enabled())
             tray.toggle_startup()
         set_item.assert_called_once_with(True)
-        with patch.object(settings_mac, "show_text") as show:
+
+    def test_mimo_login_runs_the_console_login_and_refreshes_the_menu_bar(self):
+        import mimo_usage
+        import threading as threads
+        tray = self.settings_tray()
+        finished = threads.Event()
+
+        def fake_login(interactive=True):            # never opens a real browser in tests
+            finished.set()
+            return Mock()
+        with patch.object(mimo_usage, "edge_path", return_value="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"), \
+                patch.object(mimo_usage, "login", side_effect=fake_login) as login:
             tray.mimo_login()
-        self.assertIn("Mac 版暂不支持", tray.mimo_login_result)
+            self.assertTrue(finished.wait(5))
+            for _ in range(50):
+                if not getattr(tray, "mimo_login_running", False):
+                    break
+                time.sleep(0.02)
+        login.assert_called_once_with(interactive=True)
+        self.assertTrue(tray.mimo_login_result.startswith("登录成功"))
+        self.assertEqual(settings_mac.take_commands(settings_mac.MENU), [{"name": "refresh", "providers": ["mimo"]}])
+
+    def test_mimo_login_without_a_browser_explains_instead(self):
+        import mimo_usage
+        tray = self.settings_tray()
+        with patch.object(mimo_usage, "edge_path", return_value=None), \
+                patch.object(mimo_usage, "login") as login, patch.object(settings_mac, "show_text") as show:
+            tray.mimo_login()
+        login.assert_not_called()
         show.assert_called_once()
+        self.assertIn("未找到 Chrome", tray.mimo_login_result)
 
 
 class RetinaPictureTest(unittest.TestCase):

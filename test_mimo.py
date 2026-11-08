@@ -1,6 +1,7 @@
 """Xiaomi MiMo Token Plan: Credits, console parsing, ledger, tracker, sources."""
 import json
 import os
+import sys
 import socket
 import sqlite3
 import tempfile
@@ -144,11 +145,31 @@ class StorageTests(unittest.TestCase):
         path.write_bytes(mimo_usage._protect(json.dumps({"old": "jar"}).encode()))
         self.assertEqual(mimo_usage.load_session(path)["cookies"], {"old": "jar"})
 
-    @unittest.skipIf(os.name == "nt", "macOS/Linux must refuse unencrypted console sessions")
+    @unittest.skipIf(os.name == "nt" or sys.platform == "darwin", "Linux must refuse unencrypted console sessions")
     def test_non_windows_refuses_console_session_persistence(self):
         with self.assertRaises(OSError):
             mimo_usage.save_session({"cookies": {"sid": "secret"}}, self.dir / "s.bin")
         self.assertFalse((self.dir / "s.bin").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "the macOS keychain")
+    def test_macos_keeps_the_session_in_the_keychain_and_only_a_marker_on_disk(self):
+        store = {}
+        path = self.dir / "s.bin"
+        with patch.object(mimo_usage, "_keychain_store", lambda account, data: store.__setitem__(account, data)), \
+                patch.object(mimo_usage, "_keychain_load", lambda account: store.get(account)):
+            mimo_usage.save_session({"cookies": {"sid": "secret"}, "headers": {"Authorization": "Bearer t"}, "api_base": "https://x"}, path)
+            self.assertEqual(path.read_bytes(), mimo_usage.KEYCHAIN_MARKER)          # nothing secret on disk
+            self.assertNotIn(b"secret", path.read_bytes())
+            self.assertEqual(mimo_usage.load_session(path)["cookies"], {"sid": "secret"})
+            store.clear()                                                           # gone from the keychain
+            self.assertEqual(mimo_usage.load_session(path)["cookies"], {})
+            path.write_bytes(b"not a marker")                                       # a Windows file copied over
+            self.assertEqual(mimo_usage.load_session(path)["cookies"], {})
+
+    def test_browser_lookup_covers_macos_chromium_browsers(self):
+        with patch.object(mimo_usage.sys, "platform", "darwin"), patch.dict(os.environ, {"CIRCLOW_MIMO_BROWSER": ""}), \
+                patch.object(mimo_usage.os.path, "isfile", lambda path: path.endswith("Google Chrome")):
+            self.assertEqual(mimo_usage.edge_path(), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 
     def test_captured_api_keeps_only_console_token_headers(self):
         events = [

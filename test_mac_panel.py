@@ -203,5 +203,44 @@ class ClaudeProbeTest(unittest.TestCase):
         self.assertEqual(json.loads(cli_usage.CLAUDE_ARGS[index + 1]), {"permissions": {"defaultMode": "default"}})
 
 
+
+class LiquidGlassTest(unittest.TestCase):
+    def tearDown(self):
+        import agent_panel
+        agent_panel.set_glass(False)
+
+    def test_glass_mode_renders_the_content_on_a_transparent_card_of_the_same_size(self):
+        import agent_panel
+        from PIL import Image
+        content = Image.new("RGBA", (100, 60), (240, 238, 230, 255))
+        agent_panel.set_glass(False)
+        drawn = agent_panel._card(content, 2.0)
+        agent_panel.set_glass(True)
+        glass = agent_panel._card(content, 2.0)
+        self.assertEqual(glass.size, drawn.size)                       # same geometry and margins
+        self.assertEqual(glass.getpixel((2, 2))[3], 0)                 # no drawn shadow or surface
+        margin = round(MARGIN * 2.0)
+        self.assertEqual(glass.getpixel((margin + 5, margin + 5)), (240, 238, 230, 255))
+
+    def test_switching_modes_clears_the_cached_card(self):
+        import agent_panel
+        agent_panel._background.cache_clear()
+        agent_panel.set_glass(True)
+        info = agent_panel._background.cache_info()
+        self.assertEqual(info.currsize, 0)
+        self.assertTrue(agent_panel.GLASS)
+
+    def test_glass_can_be_turned_off_and_is_rounded_and_tinted(self):
+        import os
+        with patch.dict(os.environ, {"CIRCLOW_GLASS": "0"}):
+            self.assertFalse(mac_panel.glass_available())
+            self.assertIsNone(mac_panel.make_glass())
+        if not mac_panel.glass_available():
+            self.skipTest("no NSGlassEffectView on this system")
+        from detail_card import RADIUS
+        glass = mac_panel.make_glass()
+        self.assertEqual(float(glass.cornerRadius()), float(RADIUS))
+        self.assertAlmostEqual(float(glass.tintColor().alphaComponent()), mac_panel.GLASS_TINT[3], places=3)
+
 if __name__ == "__main__":
     unittest.main()

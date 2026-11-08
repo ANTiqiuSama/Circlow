@@ -28,6 +28,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -128,18 +129,76 @@ def _protect(data: bytes, decrypt: bool = False) -> bytes:
         kernel32.LocalFree(target.pbData)
 
 
+# ----- macOS Keychain ----------------------------------------------------------
+# On the Mac the session lives in the login keychain (encrypted by macOS, like
+# DPAPI on Windows); the session file only says "in the keychain".
+
+KEYCHAIN_SERVICE = "com.antiqiusama.circlow.mimo"
+KEYCHAIN_MARKER = b"circlow:keychain\n"
+
+
+def _keychain_account(path: Path) -> str:
+    return "session" if path == COOKIE_PATH else f"session:{path}"
+
+
+def _keychain_query(account: str) -> dict:
+    import Security
+    return {Security.kSecClass: Security.kSecClassGenericPassword, Security.kSecAttrService: KEYCHAIN_SERVICE,
+            Security.kSecAttrAccount: account}
+
+
+def _keychain_store(account: str, data: bytes) -> None:
+    import Security
+    from Foundation import NSData
+    value = NSData.dataWithBytes_length_(data, len(data))
+    query = _keychain_query(account)
+    status = Security.SecItemUpdate(query, {Security.kSecValueData: value})
+    if status == Security.errSecItemNotFound:
+        status = Security.SecItemAdd({**query, Security.kSecValueData: value,
+                                      Security.kSecAttrLabel: "环流 · 小米 MiMo 控制台会话"}, None)[0]
+    if status != 0:
+        raise OSError(f"无法写入钥匙串（{status}）")
+
+
+def _keychain_load(account: str) -> bytes | None:
+    import Security
+    status, result = Security.SecItemCopyMatching(
+        {**_keychain_query(account), Security.kSecReturnData: True, Security.kSecMatchLimit: Security.kSecMatchLimitOne}, None)
+    return bytes(result) if status == 0 and result is not None else None
+
+
+def _keychain_delete(account: str) -> None:
+    import Security
+    Security.SecItemDelete(_keychain_query(account))
+
+
 def save_session(session: dict[str, Any], path: Path | None = None) -> None:
-    """{"cookies": {...}, "headers": {...}, "api_base": "..."} encrypted with DPAPI."""
+    """{"cookies": {...}, "headers": {...}, "api_base": "..."}, never in plain
+    text: DPAPI-encrypted on Windows, in the login keychain on macOS."""
     path = path or COOKIE_PATH
+    data = json.dumps(session).encode("utf-8")
+    if sys.platform == "darwin":
+        _keychain_store(_keychain_account(path), data)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(KEYCHAIN_MARKER)
+        return
+    sealed = _protect(data)                  # raises elsewhere: no plaintext fallback
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_protect(json.dumps(session).encode("utf-8")))
+    path.write_bytes(sealed)
 
 
 def load_session(path: Path | None = None) -> dict[str, Any]:
     path = path or COOKIE_PATH
     try:
-        value = json.loads(_protect(path.read_bytes(), decrypt=True).decode("utf-8"))
-    except (OSError, ValueError):
+        stored = path.read_bytes()
+        if sys.platform == "darwin":
+            stored = _keychain_load(_keychain_account(path)) if stored == KEYCHAIN_MARKER else None
+            if stored is None:
+                raise OSError("no keychain session")
+            value = json.loads(stored.decode("utf-8"))
+        else:
+            value = json.loads(_protect(stored, decrypt=True).decode("utf-8"))
+    except (OSError, ValueError, ImportError):
         return {"cookies": {}, "headers": {}, "api_base": ""}
     if not isinstance(value, dict):
         value = {}
@@ -163,6 +222,11 @@ def load_cookies(path: Path | None = None) -> dict[str, str]:
 def logout() -> None:
     import shutil
     shutil.rmtree(PROFILE_DIR, ignore_errors=True)   # the Xiaomi account session lives there
+    if sys.platform == "darwin":
+        try:
+            _keychain_delete(_keychain_account(COOKIE_PATH))
+        except Exception:
+            pass
     for path in (COOKIE_PATH,):
         try:
             path.unlink()
@@ -607,10 +671,20 @@ class MimoTracker:
 
 # ----- Edge login (Chrome DevTools Protocol over a tiny WebSocket client) -------
 
+MAC_BROWSERS = ("Google Chrome.app/Contents/MacOS/Google Chrome", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "Chromium.app/Contents/MacOS/Chromium", "Brave Browser.app/Contents/MacOS/Brave Browser")
+
+
 def edge_path() -> str | None:
+    """A Chromium browser for the console login: Edge or Chrome on Windows;
+    Chrome, Edge, Chromium or Brave on macOS (in /Applications or ~/Applications)."""
     override = os.environ.get("CIRCLOW_MIMO_BROWSER")
     candidates = [override] if override else []
-    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"), os.environ.get("LOCALAPPDATA")):
+    if sys.platform == "darwin":
+        for folder in (Path("/Applications"), Path.home() / "Applications"):
+            candidates += [str(folder / name) for name in MAC_BROWSERS]
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                 os.environ.get("LOCALAPPDATA") if os.name == "nt" else None):
         if base:
             candidates += [os.path.join(base, "Microsoft/Edge/Application/msedge.exe"),
                            os.path.join(base, "Google/Chrome/Application/chrome.exe")]
@@ -916,7 +990,7 @@ def login(interactive: bool = True, timeout: float = 600.0, raw: dict | None = N
                     globals()["_headless_failed_at"] = 0.0
                     return plan
             time.sleep(2.0)
-        raise LoginRequired("登录超时（详情见 %LOCALAPPDATA%\\Circlow\\mimo-login.log）" if interactive else
+        raise LoginRequired("登录超时（详情见数据文件夹中的 mimo-login.log）" if interactive else
                             "MiMo 控制台会话已过期")
     finally:
         if socket_:

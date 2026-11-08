@@ -240,9 +240,30 @@ def make_settings_tray():
             return result
 
         def mimo_login(self, _icon=None, _item=None) -> None:
-            # The console login keeps its cookie with Windows DPAPI.
-            self.mimo_login_result = "Mac 版暂不支持登录小米 MiMo 控制台；请在下方手动填写套餐"
-            show_text("Xiaomi MiMo", self.mimo_login_result)
+            """The console login in an app-owned Chrome/Edge window; the session
+            goes to the keychain and the menu bar reads the plan again."""
+            if getattr(self, "mimo_login_running", False):
+                return
+            if not mimo_usage.edge_path():
+                self.mimo_login_result = "未找到 Chrome / Edge / Chromium / Brave，无法打开登录窗口；可在下方手动填写套餐"
+                show_text("Xiaomi MiMo", self.mimo_login_result)
+                return
+            self.mimo_login_running = True
+            self.mimo_login_result = "已打开登录窗口，请在弹出的浏览器窗口中登录小米账号…"
+
+            def run():
+                try:
+                    mimo_usage.login(interactive=True)
+                    shown = "mimo" in tray_app.provider_registry.enabled_keys()
+                    self.mimo_login_result = ("登录成功，已读取套餐" if shown else
+                                              "登录成功；在“来源”中打开小米 MiMo 后显示 M 图标")
+                    send_command(MENU, "refresh", providers=["mimo"])
+                except Exception as error:
+                    self.mimo_login_result = f"登录未完成：{error}"
+                    show_text("Xiaomi MiMo · 登录未完成", str(error))
+                finally:
+                    self.mimo_login_running = False
+            threading.Thread(target=run, name="mimo-login", daemon=True).start()
 
         def mimo_logout(self, _icon=None, _item=None) -> None:
             mimo_usage.logout()

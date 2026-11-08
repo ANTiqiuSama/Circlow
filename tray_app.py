@@ -864,7 +864,10 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                     self.mimo_login_result = "登录成功；在“额度来源”中开启小米 MiMo 并保存后显示 M 图标"
             except Exception as error:
                 self.mimo_login_result = f"登录未完成：{error}"
-                ctypes.windll.user32.MessageBoxW(None, str(error), "Xiaomi MiMo · 登录未完成", 0x30)
+                if os.name == "nt":
+                    ctypes.windll.user32.MessageBoxW(None, str(error), "Xiaomi MiMo · 登录未完成", 0x30)
+                else:
+                    log.warning("MiMo login did not finish: %s", error)
             finally:
                 self.mimo_login_running = False
         threading.Thread(target=run, name="mimo-login", daemon=True).start()

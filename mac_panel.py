@@ -64,6 +64,37 @@ def to_nsimage(image, scale: float):
     return native
 
 
+GLASS_TINT = (22, 21, 19, 0.62)   # the card's own dark colour, so the light text reads on any wallpaper
+
+
+def glass_available() -> bool:
+    import os
+    if os.environ.get("CIRCLOW_GLASS", "1").strip().lower() in ("0", "false", "off", "no"):
+        return False
+    try:
+        import objc
+        objc.lookUpClass("NSGlassEffectView")
+        return True
+    except Exception:
+        return False
+
+
+def make_glass():
+    """macOS 26 Liquid Glass for the panel card (NSGlassEffectView), tinted
+    with the card colour and rounded like the drawn card; None where the
+    system has no glass, and the panel draws its own card instead."""
+    if not glass_available():
+        return None
+    import objc
+    from AppKit import NSColor
+    from detail_card import RADIUS
+    glass = objc.lookUpClass("NSGlassEffectView").alloc().initWithFrame_(((MARGIN, MARGIN), (10, 10)))
+    glass.setCornerRadius_(float(RADIUS))
+    r, g, b, alpha = GLASS_TINT
+    glass.setTintColor_(NSColor.colorWithSRGBRed_green_blue_alpha_(r / 255, g / 255, b / 255, alpha))
+    return glass
+
+
 _PANEL_CLASS = None
 
 
@@ -104,7 +135,6 @@ class PanelWindow:
             NSBackingStoreBuffered, False)
         panel.setOpaque_(False)
         panel.setBackgroundColor_(NSColor.clearColor())
-        panel.setHasShadow_(False)               # the image carries its own soft shadow
         panel.setLevel_(25)                      # NSStatusWindowLevel: above normal and floating windows
         panel.setFloatingPanel_(True)
         panel.setHidesOnDeactivate_(False)
@@ -118,7 +148,21 @@ class PanelWindow:
         view = NSImageView.alloc().initWithFrame_(((0, 0), (10, 10)))
         view.setImageScaling_(1)                 # NSImageScaleAxesIndependently: fill the frame exactly
         view.setEditable_(False)
-        panel.setContentView_(view)
+        self.glass = make_glass()
+        if self.glass is not None:
+            # Liquid Glass card: the glass draws the card (and the window its
+            # shadow); the image above it holds only the content.
+            from AppKit import NSAppearance, NSView
+            container = NSView.alloc().initWithFrame_(((0, 0), (10, 10)))
+            container.addSubview_(self.glass)
+            container.addSubview_(view)
+            panel.setContentView_(container)
+            panel.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua"))
+            panel.setHasShadow_(True)
+        else:
+            panel.setContentView_(view)
+            panel.setHasShadow_(False)           # the image carries its own soft shadow
+        agent_panel.set_glass(self.glass is not None)
         self.panel, self.view = panel, view
         self.scene = agent_panel.Scene()
         self.provider = None
@@ -182,6 +226,10 @@ class PanelWindow:
         x, y = panel_origin(self.anchor, self.size, self.visible_frame)
         frame = ((x, y - lift), self.size)
         if frame != self.frame:
+            if self.glass is not None and (self.frame is None or self.frame[1] != self.size):
+                width, height = self.size
+                self.view.setFrame_(((0, 0), (width, height)))
+                self.glass.setFrame_(((MARGIN, MARGIN), (max(1, width - 2 * MARGIN), max(1, height - 2 * MARGIN))))
             self.panel.setFrame_display_(frame, True)
             self.frame = frame
         self.panel.setAlphaValue_(alpha)
