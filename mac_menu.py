@@ -136,6 +136,13 @@ def status_image(snapshot: QuotaSnapshot, letter: str, performance: dict):
     return make_display_icon(snapshot, letter, performance)
 
 
+# The icon's height in points: that of the system's own menu bar extras
+# (the input menu, Control Center), measured at 16 on macOS 26. Rings, glyphs
+# and numerals are drawn on one canvas, so they shrink together. AppKit adds
+# 8 points either side of every item, so the pitch is ICON_POINTS + 16.
+ICON_POINTS = 16
+
+
 def bar_order(keys: list[str]) -> list[str]:
     """Creation order for status items. macOS places each new item to the
     left of the existing ones, so create right-to-left to read Claude, Codex,
@@ -484,7 +491,7 @@ def run_mac() -> int:
                 image = icons[key].icon or status_image(snapshot, providers.get(key).letter, performance)
                 button = self.items[key].button()
                 if self.pictures.get(key) is not image:
-                    picture = to_nsimage(image, image.size[0] / 20)
+                    picture = to_nsimage(image, image.size[0] / ICON_POINTS)
                     picture.setTemplate_(mono)       # the system colours it: white on a dark bar, black on a light one
                     button.setImage_(picture)
                     self.pictures[key] = image
