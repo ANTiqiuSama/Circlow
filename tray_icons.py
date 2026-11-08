@@ -88,6 +88,11 @@ def quota_exhausted(value: float | None, provider: str = "", pool: str | None = 
     return value <= EXHAUSTED_REMAINING
 
 
+def quota_depleted(value: float | None) -> bool:
+    """Actually empty, distinct from the icon's early countdown threshold."""
+    return value is not None and value <= 0
+
+
 def exhaustion_text(provider: str) -> str:
     """How the panel names that line, e.g. "低于 15%" or "不超过 5%"."""
     below = provider in COUNTDOWN_KEYS

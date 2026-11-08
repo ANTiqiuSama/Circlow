@@ -321,10 +321,15 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
             now = time.time()
             minutes = (snapshot.window_minutes, snapshot.secondary_window_minutes)
             names = "、".join(window_label(minutes[slot]) or "当前" for slot in empty)
-            until = usable_again_at(snapshot, now)
+            resets = (snapshot.resets_at, snapshot.secondary_resets_at)
+            stamps = [resets[slot] for slot in empty]
+            until = max(stamps) if all(stamp and stamp > now for stamp in stamps) else None
             back = f"{reset_distance(until, now)}后恢复" if until else "恢复时间未知"
             if state in ("near", "near_working"):
-                return f"{names}剩余{exhaustion_text(provider)}，按耗尽处理；{back}", "warn"
+                values = (snapshot.remaining_percent, snapshot.secondary_remaining_percent)
+                low = "、".join(f"{window_label(minutes[slot]) or '当前'}剩余{values[slot]:g}%" for slot in empty)
+                reset = f"{reset_distance(until, now)}后重置" if until else "重置时间未知"
+                return f"{low}，接近用尽；{reset}", "warn"
             if state == "paid":
                 using = "正在用购买的额度" if self.source_working(provider) else "可用购买的额度继续"
                 return f"{names}额度已用完，{using}；{back}", "warn"
@@ -473,14 +478,15 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
             status, tone = ("购买额度运行" if working or self.source_working(provider) else "可用购买额度"), "paid"
         elif state == "inferred":
             status, tone = "可能使用额外额度", "paid"
-        elif state in ("working", "near_working"):
+        elif state == "working":
             status, tone = "额度模式工作", "live"
         elif state == "near":
             status, tone = "接近用尽", "blocked"
         elif state == "blocked":
             status, tone = "等待重置", "blocked"
-        elif working:
-            status, tone = f"{working} 个在工作", "live"
+        elif working or self.source_working(provider):
+            count = max(1, working, int(data.get("active_sessions") or 0))
+            status, tone = f"{count} 个在工作", "live"
         elif snapshot is not None and snapshot.stale:
             status, tone = "旧数据", "stale"
         elif snapshot is not None and snapshot.error and snapshot.display_remaining is None:
