@@ -31,6 +31,20 @@ xcrun vtool -set-build-version macos "${minos:-11.0}" 26.0 -replace -output "$ex
 /usr/libexec/PlistBuddy -c 'Add :LSUIElement bool true' "$bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName 环流' "$bundle/Contents/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string 环流' "$bundle/Contents/Info.plist"
-codesign --force --deep --sign - "$bundle"
+# Sign with the "Circlow Development" identity when the login keychain has
+# one (macos-signing-identity.sh creates it), or with the identity named in
+# CIRCLOW_CODESIGN_IDENTITY, so every local build keeps the same signature:
+# the keychain's "always allow" for the MiMo session and the system's
+# permissions then survive a rebuild. Ad hoc otherwise (CI), whose
+# signature is a hash of the binary and changes with every build.
+identity="${CIRCLOW_CODESIGN_IDENTITY:-}"
+if [[ -z "$identity" ]] && security find-identity -v -p codesigning 2>/dev/null | grep -q '"Circlow Development"'; then
+  identity="Circlow Development"
+fi
+if [[ -n "$identity" ]]; then
+  codesign --force --deep --timestamp=none --sign "$identity" "$bundle"
+else
+  codesign --force --deep --sign - "$bundle"
+fi
 codesign --verify --deep --strict "$bundle"
-echo "Built: $bundle"
+echo "Built: $bundle (signed: ${identity:-ad hoc})"

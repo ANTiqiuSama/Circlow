@@ -110,6 +110,8 @@ open dist-macos/CodexQuotaTray.app
 
 也可从仓库的 **Actions → macOS menu bar build** 下载 Apple Silicon（arm64）或 Intel（x86_64）构建产物。工作流在 macOS runner 上生成 `.app` 并上传 ZIP；当前构建使用临时签名，未做 Apple 公证，首次打开可能需要在 macOS 安全设置中允许。该版本的实际菜单栏交互仍需 Mac 实机验收。
 
+在本机反复构建时，先运行一次 `bash macos-signing-identity.sh`：它在登录钥匙串里创建一个自签名的代码签名身份“Circlow Development”（有效期 10 年，macOS 会要求输入一次登录密码以信任该证书），此后 `build-macos.sh` 都用它签名，`.app` 的签名身份在每次重建后保持不变，钥匙串里对 MiMo 控制台会话选过的“始终允许”以及系统的通知权限都能沿用；没有这个身份时（如 CI）仍为临时签名，而临时签名是二进制的哈希，每次构建都不同，所以钥匙串每次都会重新询问。也可用 `CIRCLOW_CODESIGN_IDENTITY` 指定其他身份名。第一次用该身份签名时 codesign 可能请求一次使用密钥（选“始终允许”），新构建第一次读取 MiMo 会话时钥匙串再问一次，同样选“始终允许”，之后不再出现。
+
 每个开启的来源各有一个顶部菜单栏图标，从左到右固定为 Claude Code → Codex → Gemini → Grok → MiMo。图标与 Windows 托盘共用同一套绘制逻辑（`tray_icons.py`）：左右分环同时显示 5 小时与每周额度，Gemini 三个模型池三等分，用尽时显示红色倒计时与 `d`/`h`/`m` 单位，生成中显示 TPS，颜色与角标含义也与 Windows 一致。点击图标可看各额度窗口或 Gemini 模型池、距重置时间（如 `4小时32分钟后重置`）、Codex 用尽时的购买额度余额、最近 TPS、读取状态；旧数据会写明读数时间和原因。菜单打开期间按悬停频率刷新该来源。“打开来源”对 Claude 在装有 Claude.app 时直接打开它，否则与 Grok 一样在装有 herdr 时新建一个 herdr 工作区并启动对应 agent，同时把承载 herdr 的终端应用切到前台（没有 herdr 窗口时用“终端”打开一个）；没装 herdr 时在“终端”新窗口里直接运行对应 CLI。读取在后台进行，菜单栏启动时先显示本机缓存；数据保存在 `~/Library/Application Support/CodexQuotaTray/`。Finder 启动时会补充常见 CLI 路径，也可用 `CODEX_QUOTA_CODEX_EXE`、`CODEX_QUOTA_GROK_EXE`、`CODEX_QUOTA_GEMINI_EXE`、`CODEX_QUOTA_CLAUDE_EXE` 指定可执行文件。
 
 macOS 版的 Codex 使用 `codex app-server`，Gemini 使用 `agy /usage`，Grok 和已订阅的 Claude Code 使用临时 `/usage` 终端。Claude 默认关闭，订阅开通后才通过 `CODEX_QUOTA_PROVIDERS=codex,grok,gemini,claude` 启用。MiMo 目前支持手动套餐文件和本机 Credits 账本：在上述数据目录的 `mimo.json` 填入 `total_credits`、`period_end` 等字段后可显示 M 图标。MiMo 控制台登录凭据依赖 Windows DPAPI，Mac 版暂不支持自动登录或同步控制台用量，也不会将 cookie 以明文保存。Mac 版使用原生点击菜单，Windows 专属的悬停气泡与折线图、设置窗口、模型智商与开机自启开关尚未移植。
@@ -601,6 +603,7 @@ tray_app.py           程序入口、菜单、线程协调与登录启动项
 mac_menu.py           macOS 原生菜单栏入口、后台读取与菜单明细
 tray_icons.py         托盘 / 菜单栏共用的图标状态：分环、倒计时、TPS 与旧数据说明
 build-macos.sh        macOS 测试与 .app 构建入口
+macos-signing-identity.sh  为本机构建创建固定的代码签名身份（一次性，见上文）
 test_*.py             额度、速率、任务面板、定时任务、调度及 Claude 回归用例
 demo_assets.py        生成 README 演示图（演示数据）
 build.ps1             测试与 PyInstaller 构建入口
