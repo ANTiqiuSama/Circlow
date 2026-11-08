@@ -43,7 +43,7 @@ from forecast import reset_distance
 from quota_sources import QuotaSnapshot, collect, load_cached_snapshots, mimo_snapshot, mimo_tracker, placeholder, save_cached_snapshots
 from refresh_scheduler import RefreshScheduler
 from tps_sources import TpsMonitor, save_performance
-from tray_icons import make_display_icon, quota_exhausted, stale_note
+from tray_icons import make_display_icon, quota_depleted, stale_note
 
 
 HERDR_AGENTS = launchers.HERDR_AGENTS      # "打开来源" starts these in a new Herdr workspace
@@ -83,11 +83,12 @@ def paid_text(snapshot: QuotaSnapshot) -> str:
 
 def quota_rows(snapshot: QuotaSnapshot, now: float | None = None) -> list[str]:
     """Menu details: every known window/pool, without stale account data reuse."""
-    paid = (snapshot.provider == "codex" and snapshot.credits_balance is not None and snapshot.credits_balance > 0)
+    paid = (snapshot.provider == "codex" and not snapshot.stale and not snapshot.error
+            and snapshot.credits_balance is not None and snapshot.credits_balance > 0)
 
     def row(label: str, remaining: float | None, reset: int | None) -> str:
         value = "未知" if remaining is None else f"剩余 {remaining:.0f}%"
-        if paid and quota_exhausted(remaining, snapshot.provider):
+        if paid and quota_depleted(remaining):
             value = f"已用完 · {paid_text(snapshot)}"
         return f"{label} · {value} · {countdown(reset, now)}"
 

@@ -10,7 +10,7 @@ import agent_panel
 import forecast as forecast_module
 import providers as provider_registry
 from quota_sources import mimo_tracker
-from tray_icons import quota_exhausted
+from tray_icons import quota_depleted, quota_exhausted
 
 
 def provider_letter(provider: str) -> str:
@@ -50,7 +50,6 @@ class ChartData:
     """Needs from the tray: snapshots, performance, agents, tps_monitor,
     history."""
 
-    CHART_WEEKLY_BELOW = 10.0       # Codex 5-hour % left at which the chart shows the weekly window
     CHART_VIEW_MAX = 5 * 3600        # The solid line: the live window, at most its last 5 hours.
     CHART_POINTS = 160
     CHART_RECENT_SECONDS = 30 * 60  # keep completed work visible long enough to inspect its trend
@@ -78,16 +77,15 @@ class ChartData:
             agent.get("live") and agent.get("provider") == provider for agent in getattr(self, "agents", [])))
 
     def exhausted_state(self, provider: str) -> tuple[str | None, tuple[int, ...]]:
-        """Known credits, inferred Claude extra usage, working, or blocked."""
+        """Low-quota warnings versus genuinely depleted subscription windows."""
         snapshot = self.snapshots.get(provider)
-        if snapshot is None or snapshot.stale or provider == "mimo" or (snapshot.pools and len(snapshot.pools) > 1):
+        if snapshot is None or snapshot.stale or snapshot.error or provider == "mimo" or (snapshot.pools and len(snapshot.pools) > 1):
             return None, ()
         values = (snapshot.remaining_percent, snapshot.secondary_remaining_percent)
-        empty = tuple(slot for slot, value in enumerate(values) if quota_exhausted(value, provider))
+        empty = tuple(slot for slot, value in enumerate(values) if quota_depleted(value))
         if not empty:
-            return None, ()
-        if all(values[slot] >= 0.5 for slot in empty):
-            return ("near_working" if self.source_working(provider) else "near"), empty
+            near = tuple(slot for slot, value in enumerate(values) if quota_exhausted(value, provider))
+            return (("near_working" if self.source_working(provider) else "near"), near) if near else (None, ())
         if provider == "codex" and snapshot.credits_balance is not None and snapshot.credits_balance > 0:
             return "paid", empty
         if self.source_working(provider):
@@ -101,14 +99,15 @@ class ChartData:
         return "blocked", empty
 
     def codex_quota_mode(self) -> bool:
-        if "codex" not in self.snapshots or not self.source_working("codex"):
+        snapshot = self.snapshots.get("codex")
+        if snapshot is None or snapshot.stale or snapshot.error or not self.source_working("codex"):
             return False
         windows = self.quota_windows("codex")
         five = next((w for w in windows if w[3] == 300 and w[1] is not None), None)
         week = next((w for w in windows if w[3] == 10080 and w[1] is not None), None)
-        # The chart moves to the weekly curve only once the 5-hour window is
-        # nearly empty, not as early as the icon's 15% countdown.
-        return bool(five and five[1] <= self.CHART_WEEKLY_BELOW and week)
+        # A countdown icon is only an early warning. Keep the real five-hour
+        # curve until that window reaches zero and work continues.
+        return bool(five and quota_depleted(five[1]) and week)
 
     def active_sources(self, now: float) -> dict[str, set[str]]:
         """Sources working now or with real output in the last half hour, and
