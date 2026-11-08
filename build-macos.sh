@@ -21,7 +21,8 @@ python3 -m venv .venv-macos
 bundle="dist-macos/Circlow.app"
 test -d "$bundle"
 /usr/libexec/PlistBuddy -c 'Add :LSUIElement bool true' "$bundle/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string 环流' "$bundle/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName 环流' "$bundle/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string 环流' "$bundle/Contents/Info.plist"
 codesign --force --deep --sign - "$bundle"
 codesign --verify --deep --strict "$bundle"
 echo "Built: $bundle"
