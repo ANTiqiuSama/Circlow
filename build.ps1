@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
-python -X utf8 -m unittest -v test_quota_sources.py test_tps_sources.py test_tray_app.py test_split_ring.py test_features.py test_claude.py test_claude_status.py test_mimo.py test_reset_watch.py test_agent_tasks.py test_agent_hints.py test_settings.py test_usage_store.py test_process_jail.py test_model_iq.py test_sync_hub.py test_app_identity.py
+python -X utf8 -m unittest -v test_quota_sources.py test_tps_sources.py test_tray_app.py test_split_ring.py test_features.py test_claude.py test_claude_status.py test_mimo.py test_reset_watch.py test_agent_tasks.py test_agent_hints.py test_settings.py test_usage_store.py test_process_jail.py test_model_iq.py test_sync_hub.py test_app_identity.py test_glass_switch.py
 if ($LASTEXITCODE -ne 0) { throw "Tests failed" }
 $claudeReceiver = Join-Path $root 'claude_status.ps1'
 $appIcon = Join-Path $root 'assets\circlow-fox-tray-mascot.ico'

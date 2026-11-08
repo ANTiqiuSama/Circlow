@@ -52,6 +52,13 @@ class RenameTests(unittest.TestCase):
             self.assertEqual(app_identity.icon_file(".ico"), self.root / "circlow-fox-tray-mascot.ico")
             self.assertIsNone(app_identity.icon_file(".icns"))
 
+    def test_the_settings_sidebar_shows_the_mascot(self):
+        import settings_window
+        mark = settings_window.brand_mark(72)
+        self.assertEqual((mark.size, mark.mode), ((72, 72), "RGBA"))
+        with mock.patch.object(settings_window.app_identity, "icon_file", return_value=None):
+            self.assertIsNone(settings_window.brand_mark(72))
+
     def test_old_environment_settings_still_count(self):
         environ = {"CODEX_QUOTA_PROVIDERS": "codex", "CODEX_QUOTA_HERDR": "0", "CIRCLOW_HERDR": "1", "PATH": "x"}
         self.assertEqual(app_identity.adopt_legacy_env(environ), ["CIRCLOW_PROVIDERS"])
