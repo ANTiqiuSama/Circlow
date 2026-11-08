@@ -292,14 +292,21 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
     # ----- text and card content -------------------------------------------------
 
     def forecasts(self, provider: str) -> list[tuple[str, Forecast]]:
+        return [(label, outlook) for label, outlook, *_rest in self.window_outlooks(provider)]
+
+    def window_outlooks(self, provider: str, now: float | None = None) -> list[tuple]:
+        """(label, Forecast, remaining %, resets_at, minutes) per quota window."""
         snapshot = self.snapshots[provider]
         if self.history is None:
             return []
-        now = time.time()
-        result = [(window_label(snapshot.window_minutes), self.history.forecast_for(snapshot, now))]
+        now = now or time.time()
+        result = [(window_label(snapshot.window_minutes), self.history.forecast_for(snapshot, now),
+                   snapshot.remaining_percent, snapshot.resets_at, snapshot.window_minutes)]
         if snapshot.secondary_remaining_percent is not None:
             result.append((window_label(snapshot.secondary_window_minutes) or "第二窗口",
-                           self.history.forecast_for(snapshot, now, secondary=True)))
+                           self.history.forecast_for(snapshot, now, secondary=True),
+                           snapshot.secondary_remaining_percent, snapshot.secondary_resets_at,
+                           snapshot.secondary_window_minutes))
         return result
 
     def headline_forecast(self, provider: str) -> tuple[str, str]:
@@ -329,17 +336,13 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
             return f"{names}额度已用完，{back}{spare}", "danger"
         if snapshot is not None and snapshot.stale:
             return stale_note(snapshot, time.time()), "warn"
-        items = self.forecasts(provider)
+        now = time.time()
+        items = self.window_outlooks(provider, now)
         if not items:
             return "", "unknown"
         if provider == "codex" and self.codex_quota_mode():
-            weekly = next((outlook for label, outlook in items if label == "每周"), None)
-            if weekly is not None:
-                return f"每周额度：{weekly.text}", weekly.tone
-        rank = {"danger": 0, "warn": 1, "ok": 2, "idle": 3, "unknown": 4}
-        label, chosen = min(items, key=lambda item: (rank[item[1].tone], item[1].exhausts_at or float("inf")))
-        prefix = f"{label}额度：" if len(items) > 1 and label else ""
-        return prefix + chosen.text, chosen.tone
+            items = [item for item in items if item[0] == "每周"] or items
+        return forecast_module.outlook(items, now)
 
     POOL_FORECAST_FLOOR = 10.0   # % left: below this a pool's own run-out time is not announced
 
@@ -354,7 +357,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
             if remaining is None or remaining < self.POOL_FORECAST_FLOOR:
                 continue
             samples = max((forecast_module.current_window(self.history.samples(name), resets_at) for name in names), key=len)
-            outlook = forecast_module.forecast(samples, now, remaining, resets_at)
+            outlook = forecast_module.forecast(samples, now, remaining, resets_at, _minutes)
             if outlook.exhausts_at is not None and outlook.before_reset is not False and outlook.tone in ("warn", "danger"):
                 running_out.append((outlook.exhausts_at, label, outlook.tone))
         if not running_out:
@@ -510,7 +513,8 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                                       tone, banner, forecast, forecast_tone, today_used,
                                       self.burn_chart(provider, now), alert, intel, intel_note,
                                       quota_tones=tuple(tones), quota_figures=tuple(figures), column_iq=column_iq,
-                                      hint_now=hint_now, hint_next=hint_next)
+                                      hint_now=hint_now, hint_next=hint_next,
+                                      local_tps=self.local_tps(provider, data))
 
     def merge(self, first: str, second: str) -> str | None:
         a, b = self.clusters.get(first), self.clusters.get(second)
@@ -528,6 +532,14 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         log.info("agent group split: %s members=%s", key, len(members))
         return members
 
+    @staticmethod
+    def local_tps(provider: str, data: dict) -> float | None:
+        """This device's own TPS for the panel's "本机" line: shown only with
+        sync on (otherwise the panel's figure already is this device's)."""
+        if provider == "gemini" or "local_tps" not in data:
+            return None
+        return float(data.get("local_tps") or 0.0)
+
     def tooltip(self, provider: str) -> str:
         snapshot = self.snapshots[provider]
         performance = self.performance["providers"][provider]
@@ -536,7 +548,8 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         hint = f"可能即将全局重置（24h {self.reset_outlook.prob_24}%）\n" if provider == "codex" and self.reset_level() == "high" else ""
         if provider == "gemini":
             return f"{quota_line(snapshot)}\n{self.menu_reset(provider)}"[:127]
-        return f"{hint}{quota_line(snapshot)}\n最近TPS {generation} · 60秒 {performance['output_tps_60']:.1f} tok/s\n{self.menu_reset(provider)}"[:127]
+        mine = f" · 本机 {performance.get('local_tps') or 0:.0f}" if performance.get("devices") else ""
+        return f"{hint}{quota_line(snapshot)}\n最近TPS {generation}{mine} · 60秒 {performance['output_tps_60']:.1f} tok/s\n{self.menu_reset(provider)}"[:127]
 
     def build_menu(self, provider: str) -> pystray.Menu:
         return pystray.Menu(
@@ -645,7 +658,11 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         return f"最近60秒输出速率：{data['output_tps_60']:.1f} tok/s（{data['output_tokens_60']} 输出tokens）"
 
     def open_all_performance(self, _icon=None, _item=None) -> None:
-        sections = [f"本机合计 · 最近60秒：{self.performance['total_output_tps_60']:.1f} tok/s", ""]
+        if "local_total_output_tps_60" in self.performance:
+            sections = [f"全部设备 · 最近60秒：{self.performance['total_output_tps_60']:.1f} tok/s",
+                        f"本机 · 最近60秒：{self.performance['local_total_output_tps_60']:.1f} tok/s", ""]
+        else:
+            sections = [f"本机合计 · 最近60秒：{self.performance['total_output_tps_60']:.1f} tok/s", ""]
         for provider, data in self.performance["providers"].items():
             if provider == "gemini":
                 continue
@@ -756,9 +773,11 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                     self.scheduler.clock_jump(now)
                     self.wake.set()
                 last_wall = now
-                self.performance = self.tps_monitor.poll(now)
+                local = self.tps_monitor.poll(now)
+                self.performance = self.with_other_devices(local, now)
+                self.local_performance = local
                 self.agents = self.tps_monitor.agents(now)
-                self.save_performance_if_changed(self.performance, now)
+                self.save_performance_if_changed(local, now)
                 self.feed_scheduler(self.performance, now)
                 if "mimo" in PROVIDERS:
                     self.update_mimo_locally(now)
@@ -1197,10 +1216,29 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         if config is None:
             self.sync = None
             return False
-        self.sync = sync_hub.SyncLoop(sync_hub.HubClient(config), config["device"], self.sync_payload, self.sync_merge)
+        client = sync_hub.HubClient(config)
+        self.sync = sync_hub.SyncLoop(client, config["device"], self.sync_payload, self.sync_merge)
+        self.live = sync_hub.LiveLoop(client, config["device"], self.live_payload)
         threading.Thread(target=self.sync.run, args=(self.stop_event,), name="device-sync", daemon=True).start()
+        threading.Thread(target=self.live.run, args=(self.stop_event,), name="live-tps", daemon=True).start()
         log.info("sync: on as %s via %s", config["device"], config["url"])
         return True
+
+    def live_payload(self, now: float) -> dict:
+        """This device's own TPS for the other devices (never the merged one)."""
+        return sync_hub.live_payload(getattr(self, "local_performance", None) or self.performance, now)
+
+    def with_other_devices(self, local: dict, now: float) -> dict:
+        """The TPS every synced device shows (sync_hub.combine); this device's
+        own figures stay alongside as local_*. Unchanged without sync."""
+        live = getattr(self, "live", None)
+        if live is None:
+            return local
+        if any(row.get("active_sessions") for row in local.get("providers", {}).values()) and \
+                not any(row.get("active_sessions") for row in getattr(self, "local_performance", {}).get("providers", {}).values()):
+            live.wake()                       # started working: tell the others now
+        records, hub_now = live.view(now)
+        return sync_hub.combine(local, records, hub_now, live.device, now)
 
     def sync_payload(self, now: float) -> dict:
         """What this device shares: its quota readings, its own hourly output

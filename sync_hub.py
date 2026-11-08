@@ -42,6 +42,15 @@ HEARTBEAT = 600           # an unchanged payload is still sent this often
 BACKOFF = (120, 300, 600)  # after 1, 2, 3+ failed rounds
 TIMEOUT = 60              # a paused box can take ~45 s to wake on a request
 USAGE_DAYS = 8
+# Live TPS: while any device is working, every LIVE_ACTIVE seconds; otherwise
+# every LIVE_IDLE. A device not heard from for LIVE_FRESH seconds (by the
+# hub's clock) no longer counts. A reply's speed is shown for SAMPLE_AGE
+# seconds, as tps_sources does for local replies.
+LIVE_ACTIVE = 3
+LIVE_IDLE = 30
+LIVE_FRESH = 90
+LIVE_TIMEOUT = 15
+SAMPLE_AGE = 300
 SNAPSHOT_FIELDS = {field.name for field in dataclasses.fields(QuotaSnapshot)}
 
 
@@ -80,7 +89,7 @@ class HubClient:
         self.config = config
         self.opener = opener
 
-    def _call(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _call(self, method: str, path: str, body: dict | None = None, timeout: float = TIMEOUT) -> dict:
         headers = {"X-Sync-Token": self.config["token"], "Accept": "application/json"}
         if self.config.get("link_token"):
             headers["Authorization"] = f"Bearer {self.config['link_token']}"
@@ -89,7 +98,7 @@ class HubClient:
             data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.config["url"] + path, data=data, headers=headers, method=method)
-        with self.opener(request, timeout=TIMEOUT) as response:
+        with self.opener(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
 
     def put(self, device: str, payload: dict) -> None:
@@ -97,6 +106,14 @@ class HubClient:
 
     def get_all(self) -> dict[str, dict]:
         return self._call("GET", "/v1/devices").get("devices", {})
+
+    def put_live(self, device: str, payload: dict) -> None:
+        self._call("PUT", f"/v1/live/{device}", payload, timeout=LIVE_TIMEOUT)
+
+    def get_live(self) -> tuple[dict[str, dict], float]:
+        """Every device's live TPS and the hub's clock."""
+        answer = self._call("GET", "/v1/live", timeout=LIVE_TIMEOUT)
+        return answer.get("live", {}), float(answer.get("now") or time.time())
 
 
 def snapshot_payload(snapshots: dict[str, QuotaSnapshot | None]) -> dict[str, dict]:
@@ -212,6 +229,142 @@ class SyncLoop:
                 return "正在连接同步服务器"
             when = time.strftime("%H:%M", time.localtime(self.last_ok))
             return f"{when} 已同步" + (f"；另有 {len(others)} 台设备：{'、'.join(others)}" if others else "；暂无其他设备")
+
+
+# ----- live TPS: the same figure on every device -----------------------------------------
+
+def live_payload(performance: dict, now: float, label: str = "") -> dict:
+    """This device's own TPS per source, for the hub's live channel. Ages, not
+    timestamps, so the devices' clocks never have to agree."""
+    providers = {}
+    for provider, data in (performance.get("providers") or {}).items():
+        sample = data.get("last_sample_at")
+        age = round(now - sample, 2) if sample else None
+        active = int(data.get("active_sessions") or 0)
+        tokens = int(data.get("output_tokens_60") or 0)
+        if active or tokens or (age is not None and age <= SAMPLE_AGE):
+            providers[provider] = {"active": active, "tps": data.get("display_tps"), "age": age,
+                                   "model": data.get("display_model"), "tokens_60": tokens}
+    return {"label": label or device_label(), "providers": providers}
+
+
+def combine(performance: dict, live: dict[str, dict], hub_now: float, me: str, now: float) -> dict:
+    """`performance` (this device's, from TpsMonitor.poll) with the other
+    devices' live TPS folded in, so every device shows the same figures:
+
+    - the TPS shown is the most recent reply's, on whichever device it ran;
+    - the 60 s output and the number of working sessions add up;
+    - each source keeps this device's own figure as local_tps / local_active
+      / local_output_tps_60, and names the other working devices in `devices`.
+
+    Every device applies the same rule to the same numbers, so they agree up
+    to one live round (LIVE_ACTIVE seconds)."""
+    others = []
+    for device, record in (live or {}).items():
+        if device == me or not isinstance(record, dict):
+            continue
+        late = hub_now - float(record.get("received_at") or 0)
+        payload = record.get("payload") or {}
+        if -5 <= late <= LIVE_FRESH:                  # a few seconds of jitter between hub reads
+            others.append((str(payload.get("label") or device), max(0.0, late), payload.get("providers") or {}))
+    merged = dict(performance)
+    providers = {}
+    total = 0
+    for provider, data in (performance.get("providers") or {}).items():
+        row = dict(data)
+        local_tps, local_active, local_tokens = data.get("display_tps"), int(data.get("active_sessions") or 0), int(data.get("output_tokens_60") or 0)
+        sample = data.get("last_sample_at")
+        best = (now - sample, local_tps, data.get("display_model")) if sample and local_tps is not None else None
+        active, tokens, devices = local_active, local_tokens, []
+        for label, late, rows in others:
+            remote = rows.get(provider)
+            if not isinstance(remote, dict):
+                continue
+            try:
+                remote_active, remote_tokens = int(remote.get("active") or 0), int(remote.get("tokens_60") or 0)
+                remote_tps = None if remote.get("tps") is None else float(remote["tps"])
+                age = None if remote.get("age") is None else float(remote["age"]) + late
+            except (TypeError, ValueError):
+                continue
+            active += remote_active
+            tokens += remote_tokens
+            if remote_tps is not None and age is not None and age <= SAMPLE_AGE and (best is None or age < best[0]):
+                best = (age, remote_tps, remote.get("model"))
+            if remote_active or remote_tokens or (remote_tps is not None and age is not None and age <= SAMPLE_AGE):
+                devices.append({"label": label, "tps": remote_tps, "active": remote_active})
+        row.update(local_tps=local_tps, local_active=local_active, local_output_tps_60=data.get("output_tps_60", 0.0),
+                   devices=devices, active_sessions=active, output_tokens_60=tokens, output_tps_60=round(tokens / 60, 2))
+        if best is not None:
+            age, tps, model = best
+            row.update(display_tps=tps, generation_tps=tps, display_model=model or data.get("display_model"),
+                       last_sample_at=now - age)
+        providers[provider] = row
+        total += tokens
+    merged["providers"] = providers
+    merged["local_total_output_tps_60"] = performance.get("total_output_tps_60", 0.0)
+    merged["total_output_tps_60"] = round(total / 60, 2)
+    merged["devices_seen"] = len(others)
+    return merged
+
+
+class LiveLoop:
+    """Swaps live TPS with the other devices: every LIVE_ACTIVE seconds while
+    any of them (or this one) is working, every LIVE_IDLE otherwise. view()
+    gives the last read, adjusted to the hub's clock now."""
+
+    def __init__(self, client: HubClient, device: str, collect: Callable[[float], dict]):
+        self.client, self.device, self.collect = client, device, collect
+        self.live: dict[str, dict] = {}
+        self.hub_now = 0.0
+        self.read_at = 0.0
+        self.failures = 0
+        self.next_at = 0.0
+        self.lock = threading.Lock()
+
+    def busy(self, payload: dict) -> bool:
+        if any(row.get("active") for row in (payload.get("providers") or {}).values()):
+            return True
+        with self.lock:
+            late = self.hub_now
+            return any(device != self.device and late - float(record.get("received_at") or 0) <= LIVE_FRESH
+                       and any(row.get("active") for row in ((record.get("payload") or {}).get("providers") or {}).values()
+                               if isinstance(row, dict))
+                       for device, record in self.live.items() if isinstance(record, dict))
+
+    def tick(self, now: float) -> bool:
+        if now < self.next_at:
+            return False
+        try:
+            payload = self.collect(now)
+            self.client.put_live(self.device, payload)
+            live, hub_now = self.client.get_live()
+        except (OSError, ValueError, urllib.error.URLError):
+            self.failures += 1
+            self.next_at = now + BACKOFF[min(self.failures, len(BACKOFF)) - 1]
+            return False
+        with self.lock:
+            self.live, self.hub_now, self.read_at = live, hub_now, now
+        self.failures = 0
+        self.next_at = now + (LIVE_ACTIVE if self.busy(payload) else LIVE_IDLE)
+        return True
+
+    def wake(self) -> None:
+        """This device started working: swap at once rather than at the idle pace."""
+        self.next_at = 0.0
+
+    def view(self, now: float) -> tuple[dict[str, dict], float]:
+        with self.lock:
+            if not self.read_at:
+                return {}, now
+            return self.live, self.hub_now + (now - self.read_at)
+
+    def run(self, stop: threading.Event) -> None:
+        while not stop.is_set():
+            try:
+                self.tick(time.time())
+            except Exception:
+                log.exception("live TPS round failed")
+            stop.wait(0.5)
 
 
 def _reason(error: Exception) -> str:

@@ -298,6 +298,117 @@ class ServerTests(unittest.TestCase):
         client.put("mac-air", {"label": "Mac"})
         self.assertEqual(client.get_all()["mac-air"]["payload"], {"label": "Mac"})
 
+    def test_live_tps_goes_through_memory_only(self):
+        self.assertEqual(self.call("PUT", "/v1/live/win-pc", {"providers": {}}, token="wrong")[0], 401)
+        self.assertEqual(self.call("PUT", "/v1/live/bad%21name", {"a": 1})[0], 400)
+        client = sync_hub.HubClient({"url": self.url, "token": "secret"})
+        client.put_live("win-pc", {"label": "PC", "providers": {"codex": {"tps": 80}}})
+        live, hub_now = client.get_live()
+        self.assertEqual(live["win-pc"]["payload"]["providers"]["codex"]["tps"], 80)
+        self.assertLess(abs(hub_now - time.time()), 5)
+        self.assertFalse(any(self.folder.rglob("*win-pc*")))           # nothing written to disk
+        self.server_module.LIVE["old"] = {"received_at": time.time() - 3600, "payload": {}}
+        self.assertNotIn("old", client.get_live()[0])
+
+
+def perf(providers, total=None):
+    rows = {}
+    for provider, (tps, sample_at, active, tokens) in providers.items():
+        rows[provider] = {"label": provider, "display_tps": tps, "generation_tps": tps, "display_model": f"{provider}-model",
+                          "last_sample_at": sample_at, "active_sessions": active, "output_tokens_60": tokens,
+                          "output_tps_60": round(tokens / 60, 2)}
+    return {"providers": rows, "total_output_tps_60": total if total is not None else round(sum(r["output_tokens_60"] for r in rows.values()) / 60, 2)}
+
+
+class LiveTpsTests(unittest.TestCase):
+    NOW = 10_000.0
+
+    def remote(self, providers, late=1.0, hub_now=50_000.0, label="Mac · air"):
+        """A record as the hub returns it: ages measured on the Mac, hub clock unrelated to ours."""
+        payload = sync_hub.live_payload(perf(providers), 7_000.0, label)
+        return {"mac-air": {"received_at": hub_now - late, "payload": payload}}, hub_now
+
+    def test_the_payload_carries_ages_not_timestamps(self):
+        payload = sync_hub.live_payload(perf({"codex": (90.0, 9_990.0, 1, 600), "grok": (None, None, 0, 0)}), self.NOW, "PC")
+        self.assertEqual(payload["providers"], {"codex": {"active": 1, "tps": 90.0, "age": 10.0, "model": "codex-model", "tokens_60": 600}})
+
+    def test_every_device_shows_the_newest_reply_and_the_summed_output(self):
+        local = perf({"codex": (60.0, self.NOW - 40, 1, 1200), "claude": (30.0, self.NOW - 20, 0, 0)})
+        live, hub_now = self.remote({"codex": (95.0, 7_000.0 - 5, 2, 600)}, late=2.0)
+        merged = sync_hub.combine(local, live, hub_now, "win-pc", self.NOW)
+        codex = merged["providers"]["codex"]
+        self.assertEqual(codex["display_tps"], 95.0)                    # the Mac's reply is newer (7 s vs 40 s)
+        self.assertEqual(codex["display_model"], "codex-model")
+        self.assertAlmostEqual(codex["last_sample_at"], self.NOW - 7)
+        self.assertEqual((codex["active_sessions"], codex["output_tokens_60"], codex["output_tps_60"]), (3, 1800, 30.0))
+        self.assertEqual((codex["local_tps"], codex["local_active"], codex["local_output_tps_60"]), (60.0, 1, 20.0))
+        self.assertEqual(codex["devices"], [{"label": "Mac · air", "tps": 95.0, "active": 2}])
+        self.assertEqual(merged["providers"]["claude"]["display_tps"], 30.0)
+        self.assertEqual(merged["providers"]["claude"]["devices"], [])
+        self.assertEqual((merged["total_output_tps_60"], merged["local_total_output_tps_60"]), (30.0, 20.0))
+        self.assertEqual(local["providers"]["codex"]["display_tps"], 60.0)      # the input is left alone
+
+    def test_both_devices_agree(self):
+        """Windows folds in the Mac and the Mac folds in Windows: the same figures."""
+        windows = perf({"codex": (60.0, self.NOW - 40, 1, 1200)})
+        mac_now = 7_000.0
+        mac = perf({"codex": (95.0, mac_now - 5, 2, 600)})
+        hub_now = 50_000.0
+        live = {"win-pc": {"received_at": hub_now, "payload": sync_hub.live_payload(windows, self.NOW, "PC")},
+                "mac-air": {"received_at": hub_now, "payload": sync_hub.live_payload(mac, mac_now, "Mac")}}
+        on_windows = sync_hub.combine(windows, live, hub_now, "win-pc", self.NOW)["providers"]["codex"]
+        on_mac = sync_hub.combine(mac, live, hub_now, "mac-air", mac_now)["providers"]["codex"]
+        for key in ("display_tps", "active_sessions", "output_tps_60"):
+            self.assertEqual(on_windows[key], on_mac[key], key)
+        self.assertEqual((on_windows["local_tps"], on_mac["local_tps"]), (60.0, 95.0))
+
+    def test_a_silent_device_or_an_old_reply_no_longer_counts(self):
+        local = perf({"codex": (60.0, self.NOW - 40, 0, 0)})
+        live, hub_now = self.remote({"codex": (95.0, 7_000.0 - 5, 1, 600)}, late=sync_hub.LIVE_FRESH + 5)
+        self.assertEqual(sync_hub.combine(local, live, hub_now, "win-pc", self.NOW)["providers"]["codex"]["display_tps"], 60.0)
+        live, hub_now = self.remote({"codex": (95.0, 7_000.0 - sync_hub.SAMPLE_AGE + 1, 0, 0)}, late=10)
+        self.assertEqual(sync_hub.combine(local, live, hub_now, "win-pc", self.NOW)["providers"]["codex"]["display_tps"], 60.0)
+
+    def test_without_other_devices_only_the_local_fields_are_added(self):
+        local = perf({"codex": (60.0, self.NOW - 4, 1, 300)})
+        merged = sync_hub.combine(local, {}, self.NOW, "win-pc", self.NOW)["providers"]["codex"]
+        self.assertEqual((merged["display_tps"], merged["local_tps"], merged["devices"]), (60.0, 60.0, []))
+
+    def test_the_live_loop_speeds_up_while_anyone_works(self):
+        client = mock.Mock()
+        client.get_live.return_value = ({}, 1000.0)
+        payloads = {"value": {"providers": {}}}
+        loop = sync_hub.LiveLoop(client, "win-pc", lambda now: payloads["value"])
+        self.assertTrue(loop.tick(0))
+        self.assertEqual(loop.next_at, sync_hub.LIVE_IDLE)
+        payloads["value"] = {"providers": {"codex": {"active": 1}}}
+        loop.wake()
+        self.assertTrue(loop.tick(5))
+        self.assertEqual(loop.next_at, 5 + sync_hub.LIVE_ACTIVE)
+        payloads["value"] = {"providers": {}}
+        client.get_live.return_value = ({"mac-air": {"received_at": 999.0, "payload": {"providers": {"codex": {"active": 2}}}}}, 1000.0)
+        loop.tick(loop.next_at)
+        self.assertEqual(loop.next_at - 8, sync_hub.LIVE_ACTIVE)                 # the Mac is working
+        client.put_live.side_effect = OSError("down")
+        self.assertFalse(loop.tick(loop.next_at))
+        live, hub_now = loop.view(20)
+        self.assertIn("mac-air", live)
+        self.assertEqual(hub_now, 1000.0 + 12)
+
+    def test_the_tray_shows_the_shared_figure_and_its_own(self):
+        from tray_app import QuotaTray
+        tray = QuotaTray.__new__(QuotaTray)
+        self.assertIsNone(QuotaTray.local_tps("codex", {"display_tps": 60.0}))     # no sync: no "本机" line
+        self.assertEqual(QuotaTray.local_tps("codex", {"local_tps": 60.0}), 60.0)
+        self.assertIsNone(QuotaTray.local_tps("gemini", {"local_tps": 60.0}))
+        tray.live = mock.Mock(device="win-pc")
+        tray.live.view.return_value = self.remote({"codex": (95.0, 7_000.0 - 5, 2, 600)})
+        merged = tray.with_other_devices(perf({"codex": (60.0, self.NOW - 40, 1, 1200)}), self.NOW)
+        self.assertEqual(merged["providers"]["codex"]["display_tps"], 95.0)
+        tray.live = None
+        local = perf({"codex": (60.0, self.NOW - 40, 1, 1200)})
+        self.assertIs(tray.with_other_devices(local, self.NOW), local)
+
 
 if __name__ == "__main__":
     unittest.main()

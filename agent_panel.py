@@ -120,6 +120,7 @@ class PanelModel:
     column_iq: tuple = ()                       # spare header slot, Grok only: (label, figure, caption, unit)
     hint_now: str = ""                          # MiMo or local summary of current agent work
     hint_next: str = ""                         # one optional next action
+    local_tps: float | None = None              # with multi-device sync: this device's own TPS, under the shared figure
 
     def figure_of(self, slot: int) -> tuple[str, str] | None:
         return self.quota_figures[slot] if slot < len(self.quota_figures) else None
@@ -747,6 +748,10 @@ class Scene:
             rate = max(0.0, self.rate.value)
             blit_at(frame, figure(f"{rate:.0f}", "tok/s", color if model.tps and rate >= 0.5 else TEXT, SECONDARY_TEXT, scale),
                     at(x), at(meter_top + 38))
+            if model.local_tps is not None:
+                # The figure is the same on every synced device; this one's own share below.
+                draw.text((at(x), at(meter_top + 55)), f"本机 {model.local_tps:.0f}", font=ui_font(max(1, round(10 * scale))),
+                          fill=MUTED_TEXT, anchor="lt")
         if model.status_tone == "live":
             p = (self.time % 1.8) / 1.8
             blit(frame, faded(ring(round((4 + 7 * ease_out_cubic(p)) * scale), max(1, round(1.2 * scale)), model.letter),
