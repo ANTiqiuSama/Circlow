@@ -6,6 +6,7 @@ on:
     paths:
       - 'mac_menu.py'
       - 'app_identity.py'
+      - 'assets/circlow-fox-tray-mascot.icns'
       - 'test_app_identity.py'
       - 'sync_hub.py'
       - 'usage_store.py'
@@ -49,6 +50,7 @@ on:
     paths:
       - 'mac_menu.py'
       - 'app_identity.py'
+      - 'assets/circlow-fox-tray-mascot.icns'
       - 'test_app_identity.py'
       - 'sync_hub.py'
       - 'usage_store.py'

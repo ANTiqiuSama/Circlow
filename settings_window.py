@@ -15,6 +15,7 @@ Switches and form fields are staged: the footer lists what is not saved yet and
 """
 from __future__ import annotations
 
+import app_identity
 import json
 import logging
 import os
@@ -404,6 +405,7 @@ class SettingsWindow:
         root = self.root = tk.Tk()
         root.withdraw()
         root.title("环流 · Circlow 设置")
+        self._window_icon(root)
         root.configure(bg=view.BG)
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         S = self.S = lambda value: round(value * self.scale)  # noqa: E731
@@ -443,6 +445,23 @@ class SettingsWindow:
         self.zoom_dismissed = None    # start of the fast run the user zoomed back out of
         self.reflow = ui_motion.Throttle(root, 30, self._reflow)
         self._layout()
+
+    def _window_icon(self, root) -> None:
+        """The app's icon on the window and its taskbar button (Windows), or
+        on the window from source on macOS (a build shows the bundle's)."""
+        try:
+            ico = app_identity.icon_file(".ico") if sys.platform == "win32" else None
+            if ico is not None:
+                root.iconbitmap(default=str(ico))
+                return
+            png = app_identity.icon_file(".png")
+            if png is not None:
+                from PIL import Image
+                with Image.open(png) as picture:
+                    self._icon_photo = self.ImageTk.PhotoImage(picture.convert("RGBA").resize((256, 256), Image.LANCZOS))
+                root.iconphoto(True, self._icon_photo)
+        except (OSError, self.tk.TclError):
+            pass
 
     def _saved_minutes(self) -> int:
         try:

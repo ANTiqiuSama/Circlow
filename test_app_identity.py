@@ -44,6 +44,14 @@ class RenameTests(unittest.TestCase):
         self.assertEqual((self.root / "Circlow" / "usage.json.gz").read_bytes(), b"x")
         self.assertTrue(old.exists())
 
+    def test_the_app_icon_is_found_in_assets_and_in_a_build(self):
+        for suffix in (".ico", ".icns", ".png"):
+            self.assertTrue(app_identity.icon_file(suffix).is_file(), suffix)
+        (self.root / "circlow-fox-tray-mascot.ico").write_bytes(b"x")
+        with mock.patch.object(app_identity.sys, "_MEIPASS", str(self.root), create=True):
+            self.assertEqual(app_identity.icon_file(".ico"), self.root / "circlow-fox-tray-mascot.ico")
+            self.assertIsNone(app_identity.icon_file(".icns"))
+
     def test_old_environment_settings_still_count(self):
         environ = {"CODEX_QUOTA_PROVIDERS": "codex", "CODEX_QUOTA_HERDR": "0", "CIRCLOW_HERDR": "1", "PATH": "x"}
         self.assertEqual(app_identity.adopt_legacy_env(environ), ["CIRCLOW_PROVIDERS"])

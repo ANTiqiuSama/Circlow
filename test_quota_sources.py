@@ -1,4 +1,5 @@
 import time
+import shutil
 import os
 from datetime import datetime
 import unittest
@@ -374,7 +375,8 @@ class QuotaTests(unittest.TestCase):
 
     def test_cached_snapshots_are_marked_stale(self):
         original = quota_sources.CACHE_PATH
-        temporary = Path(original).with_name("state-test.json")
+        folder = tempfile.mkdtemp()                # never the real data folder
+        temporary = Path(folder) / "state-test.json"
         quota_sources.CACHE_PATH = temporary
         try:
             quota_sources.save_cached_snapshots({"sample": self.sample(42)})
@@ -383,6 +385,7 @@ class QuotaTests(unittest.TestCase):
             self.assertTrue(loaded.stale)
         finally:
             quota_sources.CACHE_PATH = original
+            shutil.rmtree(folder, ignore_errors=True)
             temporary.unlink(missing_ok=True)
 
 
