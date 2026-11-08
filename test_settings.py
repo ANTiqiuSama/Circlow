@@ -366,5 +366,104 @@ class SourceSwitchTests(unittest.TestCase):
             self.assertFalse(path.exists())
 
 
+class Var:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class AutoSaveTests(unittest.TestCase):
+    """No save button: each group is saved on its own a moment after an edit."""
+
+    def window(self, app=None):
+        from unittest.mock import Mock
+        import settings_window
+        window = settings_window.SettingsWindow.__new__(settings_window.SettingsWindow)
+        window.app = app or Mock()
+        window.vars = {"summary": Var(False), "startup": Var(False), "herdr": Var(True), "source:claude": Var(True)}
+        window.fields = {"url": Var(""), "model": Var(""), "key": Var("")}
+        window.iq_key, window.iq_selected = Var(""), []
+        window.mimo_fields = {name: Var("") for name in ("total", "end", "used", "name")}
+        window.root = Mock()
+        window.root.after.return_value = "job"
+        window.status, window.status_label = Var(""), Mock()
+        window.status_label.cget.return_value = ""
+        window.notice = ("", 0.0)
+        window._fill_mimo = Mock()
+        window.origins = window.staged()
+        window.seen = dict(window.origins)
+        window.save_problems = {}
+        return window
+
+    def test_delays_follow_what_changed(self):
+        import settings_window
+        self.assertEqual(settings_window.save_delay(["startup"]), settings_window.SAVE_DELAYS["switch"])
+        self.assertEqual(settings_window.save_delay(["startup", "field:url"]), settings_window.SAVE_DELAYS["text"])
+        self.assertEqual(settings_window.save_delay(["iq:key"]), settings_window.SAVE_DELAYS["text"])
+        self.assertEqual(settings_window.save_delay(["field:url", "source:grok"]), settings_window.SAVE_DELAYS["source"])
+
+    def test_only_a_real_edit_schedules_a_save(self):
+        window = self.window()
+        window.update_footer()                                    # nothing changed
+        window.root.after.assert_not_called()
+        window.vars["startup"].set(True)
+        window.update_footer()
+        window.root.after.assert_called_once()
+        self.assertEqual(window.root.after.call_args.args[0], 150)
+        window.update_footer()                                    # same values again (a notice, a redraw): no new save
+        window.root.after.assert_called_once()
+
+    def test_a_failing_group_does_not_hold_back_the_others(self):
+        window = self.window()
+        window.app.apply_summary_settings.side_effect = ValueError("API 地址无效")
+        window.fields["url"].set("not a url")
+        window.vars["startup"].set(True)
+        window.vars["herdr"].set(False)
+        window.save()
+        window.app.toggle_startup.assert_called_once()
+        window.app.save_preferences.assert_called_once_with({"herdr": False})
+        self.assertEqual(window.save_problems, {"summary": "任务命名：API 地址无效"})
+        self.assertTrue(window.origins["startup"])                # saved
+        self.assertEqual(window.origins["field:url"], "")         # still pending
+        self.assertIn("未能保存", window.status.get())
+        window.app.apply_summary_settings.side_effect = None
+        window.save()                                             # fixed on the next edit
+        self.assertEqual(window.save_problems, {})
+        self.assertEqual(window.origins["field:url"], "not a url")
+
+    def test_sources_go_last_and_mimo_waits_for_its_required_fields(self):
+        window = self.window()
+        order = []
+        window.app.toggle_startup.side_effect = lambda: order.append("startup")
+        window.app.set_providers.side_effect = lambda changes: order.append(("sources", changes))
+        window.vars["source:claude"].set(False)
+        window.vars["startup"].set(True)
+        window.mimo_fields["total"].set("49.2B")              # no end date yet
+        window.save()
+        self.assertEqual(order, ["startup", ("sources", {"claude": False})])
+        window.app.save_mimo_manual.assert_not_called()
+        self.assertEqual(window.changed_keys(), ["mimo:total"])   # waits, without an error
+        self.assertNotIn("mimo", window.save_problems)
+        self.assertTrue(window.notice[0].startswith("✓ 已保存，托盘正在重启"))
+        window.mimo_fields["end"].set("2027-01-01")
+        window.save()
+        window.app.save_mimo_manual.assert_called_once_with("49.2B", "2027-01-01", "", "")
+        self.assertEqual(window.changed_keys(), [])
+
+    def test_closing_saves_what_is_waiting(self):
+        window = self.window()
+        window.save_job = "job"
+        window.vars["startup"].set(True)
+        window.close()
+        window.root.after_cancel.assert_called_once_with("job")
+        window.app.toggle_startup.assert_called_once()
+        window.root.withdraw.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

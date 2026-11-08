@@ -130,14 +130,18 @@ class SettingsTrayTest(TempData):
         self.assertTrue(tray.stop_event.is_set())
         self.assertEqual([c["name"] for c in settings_mac.take_commands(settings_mac.MENU)], ["refresh", "quit"])
         tray.stop_event.clear()
-        shown = next(iter(tray_app.PROVIDERS))
-        with patch.object(tray_app.provider_registry, "set_provider_choices") as choose:
-            tray.set_providers({shown: True})                 # no change: nothing happens
+        saved = ["codex", "grok"]                                 # the switches as saved right now
+        with patch.object(tray_app.provider_registry, "enabled_keys", side_effect=lambda: list(saved)), \
+                patch.object(tray_app.provider_registry, "set_provider_choices") as choose:
+            tray.set_providers({"codex": True})                   # no change: nothing happens
             choose.assert_not_called()
-            tray.set_providers({shown: False})
-        choose.assert_called_once_with({shown: False})
-        self.assertEqual(settings_mac.take_commands(settings_mac.MENU), [{"name": "restart"}])
-        self.assertTrue(tray.stop_event.is_set())
+            tray.set_providers({"codex": False})
+            choose.assert_called_with({"codex": False})
+            saved.remove("codex")
+            tray.set_providers({"codex": True})                   # back on in the same sitting: a change too
+            choose.assert_called_with({"codex": True})
+        self.assertEqual(settings_mac.take_commands(settings_mac.MENU), [{"name": "restart"}, {"name": "restart"}])
+        self.assertFalse(tray.stop_event.is_set())                # the window stays open while the menu bar restarts
 
     def test_startup_switch_uses_the_login_item_and_mimo_login_explains(self):
         tray = self.settings_tray()

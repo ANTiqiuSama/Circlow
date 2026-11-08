@@ -249,13 +249,15 @@ def make_settings_tray():
             send_command(MENU, "refresh", providers=["mimo"])
 
         def set_providers(self, changes: dict) -> None:
-            changes = {key: value for key, value in changes.items() if (key in tray_app.PROVIDERS) != bool(value)}
+            # Against the switches as saved now, not the set this process
+            # started with: off and back on in one sitting are two changes.
+            shown = set(tray_app.provider_registry.enabled_keys())
+            changes = {key: value for key, value in changes.items() if (key in shown) != bool(value)}
             if not changes:
                 return
             tray_app.provider_registry.set_provider_choices(changes)
             log.info("source switches changed from settings: %s", changes)
-            send_command(MENU, "restart")
-            self.stop_event.set()          # the menu bar comes back with the new set; this window closes
+            send_command(MENU, "restart")     # the menu bar comes back with the new set; this window stays open
 
         def exit_app(self, _icon=None, _item=None) -> None:
             send_command(MENU, "quit")

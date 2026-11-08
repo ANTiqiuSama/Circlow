@@ -9,9 +9,12 @@ Five pages:
 * 任务     herdr and the optional task-naming API;
 * 常规     start with Windows, how often each source is read, tools, exit.
 
-Switches and form fields are staged: the footer lists what is not saved yet and
-保存 applies it (source switches restart the tray). Buttons such as 登录 or
-立即读取 act at once and say so next to them.
+There is no save button: a change is saved on its own a moment after it is
+made (switches at once, text fields once typing stops, source switches after a
+short pause so several flips restart the tray once), and the footer says so.
+Each group is saved by itself, so a field that does not check out (shown in
+the footer) never holds back the others. Buttons such as 登录 or 立即读取 act at
+once and say so next to them.
 """
 from __future__ import annotations
 
@@ -77,6 +80,20 @@ PAGES = (("overview", "概览"), ("sources", "来源"), ("iq", "模型智商"), 
 PAGE_ALIASES = {"mimo": "sources", "agents": "tasks", "naming": "tasks"}
 PROVIDER_NAMES = {"codex": "Codex", "grok": "Grok", "gemini": "Gemini", "claude": "Claude Code", "mimo": "Xiaomi MiMo"}
 NOTICE_SECONDS = 6
+# Milliseconds from the last change to the automatic save: a switch at once,
+# a text field once typing stops, source switches after a pause (each save
+# of them restarts the tray, so several flips are applied together).
+SAVE_DELAYS = {"switch": 150, "text": 800, "source": 1200}
+
+
+def save_delay(keys) -> int:
+    """The wait before saving these changed staged keys (see SAVE_DELAYS)."""
+    keys = list(keys)
+    if any(key.startswith("source:") for key in keys):
+        return SAVE_DELAYS["source"]
+    if any(key.startswith(("field:", "mimo:")) or key == "iq:key" for key in keys):
+        return SAVE_DELAYS["text"]
+    return SAVE_DELAYS["switch"]
 _LATIN = re.compile(r"[A-Za-z0-9_./:@%+-]")
 
 
@@ -1049,9 +1066,7 @@ class SettingsWindow:
         self.status = tk.StringVar()
         self.status_label = self.label(footer, "", 10, view.INK_2, textvariable=self.status)
         self.status_label.pack(side="left", fill="x", expand=True)
-        self.save_button = self.button(footer, "保存", self.save, "primary")
-        self.save_button.pack(side="right")
-        self.button(footer, "关闭", self.close).pack(side="right", padx=S(8))
+        self.button(footer, "关闭", self.close).pack(side="right")
         self.body = tk.Frame(main, bg=view.BG)
         self.body.pack(fill="both", expand=True, padx=(S(28), S(14)), pady=(S(22), S(6)))
         keys = [key for key, _ in PAGES] + ["detail"]
@@ -1452,7 +1467,7 @@ class SettingsWindow:
     def _sources(self, page):
         import providers
         tk, S = self.tk, self.S
-        self.heading(page, "来源", "开关在保存后生效并自动重启托盘；MiMo 的登录与手动套餐立即生效。")
+        self.heading(page, "来源", "开关改动后自动保存，托盘随即重启应用；MiMo 的登录与手动套餐同样立即生效。")
         if os.environ.get("CIRCLOW_PROVIDERS"):
             self.para(page, f"已设置 CIRCLOW_PROVIDERS={os.environ['CIRCLOW_PROVIDERS']}；本页开关优先于它。", 9, view.WARN).pack(
                 anchor="w", fill="x", pady=(0, S(10)))
@@ -1483,7 +1498,7 @@ class SettingsWindow:
             if row is None:
                 continue
             pending = bool(self.vars["source:" + state["key"]].get()) != state["enabled"]
-            text = ("当前已开启" if state["enabled"] else "当前已关闭") + f" · {state['reason']}" + ("　→ 保存后重启生效" if pending else "")
+            text = ("当前已开启" if state["enabled"] else "当前已关闭") + f" · {state['reason']}" + ("　→ 正在应用，托盘将重启" if pending else "")
             self.set_text(row.state, text, fg=view.WARN if pending else view.INK_2)
         self._fill_health()
 
@@ -1510,6 +1525,8 @@ class SettingsWindow:
         self.mimo_manual = tk.Frame(self.mimo_drawer, bg=view.FIELD)
         self.mimo_manual.pack(fill="x", anchor="n")
         self.mimo_fields = {name: tk.StringVar() for name in ("total", "end", "used", "name")}
+        for variable in self.mimo_fields.values():
+            variable.trace_add("write", lambda *_: self.update_footer())
         self.label(self.mimo_manual, "不登录、免费额度或登录失败时使用：只统计本机用量", 9, view.INK_3).pack(anchor="w", pady=(S(10), 0))
         self.form(self.mimo_manual, ((self.mimo_fields["total"], "套餐总量", "例如 49.2B、492亿", False),
                                      (self.mimo_fields["end"], "到期日期", "YYYY-MM-DD", False),
@@ -1517,9 +1534,8 @@ class SettingsWindow:
                                      (self.mimo_fields["name"], "套餐名（可选）", "例如 Max 年付", False)))
         buttons = tk.Frame(self.mimo_manual, bg=view.FIELD)
         buttons.pack(fill="x", pady=(S(8), 0))
-        self.button(buttons, "保存手动套餐", self.save_mimo_manual).pack(side="left")
-        self.button(buttons, "删除手动套餐", self.remove_mimo_manual).pack(side="left", padx=S(8))
-        self.label(buttons, "点击后立即生效", 9, view.INK_3).pack(side="left", padx=S(4))
+        self.button(buttons, "删除手动套餐", self.remove_mimo_manual).pack(side="left")
+        self.label(buttons, "填好套餐总量与到期日期后自动保存", 9, view.INK_3).pack(side="left", padx=S(12))
 
     def toggle_mimo_manual(self):
         drawer = self.mimo_drawer
@@ -1576,18 +1592,14 @@ class SettingsWindow:
         self.app.mimo_logout()
         self._fill_mimo()
 
-    def save_mimo_manual(self):
-        values = {name: var.get() for name, var in self.mimo_fields.items()}
-        try:
-            self.app.save_mimo_manual(values["total"], values["end"], values["used"], values["name"])
-            self.say("✓ 手动套餐已保存")
-        except (OSError, ValueError) as error:
-            self.messagebox.showerror("未能保存", str(error), parent=self.root)
-        self._fill_mimo()
-
     def remove_mimo_manual(self):
         import mimo_usage
         mimo_usage.remove_manual_plan()
+        # Empty the form as the saved state first, so clearing it is not an edit to save.
+        self.origins.update({"mimo:" + name: "" for name in self.mimo_fields})
+        getattr(self, "save_problems", {}).pop("mimo", None)
+        for variable in self.mimo_fields.values():
+            variable.set("")
         self.say("已删除手动套餐")
         self._fill_mimo()
 
@@ -1918,19 +1930,24 @@ class SettingsWindow:
         values.update({"field:" + name: var.get().strip() for name, var in self.fields.items()})
         values["iq:key"] = self.iq_key.get().strip()
         values["iq:shown"] = tuple(self.iq_selected)
+        values.update({"mimo:" + name: var.get().strip() for name, var in getattr(self, "mimo_fields", {}).items()})
         return values
+
+    def changed_keys(self) -> list[str]:
+        """Staged keys whose value differs from what is saved."""
+        return [name for name, value in self.staged().items() if self.origins.get(name, value) != value]
 
     def pending(self) -> list[str]:
         labels = {"herdr": "herdr 适配", "startup": "开机自启", "summary": "任务命名", "iq:key": "智商 API Key",
                   "iq:shown": "横条显示的模型"}
         changed, seen = [], set()
-        for name, value in self.staged().items():
-            if self.origins.get(name, value) == value:
-                continue
+        for name in self.changed_keys():
             if name.startswith("source:"):
                 text = PROVIDER_NAMES.get(name[7:], name[7:]) + " 开关"
             elif name.startswith("field:"):
                 text = "任务命名"
+            elif name.startswith("mimo:"):
+                text = "手动套餐"
             else:
                 text = labels.get(name, name)
             if text not in seen:
@@ -1943,23 +1960,38 @@ class SettingsWindow:
         self.update_footer()
 
     def update_footer(self):
-        if not hasattr(self, "save_button") or not self.origins:
+        """Runs on every change: a value that differs from the last one seen
+        schedules the automatic save; the footer shows its outcome."""
+        if not hasattr(self, "status_label") or not self.origins:
             return
-        changed = self.pending()
-        self.save_button.set_enabled(bool(changed))
+        staged = self.staged()
+        if staged != getattr(self, "seen", None):
+            self.seen = staged
+            keys = self.changed_keys()
+            if keys:
+                self.schedule_save(save_delay(keys))
         notice, at = self.notice
-        if notice and time.time() - at < NOTICE_SECONDS:
+        problems = getattr(self, "save_problems", {})
+        if problems:
+            text, color = "未能保存：" + "；".join(problems.values()), view.WARN
+        elif notice and time.time() - at < NOTICE_SECONDS:
             text, color = notice, view.GREEN if notice.startswith("✓") else view.INK_2
-        elif changed:
-            restart = any(item.endswith(" 开关") for item in changed)
-            text = "未保存：" + "、".join(changed) + ("（保存后托盘会重启）" if restart else "")
-            color = view.WARN
         else:
             text, color = "", view.INK_2
         if self.status.get() != text:
             self.status.set(text)
         if self.status_label.cget("fg") != color:
             self.status_label.configure(fg=color)
+
+    def schedule_save(self, delay_ms: int):
+        job = getattr(self, "save_job", None)
+        if job is not None:
+            self.root.after_cancel(job)
+        self.save_job = self.root.after(delay_ms, self.autosave)
+
+    def autosave(self):
+        self.save_job = None
+        self.save()
 
     # ----- actions -------------------------------------------------------------------------------
     def open_data_folder(self):
@@ -2016,46 +2048,88 @@ class SettingsWindow:
             self.iq_key.set(info["key"])
             self.iq_selected = list(info["shown"] or [])
             self.iq_built = None
+        job = getattr(self, "save_job", None)
+        if job is not None:
+            self.root.after_cancel(job)
+            self.save_job = None
         self.origins = self.staged()
+        self.seen = dict(self.origins)            # loading is not an edit: nothing to save
+        self.save_problems = {}
         self.notice = ("", 0.0)
         self.result.set("")
         self.update_footer()
 
     def save(self):
-        if not self.pending():
+        """Save every changed group on its own (called a moment after an edit,
+        and on closing). A group that fails keeps its changes pending and its
+        reason in the footer, without holding back the others; it is tried
+        again on its next edit. Source switches go last: applying them
+        restarts the tray."""
+        keys = set(self.changed_keys())
+        if not keys:
             return
-        try:
-            self.app.apply_summary_settings({name: var.get() for name, var in self.fields.items()}, self.vars["summary"].get())
-            if self.vars["startup"].get() != self.origins["startup"]:
-                self.app.toggle_startup()
-            if hasattr(self.app, "save_model_iq"):
-                self.app.save_model_iq(self.iq_key.get(), list(self.iq_selected) or None)
-            if hasattr(self.app, "save_preferences"):
-                self.app.save_preferences({"herdr": bool(self.vars["herdr"].get())})
-            sources = {name[7:]: bool(var.get()) for name, var in self.vars.items()
-                       if name.startswith("source:") and bool(var.get()) != self.origins.get(name)}
-            self.origins = self.staged()
-            if sources:
-                self.say("✓ 已保存，托盘正在重启以应用来源开关…")
-                self.root.withdraw()
-                self.app.set_providers(sources)
-            else:
-                self.say("✓ 设置已保存并生效")
-        except (OSError, ValueError) as error:
-            self.messagebox.showerror("未能保存", str(error), parent=self.root)
+        staged = self.staged()
+        problems = dict(getattr(self, "save_problems", {}))
+        saved = []
+
+        def group(name, label, members, action):
+            if not keys.intersection(members):
+                return
+            try:
+                if action() is False:             # not ready yet (a half-filled form): stays pending, no error
+                    return
+            except (OSError, ValueError) as error:
+                problems[name] = f"{label}：{error}"
+                return
+            problems.pop(name, None)
+            self.origins.update({key: staged[key] for key in members if key in staged})
+            saved.append(name)
+
+        fields = ["field:" + name for name in self.fields]
+        group("summary", "任务命名", ["summary"] + fields,
+              lambda: self.app.apply_summary_settings({name: var.get() for name, var in self.fields.items()},
+                                                      self.vars["summary"].get()))
+        group("startup", "开机自启", ["startup"], self.app.toggle_startup)
+        if hasattr(self.app, "save_model_iq"):
+            group("iq", "智商设置", ["iq:key", "iq:shown"],
+                  lambda: self.app.save_model_iq(self.iq_key.get(), list(self.iq_selected) or None))
+        if hasattr(self.app, "save_preferences"):
+            group("herdr", "herdr 适配", ["herdr"], lambda: self.app.save_preferences({"herdr": bool(self.vars["herdr"].get())}))
+        group("mimo", "手动套餐", ["mimo:" + name for name in getattr(self, "mimo_fields", {})], self._save_mimo_manual)
+        sources = {name[7:]: bool(var.get()) for name, var in self.vars.items()
+                   if name.startswith("source:") and bool(var.get()) != self.origins.get(name)}
+        self.save_problems = problems
+        if sources:
+            group("sources", "来源开关", ["source:" + key for key in sources], lambda: self.app.set_providers(sources))
+        if "sources" in saved:
+            self.say("✓ 已保存，托盘正在重启以应用来源开关…")
+        elif saved:
+            self.say("✓ 已自动保存")
+        else:
+            self.update_footer()
+
+    def _save_mimo_manual(self):
+        """The manual MiMo plan, once its required fields are filled."""
+        values = {name: var.get().strip() for name, var in self.mimo_fields.items()}
+        if not values["total"] or not values["end"]:
+            return False
+        self.app.save_mimo_manual(values["total"], values["end"], values["used"], values["name"])
+        self._fill_mimo()
+        return True
 
     def close(self):
-        """Hide the window; unsaved switches and fields are offered for saving first."""
-        changed = self.pending() if self.origins else []
-        if changed:
-            answer = self.messagebox.askyesnocancel("保存更改？", "以下更改还没有保存：\n" + "、".join(changed) + "\n\n保存后关闭？",
-                                                    parent=self.root)
-            if answer is None:
-                return
-            if answer:
-                self.save()
-                if self.pending():
-                    return
+        """Save what is still waiting, then hide the window. A change that
+        could not be saved is named first; closing anyway is the person's call."""
+        job = getattr(self, "save_job", None)
+        if job is not None:
+            self.root.after_cancel(job)
+            self.save_job = None
+        if self.origins:
+            self.save()
+        problems = getattr(self, "save_problems", {})
+        if problems and not self.messagebox.askyesno("有设置未能保存", "\n".join(problems.values()) + "\n\n仍然关闭？",
+                                                     parent=self.root):
+            return
         self.root.withdraw()
 
     # ----- loop ------------------------------------------------------------------------------------
