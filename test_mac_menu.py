@@ -85,6 +85,38 @@ class MacMenuTests(unittest.TestCase):
             self.assertEqual(mac_menu.status_image(snap, "C", performance).tobytes(),
                              tray_icons.make_display_icon(snap, "C", performance).tobytes())
 
+    def test_glass_mode_leaves_the_disc_to_the_glass_view(self):
+        import icon_art
+        import mac_panel
+        self.addCleanup(icon_art.set_glass, False)
+        ink = icon_art.ring_icon((64.0, 12.0), "C")
+        icon_art.set_glass(True)
+        glass = icon_art.ring_icon((64.0, 12.0), "C")
+        self.assertEqual(ink.getpixel((12, 32))[3], 255)               # the ink disc inside the ring
+        self.assertLess(glass.getpixel((12, 32))[3], 40)               # only the orb's faint sheen: the glass shows through
+        self.assertEqual(glass.getpixel((2, 32)), ink.getpixel((2, 32)))   # the quota arc itself is unchanged
+        self.assertLess(glass.getpixel((32, 1))[3], 255)               # the empty track is a translucent rim
+        self.assertEqual(ink.getpixel((32, 1))[3], 255)
+        canvas = icon_art.Image.new("RGBA", (icon_art.CANVAS, icon_art.CANVAS), (0, 0, 0, 0))
+        icon_art._sheen(canvas)
+        self.assertEqual(canvas.getpixel((100, 70))[:3], (255, 255, 255))     # the orb is lit at the top...
+        self.assertEqual(canvas.getpixel((100, 200))[:3], (0, 0, 0))          # ...and shaded at its base
+        self.assertEqual(canvas.getpixel((4, 128))[3], 0)                      # nothing under the ring
+        self.assertEqual(mac_panel.glass_tint_for(glass), mac_panel.STATUS_TINT)
+        live = icon_art.live_icon(98.0, "A")
+        self.assertEqual(live.getpixel((32, 4))[3], 0)                 # no accent disc drawn...
+        self.assertEqual(live.info["glass_tint"], icon_art.accent("A"))   # ...the glass glows in it
+        middle = [live.getpixel((x, 32)) for x in range(64)]
+        self.assertTrue(any(p[3] == 255 and p[:3] == icon_art.IVORY[:3] for p in middle))   # light numeral on the accent orb
+        self.assertFalse(any(p[:3] == icon_art.TILE_TEXT[:3] for p in middle))
+        self.assertEqual(mac_panel.glass_tint_for(live), icon_art.accent("A")[:3] + (mac_panel.STATUS_LIVE_ALPHA,))
+        waiting = icon_art.waiting_icon(3, "C", unit="h")
+        self.assertLess(waiting.getpixel((32, 12))[3], 80)                # sheen only, no ink disc
+        icon_art.set_glass(False)
+        again = icon_art.live_icon(98.0, "A")
+        self.assertNotIn("glass_tint", again.info)                     # the cache was cleared with the mode
+        self.assertEqual(again.getpixel((32, 4)), icon_art.accent("A"))
+
     def test_status_items_have_stable_autosave_names(self):
         names = {mac_menu.autosave_name(key) for key in ("claude", "codex", "gemini", "grok", "mimo")}
         self.assertEqual(names, {"Circlow.claude", "Circlow.codex", "Circlow.gemini", "Circlow.grok", "Circlow.mimo"})

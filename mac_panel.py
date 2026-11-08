@@ -120,6 +120,75 @@ def make_glass():
     return glass
 
 
+# ----- menu bar: the icon's disc as a Liquid Glass orb -------------------------------------
+# Like Control Center's round buttons: the clear glass style with a light tint,
+# so the orb stands out on a dark bar (the regular style stays near black
+# there), and icon_art draws the orb's sheen since the glass itself is flat at
+# 20 points. A generating source glows in its accent, like an active button.
+# CIRCLOW_STATUS_GLASS=dark keeps an ink-tinted regular-style disc instead,
+# for a light wallpaper where a light orb would swallow the ivory glyph.
+STATUS_SIZE = 20.0
+STATUS_TINT = (255, 255, 255, 0.18)
+STATUS_DARK_TINT = (38, 37, 34, 0.6)
+STATUS_LIVE_ALPHA = 0.75
+_GLASS_CLASS = None
+
+
+def status_dark() -> bool:
+    import os
+    return os.environ.get("CIRCLOW_STATUS_GLASS", "").strip().lower() == "dark"
+
+
+def glass_class():
+    """NSGlassEffectView that lets clicks reach the status button under it."""
+    global _GLASS_CLASS
+    if _GLASS_CLASS is None:
+        import objc
+
+        class StatusGlass(objc.lookUpClass("NSGlassEffectView")):
+            def hitTest_(self, _point):
+                return None
+
+        _GLASS_CLASS = StatusGlass
+    return _GLASS_CLASS
+
+
+def tint_glass(glass, rgba) -> None:
+    from AppKit import NSColor
+    r, g, b, alpha = rgba
+    glass.setTintColor_(NSColor.colorWithSRGBRed_green_blue_alpha_(r / 255, g / 255, b / 255, alpha))
+
+
+def status_glass(size: float = STATUS_SIZE):
+    """(glass, picture view) for one menu bar item: a Liquid Glass disc with
+    the ring picture drawn over it (icon_art in glass mode draws no disc);
+    None where the system has no glass."""
+    if not glass_available():
+        return None
+    import AppKit
+    from AppKit import NSImageView
+    glass = glass_class().alloc().initWithFrame_(((0, 0), (size, size)))
+    glass.setCornerRadius_(size / 2)
+    glass.setStyle_(getattr(AppKit, "NSGlassEffectViewStyleRegular", 0) if status_dark()
+                    else getattr(AppKit, "NSGlassEffectViewStyleClear", 1))
+    glass.setAutoresizingMask_(AppKit.NSViewMinXMargin | AppKit.NSViewMaxXMargin
+                               | AppKit.NSViewMinYMargin | AppKit.NSViewMaxYMargin)
+    view = NSImageView.alloc().initWithFrame_(((0, 0), (size, size)))
+    view.setImageScaling_(AppKit.NSImageScaleNone)
+    glass.setContentView_(view)
+    tint_glass(glass, glass_tint_for(None))
+    return glass, view
+
+
+def glass_tint_for(image) -> tuple:
+    """The orb tint for a picture: the accent a live icon asks for, else the
+    light (or, with CIRCLOW_STATUS_GLASS=dark, ink) tint."""
+    accent = (getattr(image, "info", None) or {}).get("glass_tint")
+    if accent:
+        return tuple(accent[:3]) + (STATUS_LIVE_ALPHA,)
+    return STATUS_DARK_TINT if status_dark() else STATUS_TINT
+
+
 _PANEL_CLASS = None
 
 

@@ -382,9 +382,14 @@ def run_mac() -> int:
     import objc
     import settings_mac
     import tray_app
-    from mac_panel import MacHoverPanel, to_nsimage
+    from PIL import Image
+    from mac_panel import MacHoverPanel, glass_available, glass_tint_for, status_glass, tint_glass, to_nsimage
+    import icon_art
 
     settings_mac.take_commands(settings_mac.MENU)      # requests left over from an earlier run
+    # macOS 26: each icon's disc is Liquid Glass; the pictures carry no disc.
+    # Before the tray draws its first icon, so none shows an ink disc under glass.
+    icon_art.set_glass(glass_available())
     try:
         if settings_mac.migrate_login_item():
             log.info("login item moved to %s", settings_mac.LAUNCH_AGENT_LABEL)
@@ -398,6 +403,16 @@ def run_mac() -> int:
 
     class Delegate(NSObject):
         def applicationDidFinishLaunching_(self, _notification):
+            # AppKit swallows an exception raised here, which leaves the app
+            # running with no icons: log it and quit instead.
+            try:
+                self.start_menu_bar()
+            except Exception:
+                log.exception("menu bar failed to start")
+                tray.stop_event.set()
+                NSApplication.sharedApplication().terminate_(None)
+
+        def start_menu_bar(self):
             try:
                 import mac_notify
                 mac_notify.NOTIFIER.setup()  # asks once for permission to notify; banners then come from 环流 itself
@@ -409,10 +424,19 @@ def run_mac() -> int:
             self.menu_objs = {}
             self.order = []
             self.pictures = {}
+            self.glass = {}                 # key -> [glass view, picture view, current tint]
+            blank = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
             bar = NSStatusBar.systemStatusBar()
             for key in bar_order(keys):
                 item = bar.statusItemWithLength_(NSVariableStatusItemLength)
                 item.setAutosaveName_(autosave_name(key))
+                disc = status_glass() if icon_art.GLASS else None
+                if disc is not None:
+                    glass, view = disc
+                    # The blank keeps the item at the picture's width; the picture sits on the glass.
+                    item.button().setImage_(to_nsimage(blank, blank.size[0] / 20))
+                    item.button().addSubview_(glass)
+                    self.glass[key] = [glass, view, None]
                 menu = NSMenu.alloc().initWithTitle_(key)   # the title names the source for the delegate
                 menu.setAutoenablesItems_(False)
                 menu.setDelegate_(self)          # open menu = hover: fastest refresh tier
@@ -467,8 +491,19 @@ def run_mac() -> int:
                 # The tray draws the icon each second (TPS loop); until then draw it here.
                 image = icons[key].icon or status_image(snapshot, providers.get(key).letter, performance)
                 button = self.items[key].button()
+                if key in self.glass:
+                    self.place_glass(key, button)
                 if self.pictures.get(key) is not image:
-                    button.setImage_(to_nsimage(image, image.size[0] / 20))
+                    picture = to_nsimage(image, image.size[0] / 20)
+                    if key in self.glass:
+                        glass, view, tint = self.glass[key]
+                        view.setImage_(picture)
+                        wanted = glass_tint_for(image)
+                        if wanted != tint:
+                            tint_glass(glass, wanted)
+                            self.glass[key][2] = wanted
+                    else:
+                        button.setImage_(picture)
                     self.pictures[key] = image
                 # Sources with a hover panel skip the native tooltip, which would cover it.
                 tip = "" if tray_app.has_panel(key, snapshot) else "\n".join(
@@ -546,6 +581,23 @@ def run_mac() -> int:
 
         def openSource_(self, sender):
             open_source(str(sender.representedObject()), launcher)
+
+        def place_glass(self, key, button):
+            """Centre the glass disc on the button (its frame is only known once
+            the item is in the bar, and the autoresizing mask keeps it centred after)."""
+            glass = self.glass[key][0]
+            bounds = button.bounds()
+            origin = (round((bounds.size.width - glass.frame().size.width) / 2),
+                      round((bounds.size.height - glass.frame().size.height) / 2))
+            current = glass.frame().origin
+            if (current.x, current.y) != origin and bounds.size.width > 0:
+                glass.setFrameOrigin_(origin)
+                window = button.window()
+                frame = window.frame() if window is not None else None
+                log.info("status item %s: button=%s glass=%s window=%s visible=%s item=%s", key,
+                         tuple(bounds.size), (tuple(glass.frame().origin), tuple(glass.frame().size)),
+                         None if frame is None else (frame.origin.x, frame.size.width),
+                         None if window is None else window.isVisible(), self.items[key].isVisible())
 
         def quitApp_(self, _sender):
             self.hover.stop()
