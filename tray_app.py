@@ -42,6 +42,10 @@ from quota_sources import (
     save_cached_snapshots,
 )
 import herdr_source
+import launchers
+from local_sync import LocalSync, PERFORMANCE_SAVE_SECONDS  # noqa: F401
+from quota_charts import ChartData, provider_letter, weekly_series_name, window_label  # noqa: F401
+from tray_slots import IconSlots, REORDER_MIN_SECONDS  # noqa: F401
 import hover_details
 import mimo_usage
 import providers as provider_registry
@@ -54,18 +58,16 @@ from tray_icons import (  # noqa: F401  (re-exported for callers and tests)
     icon_windows, make_display_icon, make_provider_icon, make_tps_icon, pace_marker, quota_exhausted,
     stale_note, usable_again_at)
 from tps_sources import PERFORMANCE_PATH, TpsMonitor, performance_signature, save_performance
-from usage_store import UsageStore, hint_line as usage_hint_line, insights as usage_insights
+from usage_store import UsageStore, WeeklyLedger, hint_line as usage_hint_line, insights as usage_insights
 
 
 APP_NAME = "CodexQuotaTray"
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / APP_NAME
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-PERFORMANCE_SAVE_SECONDS = 60
 # Shown providers (key -> icon letter), in registry order; see providers.py.
 PROVIDERS = {key: provider_registry.get(key).letter for key in provider_registry.enabled_keys()}
-LAUNCHERS = {spec.key: spec.launch for spec in provider_registry.SPECS}
 # Sources whose click opens a new Herdr tab running that agent (herdr --kind).
-HERDR_AGENTS = {"claude", "grok"}
+HERDR_AGENTS = launchers.HERDR_AGENTS
 log = logging.getLogger(APP_NAME)
 
 
@@ -92,27 +94,6 @@ def pool_lines(snapshot: QuotaSnapshot) -> list[str]:
         reset = f" · {reset_text(pool['resets_at'])} 重置" if pool.get("resets_at") else ""
         lines.append(f"  {pool.get('label') or pool.get('key')}：{value}{reset}")
     return lines
-
-
-def provider_letter(provider: str) -> str:
-    try:
-        return provider_registry.get(provider).letter
-    except KeyError:
-        return "?"
-
-
-def window_label(minutes: int | None) -> str:
-    if not minutes:
-        return ""
-    if minutes == 10080:
-        return "每周"
-    if 524_000 <= minutes <= 528_000:
-        return "年度"
-    if minutes % 1440 == 0:
-        return f"{minutes // 1440} 天"
-    if minutes % 60 == 0:
-        return f"{minutes // 60} 小时"
-    return f"{minutes} 分钟"
 
 
 def compact_number(value: float) -> str:
@@ -173,7 +154,6 @@ def quota_line(snapshot: QuotaSnapshot) -> str:
 
 # Tray order is fixed (providers.TRAY_POSITIONS): Claude Code, Codex (GPT),
 # Grok, Gemini, MiMo.  It never changes with remaining quota or exhaustion.
-REORDER_MIN_SECONDS = 2          # after a drag, the order is right again within a few seconds
 ORDER_CHECK_SECONDS = 2          # five icon rectangles and one registry read: cheap
 PREFERENCES_PATH = DATA_DIR / "settings.json"
 
@@ -231,12 +211,17 @@ def restart_environment() -> dict[str, str]:
     return environment
 
 
-class QuotaTray:
+class QuotaTray(ChartData, LocalSync, IconSlots):
     # Class-level so test doubles built with __new__ share the same guarantees.
     ui_lock = threading.RLock()
     refresh_lock = threading.Lock()
     history: QuotaHistory | None = None
     scheduler: RefreshScheduler | None = None
+
+    @property
+    def letters(self) -> dict:
+        """The shown sources and their icon letters (PROVIDERS)."""
+        return PROVIDERS
 
     def __init__(self) -> None:
         # Show cached values immediately; reading the CLIs can take ~25 s.
@@ -247,6 +232,7 @@ class QuotaTray:
         self.history = QuotaHistory()
         self.scheduler = RefreshScheduler(PROVIDERS, time.time())
         self.usage = UsageStore()
+        self.weekly = WeeklyLedger()
         self.tps_monitor = TpsMonitor(store=self.usage)
         self.apply_preferences(load_preferences())
         self.performance = self.tps_monitor.snapshot(time.time())
@@ -366,187 +352,6 @@ class QuotaTray:
         text, _ = self.headline_forecast(provider)
         return f"预测：{text}" if text else ""
 
-    CHART_WEEKLY_BELOW = 10.0       # Codex 5-hour % left at which the chart shows the weekly window
-    CHART_VIEW_MAX = 5 * 3600        # The solid line: the live window, at most its last 5 hours.
-    CHART_POINTS = 160
-    CHART_RECENT_SECONDS = 30 * 60  # keep completed work visible long enough to inspect its trend
-
-    def quota_windows(self, provider: str) -> list[tuple]:
-        """(label, remaining, resets_at, window minutes, history names) in the
-        order of the panel's header columns, so a line and its bar share a slot."""
-        snapshot = self.snapshots[provider]
-        if provider == "mimo":
-            return [("套餐额度", snapshot.display_remaining, snapshot.resets_at, snapshot.window_minutes, (provider,))]
-        if snapshot.pools and len(snapshot.pools) > 1:
-            return [(pool.get("label") or pool.get("key") or "额度", pool.get("remaining_percent"), pool.get("resets_at"),
-                     pool.get("window_minutes"), (f"{provider}:pool:{pool.get('key')}",) + ((provider,) if index == 0 else ()))
-                    for index, pool in enumerate(snapshot.pools[:3])]
-        windows = [(window_label(snapshot.window_minutes) or "当前", snapshot.remaining_percent, snapshot.resets_at,
-                    snapshot.window_minutes, (provider,))]
-        if snapshot.secondary_window_minutes or snapshot.secondary_remaining_percent is not None:
-            windows.append((window_label(snapshot.secondary_window_minutes) or "第二窗口", snapshot.secondary_remaining_percent,
-                            snapshot.secondary_resets_at, snapshot.secondary_window_minutes, (provider + ":secondary",)))
-        return windows
-
-    def source_working(self, provider: str) -> bool:
-        data = (getattr(self, "performance", None) or {}).get("providers", {}).get(provider, {})
-        return bool(data.get("active_sessions", 0) or any(
-            agent.get("live") and agent.get("provider") == provider for agent in getattr(self, "agents", [])))
-
-    def exhausted_state(self, provider: str) -> tuple[str | None, tuple[int, ...]]:
-        """Known credits, inferred Claude extra usage, working, or blocked."""
-        snapshot = self.snapshots.get(provider)
-        if snapshot is None or snapshot.stale or provider == "mimo" or (snapshot.pools and len(snapshot.pools) > 1):
-            return None, ()
-        values = (snapshot.remaining_percent, snapshot.secondary_remaining_percent)
-        empty = tuple(slot for slot, value in enumerate(values) if quota_exhausted(value, provider))
-        if not empty:
-            return None, ()
-        if all(values[slot] >= 0.5 for slot in empty):
-            return ("near_working" if self.source_working(provider) else "near"), empty
-        if provider == "codex" and snapshot.credits_balance is not None and snapshot.credits_balance > 0:
-            return "paid", empty
-        if self.source_working(provider):
-            now = time.time()
-            events = getattr(getattr(self, "tps_monitor", None), "events", ())
-            if provider == "claude" and snapshot.updated_at and any(
-                    event.provider == "claude" and event.output_tokens > 0 and
-                    max(now-120, snapshot.updated_at-5) <= event.ended_at <= now+5 for event in events):
-                return "inferred", empty
-            return "working", empty
-        return "blocked", empty
-
-    def codex_quota_mode(self) -> bool:
-        if "codex" not in self.snapshots or not self.source_working("codex"):
-            return False
-        windows = self.quota_windows("codex")
-        five = next((w for w in windows if w[3] == 300 and w[1] is not None), None)
-        week = next((w for w in windows if w[3] == 10080 and w[1] is not None), None)
-        # The chart moves to the weekly curve only once the 5-hour window is
-        # nearly empty, not as early as the icon's 15% countdown.
-        return bool(five and five[1] <= self.CHART_WEEKLY_BELOW and week)
-
-    def active_sources(self, now: float) -> dict[str, set[str]]:
-        """Sources working now or with real output in the last half hour, and
-        the (lower-cased) models they ran."""
-        active: dict[str, set[str]] = {}
-        for agent in getattr(self, "agents", []):
-            if agent.get("live") and agent.get("provider") in self.snapshots:
-                active.setdefault(agent["provider"], set()).add(str(agent.get("model") or "").lower())
-        for key, data in self.performance.get("providers", {}).items():
-            if data.get("active_sessions", 0) > 0 and key in self.snapshots:
-                active.setdefault(key, set())
-        monitor = getattr(self, "tps_monitor", None)
-        for event in getattr(monitor, "events", ()):
-            if (event.provider in self.snapshots and event.output_tokens > 0
-                    and now - self.CHART_RECENT_SECONDS <= event.ended_at <= now + 5):
-                active.setdefault(event.provider, set()).add((event.model or "").lower())
-        desktop_use = getattr(monitor, "claude_desktop_last_use", 0.0)
-        if "claude" in self.snapshots and desktop_use > 0 and now - self.CHART_RECENT_SECONDS <= desktop_use <= now + 5:
-            active.setdefault("claude", set())
-        return active
-
-    def live_models(self, provider: str) -> set[str]:
-        """Only models tied to current work; recent completed sessions do not mark a pool active."""
-        return {str(agent.get("model") or "").lower() for agent in getattr(self, "agents", [])
-                if agent.get("live") and agent.get("provider") == provider and agent.get("model")}
-
-    @staticmethod
-    def pool_keys(models) -> set[str]:
-        """Gemini pools the given models draw from."""
-        keys = set()
-        for model in models:
-            if "argon" in model:
-                keys.add("argon")
-            elif any(name in model for name in ("claude", "opus", "sonnet", "gpt")):
-                keys.add("claude_gpt")
-            elif "gemini" in model:
-                keys.add("gemini")
-        return keys
-
-    def burn_chart(self, provider: str, now: float) -> "agent_panel.BurnChart | None":
-        """Quota trends of every model with a reading, identical on every icon."""
-        if self.history is None:
-            return None
-        candidates = []
-        active = self.active_sources(now)
-        for key in provider_registry.tray_positions(self.snapshots):
-            snapshot = self.snapshots[key]
-            pools_in_use = self.pool_keys(active.get(key, ())) if key == "gemini" else set()
-            windows = self.quota_windows(key)
-            selected = None
-            quota_mode = key == "codex" and self.codex_quota_mode()
-            if key in ("codex", "claude"):
-                selected = next((index for index, window in enumerate(windows)
-                                 if window[3] == 300 and window[1] is not None), None)
-                if quota_mode:
-                    selected = next(index for index, window in enumerate(windows) if window[3] == 10080)
-            for slot, (label, remaining, resets_at, minutes, names) in enumerate(windows):
-                if selected is not None and slot != selected:
-                    continue
-                if remaining is None:
-                    continue
-                recorded = max((self.history.samples(name) for name in names),
-                               key=lambda items: len(forecast_module.current_window(items, resets_at)))
-                samples = forecast_module.current_window(recorded, resets_at)
-                outlook = forecast_module.forecast(samples, now, remaining, resets_at)
-                rate = outlook.rate_per_hour
-                if key == "mimo":
-                    view = mimo_tracker().view(now)
-                    rate = view.pace_daily / view.total * 100 / 24 if view.pace_daily and view.total else rate
-                # The last hours across resets: the saved history before a reset
-                # (or a restart) stays on screen, stepping back up at the reset.
-                points, _steps = forecast_module.history_curve(recorded, now - self.CHART_VIEW_MAX, now, minutes)
-                updated = snapshot.updated_at
-                if not points or (updated and points[-1][0] + 1 < updated <= now):
-                    points.append((float(min(now, updated or now)), float(remaining)))
-                if key == "mimo":
-                    chart_label = "MiMo"
-                elif key == "grok":
-                    chart_label = "Grok"
-                else:
-                    name = "Gemini" if key == "gemini" else provider_registry.get(key).label
-                    chart_label = name if label == name else f"{name} · {label}"
-                if quota_mode:
-                    chart_label += "（5 小时已用完）"
-                pooled_models = snapshot.pools and len(snapshot.pools) > 1
-                idle = key not in active or bool(pooled_models and snapshot.pools[slot].get("key") not in pools_in_use)
-                series = agent_panel.BurnSeries(chart_label, slot,
-                    tuple((round(t, 1), round(r, 2)) for t, r in points),
-                    None if rate is None else round(rate, 3), float(resets_at) if resets_at else None,
-                    provider_letter(key), len(windows) > 1, idle=idle)
-                candidates.append((series, outlook))
-        if not candidates:
-            return None
-        # How far back: a close-up while quota drops fast, longer for slow use
-        # (agent_panel.burn_span). The forecast gets a fixed share to the right
-        # of now; a far exhaustion or reset stays in the text, not on the axis.
-        minutes = agent_panel.burn_span([series.points for series, _ in candidates], now, getattr(self, "burn_minutes", None))
-        self.burn_minutes = minutes
-        back = minutes * 60
-        # Quantised "now": the cached chart is redrawn every few seconds, not
-        # every frame: every 5 s in a 5-minute view, at most every 30 s.
-        step = max(5.0, min(30.0, back / 60))
-        shown = float(round(now / step) * step)
-        start, end = shown - back, shown + agent_panel.burn_future(back)
-        # Readings for the furthest span a hover eases out to (30 min, 2 h, then 5 h).
-        keep = shown - max(back, agent_panel.BURN_DWELL_BEATS[-1][0] * 60)
-        series = tuple(self._fit_points(item[0], keep) for item in candidates)
-        return agent_panel.BurnChart(float(start), float(end), shown, series)
-
-    def _fit_points(self, series: "agent_panel.BurnSeries", start: float) -> "agent_panel.BurnSeries":
-        """Readings from just before the view on, thinned to CHART_POINTS
-        evenly over the view; reset steps and the latest reading stay."""
-        points = list(series.points)
-        before = [index for index, (t, _r) in enumerate(points) if t < start]
-        points = points[before[-1]:] if before else points
-        if len(points) > self.CHART_POINTS:
-            steps = {i for i in range(1, len(points)) if points[i][1] > points[i - 1][1] + 1}
-            steps |= {i - 1 for i in steps}
-            stride = len(points) / self.CHART_POINTS
-            keep = sorted(steps | {int(i * stride) for i in range(self.CHART_POINTS - 1 - len(steps))} | {len(points) - 1})
-            points = [points[i] for i in keep]
-        return dataclasses.replace(series, points=tuple(points))
 
     def hover_text(self, provider: str) -> str:
         snapshot = self.snapshots[provider]
@@ -786,8 +591,10 @@ class QuotaTray:
             samples = self.history.samples(provider) if self.history is not None else []
             window = window_label(snapshot.window_minutes) if snapshot.window_minutes else ""
             weekly, remaining, resets_at = self.weekly_windows().get(provider, ((), None, None))
+            ledger = getattr(self, "weekly", None)
+            weeks = ledger.recent(weekly_series_name(snapshot) or "") if ledger is not None else []
             sections.append(("用量", usage_insights(usage, provider, time.time(), samples, f"{window}额度" if window else "",
-                                                   weekly, (remaining, resets_at))))
+                                                   weekly, (remaining, resets_at), weeks)))
 
         reads = [self.menu_updated(provider)]
         if self.scheduler:
@@ -797,22 +604,7 @@ class QuotaTray:
         sections.append(("读取", reads))
         return sections
 
-    def weekly_windows(self) -> dict:
-        """provider -> (quota readings, remaining %, resets_at) of its weekly
-        window: Grok's only window, Codex's and Claude Code's second one."""
-        found = {}
-        for provider, snapshot in self.snapshots.items():
-            if snapshot is None:
-                continue
-            if snapshot.window_minutes == 10080:
-                name, remaining, resets_at = provider, snapshot.remaining_percent, snapshot.resets_at
-            elif snapshot.secondary_window_minutes == 10080:
-                name, remaining, resets_at = f"{provider}:secondary", snapshot.secondary_remaining_percent, snapshot.secondary_resets_at
-            else:
-                continue
-            readings = self.history.samples(name) if self.history is not None else []
-            found[provider] = (readings, None if snapshot.stale else remaining, resets_at)
-        return found
+
     def open_details(self, provider: str) -> None:
         text = "\n\n".join("\n".join(lines) for _title, lines in self.detail_sections(provider))
         threading.Thread(
@@ -850,112 +642,25 @@ class QuotaTray:
 
     # ----- icon updates ----------------------------------------------------------
 
-    def update_ui(self) -> None:
-        save_cached_snapshots(self.snapshots)
-        for provider, letter in PROVIDERS.items():
-            self.update_icon(provider, letter)
-            self.icons[provider].update_menu()
-        self.maybe_reorder(time.time())
-
-    def wanted_order(self) -> list[str]:
-        return provider_registry.tray_positions(PROVIDERS)
-
-    def slots_by_position(self) -> list:
-        """The tray icons ("slots") as Windows currently shows them, left to
-        right (top to bottom on a vertical taskbar). Icons that are not on
-        the taskbar keep their creation order at the end, so the providers
-        that come last are the ones left in the overflow flyout."""
-        slots = getattr(self, "slots", None) or list(self.icons.values())
-        shown = hover_details.tray_visibility()
-        placed, unplaced = [], []
-        for index, slot in enumerate(slots):
-            try:
-                rect = hover_details.icon_rect(slot)
-            except Exception:
-                rect = None
-            # Windows' own record says hidden: the rectangle is the ^ button's.
-            hidden = shown.get(getattr(slot, "icon_id", index)) is False
-            (placed if rect and not hidden else unplaced).append((rect, index, slot))
-        # Overflow icons all report the ^ button's rectangle; two of ours on
-        # one spot are both hidden (the only check where Windows keeps no record).
-        spots = [rect for rect, _, _ in placed]
-        stacked = [item for item in placed if spots.count(item[0]) > 1]
-        if stacked:
-            placed = [item for item in placed if item not in stacked]
-            unplaced = sorted(unplaced + stacked, key=lambda item: item[1])
-        if len(unplaced) != getattr(self, "hidden_slots", 0):
-            self.hidden_slots = len(unplaced)
-            if unplaced:
-                log.warning("%d of %d tray icons are not on the taskbar; turn them on in Settings > Personalization > "
-                            "Taskbar > Other system tray icons (or drag them out of ^)", len(unplaced), len(slots))
-        if placed:
-            xs = [rect[0] for rect, _, _ in placed]
-            ys = [rect[1] for rect, _, _ in placed]
-            axis = 0 if max(xs) - min(xs) >= max(ys) - min(ys) else 1
-            placed.sort(key=lambda item: (item[0][axis], item[1]))
-        return [slot for _, _, slot in placed] + [slot for _, _, slot in unplaced]
-
-    def ensure_icons_registered(self) -> None:
-        with self.ui_lock:
-            for index, slot in enumerate(getattr(self, "slots", ())):
-                ensure = getattr(slot, "ensure_registered", None)
-                if ensure is not None and ensure():
-                    log.warning("tray icon %d was missing from the notification area; added again", index)
-                elif getattr(slot, "resend_icon", None) is not None and not getattr(slot, "details_visible", False):
-                    # Every 30 s each slot's picture is sent again: a change the
-                    # Shell dropped can never leave a source showing another's icon.
-                    slot.resend_icon()
-
-    def maybe_reorder(self, now: float, force: bool = False) -> bool:
-        """Show providers in wanted_order() by assigning them to the existing
-        tray icons by on-screen position.  Icons are never deleted or re-added:
-        Explorer restores its own remembered layout for re-added icons, so
-        moving them does not stick; swapping what each icon shows does.
-        The wanted order is fixed, so this only acts when Explorer's own
-        layout (startup, reflow, a manual drag) differs from it."""
-        icons = getattr(self, "icons", None)
-        if not icons:
-            return False
-        if not force and now - self.reordered_at < REORDER_MIN_SECONDS:
-            return False
-        if any(getattr(icon, "details_visible", False) or getattr(icon, "hover_open", False) for icon in icons.values()):
-            return False   # never change an icon under the pointer
-        wanted = self.wanted_order()
-        mapping = dict(zip(wanted, self.slots_by_position()))
-        if len(mapping) != len(icons) or all(icons[p] is mapping[p] for p in mapping):
-            self.shown_order = wanted
-            return False
-        with self.ui_lock:
-            icons.update(mapping)          # same keys: safe for the hover thread
-            for provider in wanted:
-                icon = icons[provider]
-                icon.details_visible = False
-                icon.menu = self.build_menu(provider)
-                self.update_icon(provider, PROVIDERS[provider])
-        self.shown_order, self.reordered_at = wanted, now
-        log.info("tray order: %s", ", ".join(wanted))
-        return True
-
-    def update_icon(self, provider: str, letter: str) -> None:
-        # The refresh worker and the 1 s TPS loop both land here. pystray
-        # replaces the native HICON on assignment, so serialise the updates
-        # (this also keeps the cached FreeType faces single-threaded).
-        with self.ui_lock:
-            icon = self.icons[provider]
-            # Hovered icons update too: the panel stays open through a Shell
-            # POPUPCLOSE (HoverDetails.target_at), and freezing the icon while
-            # its panel was open left it on a ring or an old countdown while
-            # the panel showed live TPS.
-            image = make_display_icon(self.snapshots[provider], letter, self.performance["providers"][provider],
-                                      reset_hint=provider == "codex" and self.reset_level() == "high")
-            # Icon assignment always sends NIM_MODIFY, even for identical pixels.
-            # Avoid needless Shell redraws; hover detail updates use a separate HWND.
-            # A picture the Shell refused is sent again even when unchanged.
-            if (icon.icon is not image and icon.icon != image) or getattr(icon, "icon_failed", False):
-                icon.icon = image
-            icon.title = self.tooltip(provider)
 
     # ----- refreshing ------------------------------------------------------------
+
+    def accept_snapshot(self, provider: str, snapshot, source: str = "") -> bool:
+        """The one door into self.snapshots. The quota threads, the 1 s local
+        sync (status line, Codex session records, the MiMo ledger) and the
+        MiMo login all land here, under one lock, and a reading older than
+        the one shown (by updated_at) is dropped rather than put over it. A
+        failed read always goes through: its error must show."""
+        lock = self.__dict__.setdefault("snapshot_lock", threading.RLock())
+        with lock:
+            current = self.snapshots.get(provider)
+            if (current is not None and not snapshot.error
+                    and (snapshot.updated_at or 0) < (current.updated_at or 0)):
+                log.debug("%s reading from %s (%.0f) is older than the one shown (%.0f); dropped",
+                          provider, source, snapshot.updated_at or 0, current.updated_at or 0)
+                return False
+            self.snapshots[provider] = snapshot
+        return True
 
     def refresh_providers(self, providers) -> None:
         providers = list(providers)
@@ -977,9 +682,8 @@ class QuotaTray:
                             self.history.clear(provider)
                         log.info("gemini quota pools changed: %s", [p.get("key") for p in snapshot.pools or []])
                 self.announce_resets(provider, self.snapshots.get(provider), snapshot, now)
-            snapshots = dict(self.snapshots)
-            snapshots.update(results)
-            self.snapshots = snapshots
+            for provider, snapshot in results.items():
+                self.accept_snapshot(provider, snapshot, "refresh")
             if self.history is not None:
                 if any([self.history.record(snapshot) for snapshot in results.values()]):
                     self.history.save()
@@ -1025,44 +729,6 @@ class QuotaTray:
                 self.scheduler.completed(provider, placeholder(provider, "刷新异常"), time.time())
             self.wake.set()                          # its next due time may be the earliest now
 
-    def feed_scheduler(self, performance: dict, now: float) -> None:
-        """Live state for the refresh cadence: generating or a live agent of
-        the source (active), and the pointer on its icon or panel (hover)."""
-        moved = False
-        icons = getattr(self, "icons", None) or {}
-        pointed = {provider for provider, icon in icons.items()
-                   if getattr(icon, "details_visible", False) or getattr(icon, "hover_open", False)}
-        if pointed:
-            # The panel charts every source in use, so those are being looked at too.
-            pointed |= set(self.active_sources(now))
-        for provider in pointed - quota_sources.WATCHED:
-            quota_sources.HOVER_STARTED[provider] = now          # a new look: its first read is a real check
-        quota_sources.WATCHED = frozenset(pointed)
-        quota_sources.ACTIVE = frozenset(p for p in self.scheduler.providers if self.source_working(p))
-        for provider in icons:
-            if provider in self.scheduler.providers:
-                moved |= self.scheduler.hover(provider, provider in pointed, now)
-        for provider in self.scheduler.providers:
-            data = performance["providers"].get(provider)
-            if data is None:
-                continue
-            sample = data.get("last_sample_at")
-            previous = self.last_samples.get(provider)
-            finished = sample is not None and previous is not None and sample > previous
-            if sample is not None:
-                self.last_samples[provider] = sample
-            elif provider not in self.last_samples:
-                self.last_samples[provider] = None
-            moved |= self.scheduler.activity(provider, self.source_working(provider), finished, now)
-        if moved:
-            self.wake.set()
-
-    def save_performance_if_changed(self, performance: dict, now: float) -> None:
-        signature = performance_signature(performance)
-        if signature == self.saved_signature and now - self.saved_at < PERFORMANCE_SAVE_SECONDS:
-            return
-        save_performance(performance)
-        self.saved_signature, self.saved_at = signature, now
 
     def tps_loop(self) -> None:
         last_wall = time.time()
@@ -1085,6 +751,9 @@ class QuotaTray:
                     self.update_codex_locally(now)
                 if "claude" in PROVIDERS:
                     self.update_claude_locally(now)
+                if now - getattr(self, "weeks_noted_at", 0.0) >= 60:
+                    self.weeks_noted_at = now
+                    self.note_weeks()
                 if now - getattr(self, "registered_at", 0.0) >= 30:
                     self.registered_at = now
                     self.ensure_icons_registered()
@@ -1105,42 +774,49 @@ class QuotaTray:
     # ----- actions ---------------------------------------------------------------
 
     def open_provider(self, provider: str) -> None:
-        if provider in HERDR_AGENTS and herdr_source.find_exe():
-            # A new focused Herdr tab running the agent. Starting waits for the
-            # agent to be ready, so it runs off the tray thread; clicks that
-            # arrive meanwhile would only start more agents.
-            opening = self.__dict__.setdefault("herdr_opening", set())
-            if provider in opening:
-                return
-            opening.add(provider)
-            # Raise the (often minimised) Herdr window now, while the click
-            # still lets the tray take the foreground.
-            herdr_source.raise_client()
-            threading.Thread(target=self.open_in_herdr, args=(provider,), name="herdr-open", daemon=True).start()
-            return
-        kind, resolve = LAUNCHERS[provider]
+        """A click on the source's icon: the first of launchers.ways that
+        works. Errors are shown in a message box, except for a way marked
+        fallback, which hands over to the next one."""
         label = provider_registry.get(provider).label
-        try:
-            target = resolve()
-            if kind == "url":
-                os.startfile(str(target))  # type: ignore[attr-defined]
-                return
-            if kind == "aumid":
-                launched = ctypes.windll.shell32.ShellExecuteW(None, "open", f"shell:AppsFolder\\{target}", None, None, 1)
-                if launched <= 32:
+        for way in launchers.ways(provider):
+            try:
+                if way.kind == "herdr":
+                    self.open_herdr_workspace(provider)
+                    return
+                if way.kind == "url":
+                    os.startfile(str(way.target))  # type: ignore[attr-defined]
+                    return
+                if way.kind == "aumid":
+                    launched = launchers.open_app_windows(way.target)
+                    if launched > 32:
+                        return
+                    if way.fallback:
+                        log.warning("%s app did not start (ShellExecute %s); trying the next way", label, launched)
+                        continue
                     raise OSError(f"无法启动 {label}（错误 {launched}）")
+                target = way.target() if callable(way.target) else way.target
+                if target is None or not Path(target).is_file():
+                    raise FileNotFoundError(f"未找到 {label} 客户端：{target or '未安装'}")
+                command, cwd = launchers.cli_command(provider, Path(target))
+                flags = subprocess.CREATE_NEW_CONSOLE if way.kind == "cli" else 0
+                subprocess.Popen(command, cwd=str(cwd), creationflags=flags, close_fds=True)
                 return
-            if target is None or not Path(target).is_file():
-                raise FileNotFoundError(f"未找到 {label} 客户端：{target or '未安装'}")
-            path = Path(target)
-            flags = subprocess.CREATE_NEW_CONSOLE if kind == "cli" else 0
-            # A CLI opened from its install folder would work on that folder;
-            # Claude Code and similar start in the user's home instead.
-            cwd = path.parent if provider == "grok" else Path.home()
-            command = ["cmd.exe", "/k", str(path)] if path.suffix.lower() in (".cmd", ".bat") else [str(path)]
-            subprocess.Popen(command, cwd=str(cwd), creationflags=flags, close_fds=True)
-        except OSError as error:
-            ctypes.windll.user32.MessageBoxW(None, str(error), f"{label} · 无法打开", 0x10)
+            except OSError as error:
+                ctypes.windll.user32.MessageBoxW(None, str(error), f"{label} · 无法打开", 0x10)
+                return
+
+    def open_herdr_workspace(self, provider: str) -> None:
+        """A new focused Herdr tab running the agent. Starting waits for the
+        agent to be ready, so it runs off the tray thread; clicks that arrive
+        meanwhile would only start more agents."""
+        opening = self.__dict__.setdefault("herdr_opening", set())
+        if provider in opening:
+            return
+        opening.add(provider)
+        # Raise the (often minimised) Herdr window now, while the click
+        # still lets the tray take the foreground.
+        herdr_source.raise_client()
+        threading.Thread(target=self.open_in_herdr, args=(provider,), name="herdr-open", daemon=True).start()
 
     def open_in_herdr(self, provider: str) -> None:
         label = provider_registry.get(provider).label
@@ -1167,8 +843,7 @@ class QuotaTray:
                 if "mimo" in PROVIDERS:
                     tracker = mimo_tracker()
                     tracker.refresh(lambda: plan)
-                    with self.ui_lock:
-                        self.snapshots["mimo"] = mimo_snapshot(tracker.view())
+                    self.accept_snapshot("mimo", mimo_snapshot(tracker.view()), "login")
                     self.wake.set()
                 else:
                     self.mimo_login_result = "登录成功；在“额度来源”中开启小米 MiMo 并保存后显示 M 图标"
@@ -1339,80 +1014,6 @@ class QuotaTray:
             level = outlook.level(now) if outlook else "unknown"
             self.stop_event.wait(reset_watch.POLL_SECONDS_HIGH if level in ("high", "watch") or outlook is None else reset_watch.POLL_SECONDS)
 
-    def update_claude_locally(self, now: float) -> None:
-        import claude_status
-        record = claude_status.latest(now)
-        old = self.snapshots.get("claude")
-        seen = record.get("observed_at", record["updated_at"]) if record else 0
-        if record and old is not None and seen > max(old.updated_at or 0, getattr(self, "claude_rejected_seen", 0)):
-            # The status line only, never /usage: this runs on the 1 s TPS loop.
-            # A reading behind what is shown (another session's older figure,
-            # or less than the last /usage check) is not taken.
-            native = quota_sources.native_claude_quota(record)
-            if not old.stale and quota_sources.claude_newer(native, old) is old:
-                return
-            fresh = quota_sources.keep_last_good(native, old)
-            if fresh.error:
-                self.claude_rejected_seen = seen
-                self.snapshots["claude"] = fresh
-                log.info("claude local quota read held: %s", fresh.error)
-                return
-            self.announce_resets("claude", old, fresh, now)
-            self.snapshots["claude"] = fresh
-            if self.history is not None and self.history.record(fresh):
-                self.history.save()
-            log.info("quota claude from native status: left=%s second=%s reset=%s/%s", fresh.remaining_percent,
-                     fresh.secondary_remaining_percent, fresh.resets_at, fresh.secondary_resets_at)
-
-    def update_codex_locally(self, now: float) -> None:
-        """Codex writes fresh rate limits into its session record after every
-        response; use them at once instead of waiting for the next App Server
-        read.  A recorded "usage limit" error triggers an immediate read."""
-        monitor = self.tps_monitor
-        record = getattr(monitor, "codex_rate_limits", None)
-        current = self.snapshots.get("codex")
-        if record and current is not None and record[0] > (current.updated_at or 0) and record[0] > now - 6 * 3600:
-            fresh = parse_codex_session_limits(record[1], record[0])
-            if fresh is not None:
-                # Session records carry no free-reset count (and older ones no balance).
-                if not current.stale:
-                    fresh.reset_credits = current.reset_credits
-                    if fresh.credits_balance is None:
-                        fresh.credits_balance = current.credits_balance
-                self.announce_resets("codex", current, fresh, now)
-                self.snapshots["codex"] = fresh
-                if self.history is not None and self.history.record(fresh):
-                    self.history.save()
-                log.info("codex quota from session record: %.0f%% left, reset %s", fresh.remaining_percent, fresh.resets_at)
-                self.update_ui()
-        hit = getattr(monitor, "codex_limit_hit_at", 0.0)
-        if hit and hit > getattr(self, "codex_limit_seen", 0.0):
-            self.codex_limit_seen = hit
-            if self.scheduler is not None:
-                self.scheduler.request(["codex"], now + 3, "额度用尽")
-                self.wake.set()
-            log.info("codex usage-limit error recorded at %s; refreshing", hit)
-
-    def update_mimo_locally(self, now: float) -> None:
-        """Fold new local MiMo token records into the Credits view (no network)."""
-        tracker = mimo_tracker()
-        # Only the observations added since the last second; re-reading the
-        # whole day of events every second was a full pass for nothing.
-        events = self.tps_monitor.events
-        total = getattr(self.tps_monitor, "added_total", None)
-        if total is None:
-            fresh = events
-        else:
-            count = min(len(events), max(0, total - self.mimo_ingested))
-            fresh = list(itertools.islice(reversed(events), count))[::-1] if count else []
-            self.mimo_ingested = total
-        added = tracker.ledger.ingest(fresh) if fresh else 0
-        tracker.ledger.save()
-        if added or now - self.mimo_view_at >= 60:
-            self.mimo_view_at = now
-            fresh = mimo_snapshot(tracker.view(now))
-            if fresh.remaining_percent is not None or self.snapshots["mimo"].remaining_percent is None:
-                self.snapshots["mimo"] = fresh
 
     def build_stamp(self) -> str:
         return build_stamp()
@@ -1521,8 +1122,7 @@ class QuotaTray:
             if not mimo_usage.COOKIE_PATH.exists():      # the console, when logged in, is read by the scheduler
                 tracker = mimo_tracker()
                 tracker.refresh(mimo_usage.manual_plan)
-                with self.ui_lock:
-                    self.snapshots["mimo"] = mimo_snapshot(tracker.view())
+                self.accept_snapshot("mimo", mimo_snapshot(tracker.view()), "manual plan")
             self.scheduler.request(["mimo"], time.time(), "手动配置")
             self.wake.set()
 

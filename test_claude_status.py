@@ -217,20 +217,55 @@ class ClaudeStatusTests(unittest.TestCase):
             result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File', str(receiver)],
                                     input=json.dumps(payload), capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-            output = (Path(tmp) / 'claude-status/test-session.json').read_text()
+            rolling = Path(tmp) / 'claude-status.json'
+            output = rolling.read_text(encoding='utf-8-sig')
             self.assertNotIn('NEVER-SAVE', output)
-            self.assertEqual(json.loads(output)['rate_limits']['five_hour']['used_percentage'], 15)
+            self.assertFalse((Path(tmp) / 'claude-status').exists())          # one rolling file, no per-session files
+            saved = json.loads(output)['sessions']['test-session']
+            self.assertEqual(saved['rate_limits']['five_hour']['used_percentage'], 15)
             self.assertIn('5h left 85%', result.stdout)
+            # Another session's reading goes into the same file.
+            other = {'session_id': 'other', 'rate_limits': {'five_hour': {'used_percentage': 30, 'resets_at': 1900000000}}}
+            subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File', str(receiver)],
+                           input=json.dumps(other), capture_output=True, text=True, timeout=10)
             # A later status line without five_hour keeps the last reading for the tray, not for display.
             payload['rate_limits'] = {'seven_day': {'used_percentage': 4, 'resets_at': 1900000000}}
             result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File', str(receiver)],
                                     input=json.dumps(payload), capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn('5h', result.stdout)
-            saved = json.loads((Path(tmp) / 'claude-status/test-session.json').read_text())
+            sessions = json.loads(rolling.read_text(encoding='utf-8-sig'))['sessions']
+            self.assertEqual(set(sessions), {'test-session', 'other'})
+            saved = sessions['test-session']
             self.assertEqual(saved['rate_limits']['five_hour']['used_percentage'], 15)
             self.assertLess(saved['rate_limits']['five_hour']['observed_at'], saved['rate_limits']['seven_day']['observed_at'] + 0.001)
             self.assertEqual(saved['rate_limits']['seven_day']['used_percentage'], 4)
+            # The tray reads the rolling file: the furthest reading per window across sessions.
+            report = claude_status.latest(time.time(), rolling=rolling)
+            self.assertEqual(report['rate_limits']['five_hour']['used_percentage'], 30)
+            self.assertEqual(report['rate_limits']['seven_day']['used_percentage'], 4)
+
+    def test_rolling_file_and_leftover_session_files_are_read_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = time.time()
+            reset = int(now + 3600)
+            rolling = Path(tmp) / 'claude-status.json'
+            rolling.write_text(json.dumps({'schema': 3, 'updated_at': now, 'sessions': {
+                'a': {'updated_at': now - 10, 'rate_limits': {'five_hour': {'used_percentage': 40, 'resets_at': reset, 'observed_at': now - 10}}},
+                'bad': {'updated_at': 'x'},
+                'b': {'updated_at': now - 5, 'rate_limits': {'seven_day': {'used_percentage': 12, 'resets_at': reset + 86400, 'observed_at': now - 5}}}}}),
+                encoding='utf-8')
+            legacy = Path(tmp) / 'claude-status'
+            legacy.mkdir()
+            (legacy / 'old.json').write_text(json.dumps({'updated_at': now - 60, 'rate_limits': {
+                'five_hour': {'used_percentage': 44, 'resets_at': reset, 'observed_at': now - 60}}}), encoding='utf-8')
+            report = claude_status.latest(now, folder=legacy, rolling=rolling)
+            self.assertEqual(report['rate_limits']['five_hour']['used_percentage'], 44)      # the furthest, from the old file
+            self.assertEqual(report['rate_limits']['seven_day']['used_percentage'], 12)
+            self.assertEqual(claude_status.latest(now, rolling=rolling)['rate_limits']['five_hour']['used_percentage'], 40)
+            self.assertEqual(claude_status.rolling_records(rolling), claude_status.rolling_records(rolling))   # cached
+            rolling.write_text('{not json', encoding='utf-8')
+            self.assertIsNone(claude_status.latest(now, rolling=rolling))
 
     def test_processes_distinguish_desktop_from_code(self):
         rows = [SimpleNamespace(info={'name':'claude.exe', 'exe': path}) for path in (

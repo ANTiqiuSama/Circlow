@@ -68,6 +68,57 @@ def install() -> None:
 
 WINDOWS = ("five_hour", "seven_day")
 MAX_AGE_SECONDS = 7 * 86400  # a weekly reading stays meaningful until its own reset
+ROLLING_NAME = "claude-status.json"       # the receiver's one file of every session's readings
+_rolling: dict[str, tuple[int, int, list]] = {}   # path -> (mtime_ns, size, [(updated_at, readings)])
+
+
+def _readings(row: dict) -> tuple | None:
+    """(updated_at, [(window, seen, used, reset)]) of one session's record, or
+    None when it holds no usable reading."""
+    at = float(row["updated_at"])
+    limits = row.get("rate_limits")
+    if not math.isfinite(at) or not isinstance(limits, dict):
+        return None
+    readings = []
+    for name in WINDOWS:
+        value = limits.get(name)
+        if not isinstance(value, dict) or isinstance(value.get("used_percentage"), bool):
+            continue
+        used = float(value["used_percentage"])
+        seen = float(value.get("observed_at", at))
+        reset = value.get("resets_at")
+        reset = int(reset) if reset is not None else None
+        if math.isfinite(used) and 0 <= used <= 100 and math.isfinite(seen) and seen <= at + 1:
+            readings.append((name, seen, used, reset))
+    return (at, readings) if readings else None
+
+
+def rolling_records(path: Path) -> list[tuple]:
+    """Every session's (updated_at, readings) from the rolling file, parsed
+    once per file change (the receiver replaces the file on each update)."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return []
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = _rolling.get(str(path))
+    if cached is not None and cached[:2] == key:
+        return cached[2]
+    records = []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        sessions = payload.get("sessions") if isinstance(payload, dict) else None
+        for row in (sessions or {}).values():
+            try:
+                record = _readings(row) if isinstance(row, dict) else None
+            except (ValueError, TypeError, KeyError, OverflowError):
+                record = None
+            if record is not None:
+                records.append(record)
+    except (OSError, ValueError, TypeError, AttributeError):
+        records = []
+    _rolling[str(path)] = (*key, records)
+    return records
 
 
 NEWEST_FILES = 128           # sessions whose files are considered, newest first
@@ -119,23 +170,7 @@ def _parse(entry: os.DirEntry) -> tuple | None:
     record = None
     try:
         if stat.st_size <= 16384:
-            row = json.loads(Path(entry.path).read_text(encoding="utf-8-sig"))
-            at = float(row["updated_at"])
-            limits = row.get("rate_limits")
-            if math.isfinite(at) and isinstance(limits, dict):
-                readings = []
-                for name in WINDOWS:
-                    value = limits.get(name)
-                    if not isinstance(value, dict) or isinstance(value.get("used_percentage"), bool):
-                        continue
-                    used = float(value["used_percentage"])
-                    seen = float(value.get("observed_at", at))
-                    reset = value.get("resets_at")
-                    reset = int(reset) if reset is not None else None
-                    if math.isfinite(used) and 0 <= used <= 100 and math.isfinite(seen) and seen <= at + 1:
-                        readings.append((name, seen, used, reset))
-                if readings:
-                    record = (at, readings)
+            record = _readings(json.loads(Path(entry.path).read_text(encoding="utf-8-sig")))
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         record = None
     _parsed[entry.path] = (*key, record)
@@ -162,34 +197,38 @@ def prune(folder: Path, wall: float) -> int:
     return removed
 
 
-def latest(now: float | None = None, folder: Path | None = None) -> dict | None:
+def latest(now: float | None = None, folder: Path | None = None, rolling: Path | None = None) -> dict | None:
     """Native account quota merged across sessions, one value per window.
 
-    Each window comes from its newest observation in any session, so a
-    session that left a window out does not hide another session's reading.
-    Claude Code drops a window from its status line once the reading it holds
-    has passed its reset; a window that is missing or past its reset is a new
-    window that has not started yet: nothing used, reset unknown ("idle").
+    Readings come from the receiver's rolling file (`rolling`, one record per
+    session) and, while any remain, from the older receiver's one file per
+    session in `folder`. Each window comes from its furthest observation in
+    any session, so a session that left a window out does not hide another
+    session's reading. Claude Code drops a window from its status line once
+    the reading it holds has passed its reset; a window that is missing or
+    past its reset is a new window that has not started yet: nothing used,
+    reset unknown ("idle").
     """
     global _pruned_at
     now = now or time.time()
     wall = time.time()
-    target = folder or data_dir() / "claude-status"
-    try:
-        entries = _scan(target, wall)
-    except OSError:
-        return None
-    if folder is None and wall - _pruned_at >= PRUNE_EVERY:
-        _pruned_at = wall
-        prune(target, wall)
-        for path in [path for path in _parsed if not os.path.exists(path)]:
-            _parsed.pop(path, None)
+    default = folder is None and rolling is None
+    if default:
+        folder, rolling = data_dir() / "claude-status", data_dir() / ROLLING_NAME
+    records = list(rolling_records(rolling)) if rolling is not None else []
+    if folder is not None:
+        try:
+            entries = _scan(folder, wall)
+        except OSError:
+            entries = []
+        if default and wall - _pruned_at >= PRUNE_EVERY:
+            _pruned_at = wall
+            prune(folder, wall)
+            for path in [path for path in _parsed if not os.path.exists(path)]:
+                _parsed.pop(path, None)
+        records += [record for record in (_parse(entry) for entry in entries) if record is not None]
     reports, observed = [], {}          # window -> [(seen, used, reset)] from every session
-    for entry in entries:
-        record = _parse(entry)
-        if record is None:
-            continue
-        at, readings = record
+    for at, readings in records:
         if not now - MAX_AGE_SECONDS <= at <= now + 30:
             continue
         for name, seen, used, reset in readings:

@@ -33,7 +33,8 @@ class HintTests(unittest.TestCase):
         self.assertNotIn("额度", agent_hints.local_hint(bare)[1])
         self.assertIn("不要提余量不足", agent_hints.SYSTEM_PROMPT)
         self.assertIn("比昨天此时", agent_hints.SYSTEM_PROMPT)                 # told not to compare with yesterday
-        self.assertIn("使用洞察或项目建议", agent_hints.SYSTEM_PROMPT)
+        self.assertIn("宏观洞察或建议", agent_hints.SYSTEM_PROMPT)
+        self.assertIn("不要给具体的操作或改动建议", agent_hints.SYSTEM_PROMPT)
 
     def test_idle_process_does_not_claim_active_generation(self):
         data = agent_hints.context([], [{"name": "Claude Code", "processes": 3}])
