@@ -188,20 +188,14 @@ SOURCE_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "gemini": 
 
 
 def hint_line(store: UsageStore, providers: Iterable[str], now: float, weekly: dict | None = None) -> str:
-    """One short usage insight for the hover panel's hint: a weekly quota
-    about to reset with much of it unused (from `weekly`: provider ->
-    (quota readings, remaining %, resets_at)), else which source did most of
-    today's work, else the busiest hours of the week. No comparison with
-    yesterday: that figure said nothing anyone could act on. Empty without
-    records."""
+    """One short usage insight for the hover panel's hint: which source did
+    most of today's work, else the busiest hours of the week. Never a quota
+    forecast: the panel's forecast line (forecast.outlook) is the one place
+    for that, so the two can not disagree. No comparison with yesterday:
+    that figure said nothing anyone could act on. Empty without records.
+    `weekly` is accepted for callers and unused."""
     day = local_day(now)
     keys = list(providers)
-    for key in keys:
-        readings, remaining, resets_at = (weekly or {}).get(key, ((), None, None))
-        spare = weekly_spare(readings, now, remaining, resets_at)
-        if spare:
-            return (f"{SOURCE_NAMES.get(key, key)} 周额度 {duration_text(spare['reset_at'] - now)}后重置，"
-                    f"预计剩 {spare['spare']:.0f}%，可多用")
     by_source = {key: store.hourly([key], day - 7 * 86400) for key in keys}
     today = {key: sum(t for hour, t in hours.items() if hour >= day) for key, hours in by_source.items()}
     total = sum(today.values())
@@ -252,7 +246,7 @@ def weekly_spare(samples: Iterable[Any], now: float, remaining: float | None, re
     window's readings), at least WEEKLY_LEFTOVER will be left; else None."""
     if remaining is None or not resets_at or not 0 < resets_at - now <= WEEKLY_AHEAD:
         return None
-    outlook = forecast(samples, now, remaining, resets_at)
+    outlook = forecast(samples, now, remaining, resets_at, 10080)
     if outlook.tone == "unknown":
         return None                 # no readings over this window yet: the pace is anyone's guess
     rate = max(0.0, outlook.rate_per_hour or 0.0)
