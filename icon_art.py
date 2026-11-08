@@ -388,6 +388,10 @@ def ring_icon(values: tuple, letter: str, stale: bool = False, marker: float | N
 def _glyph_face(label: str, draw):
     """Letter inside the quota ring. M is wider than C, X, G and A, so the
     shared box shrinks it. Keep M near their cap height, a step inside the ring."""
+    if MONO:
+        # 16-point template icons: a step inside the ring, M included (at 212
+        # its serifs ran into the ring's inner edge, 192 across).
+        return _fit(label, letter_font, 156 if label == "M" else 148, 136 if label == "M" else 140, 200, draw)
     if label == "M":
         return _fit(label, letter_font, 212, 168, 244, draw)
     return _fit(label, letter_font, 176, 168, 212, draw)
