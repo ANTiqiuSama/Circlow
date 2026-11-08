@@ -114,6 +114,7 @@ jobs:
       - name: Check bundle metadata
         run: |
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' dist-macos/Circlow.app/Contents/Info.plist)" = true
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' dist-macos/Circlow.app/Contents/Info.plist)" = 环流
           file dist-macos/Circlow.app/Contents/MacOS/Circlow
           dist-macos/Circlow.app/Contents/MacOS/Circlow --smoke-menu
       - name: Package app
