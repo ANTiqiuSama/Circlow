@@ -265,6 +265,7 @@ class LiquidGlassTest(unittest.TestCase):
         glass = mac_panel.make_glass()
         self.assertEqual(float(glass.cornerRadius()), mac_panel.GLASS_RADIUS)
         self.assertAlmostEqual(float(glass.tintColor().alphaComponent()), mac_panel.GLASS_TINT[3], places=3)
+        self.assertEqual(int(glass.style()), 1)                        # the clear style: dark and see-through
 
 if __name__ == "__main__":
     unittest.main()

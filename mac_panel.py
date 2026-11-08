@@ -84,10 +84,14 @@ def to_nsimage(image, scale: float):
     return native
 
 
-# As in LumaCenter's hover card: regular glass, a light black tint (darker
-# than the system default, still clearly glass) so the light figures read on
-# any wallpaper, and the softer 26 pt corners of macOS 26.
-GLASS_TINT = (0, 0, 0, 0.42)
+# Dark, see-through glass: the clear style (the regular style's frosted
+# material lifts the card to a mid grey, about 51/255 over a dark window,
+# whatever the tint) with a black tint at 60 %, which measures about 18/255
+# over the same window and still shows the blurred backdrop through it. The
+# light figures read on any wallpaper; the drawn highlights (agent_panel)
+# give the glass its edges. Corners: the softer 26 pt of macOS 26.
+GLASS_TINT = (0, 0, 0, 0.60)
+GLASS_STYLE = "clear"
 GLASS_RADIUS = agent_panel.GLASS_RADIUS      # the content draws its highlights to the same corner
 
 
@@ -104,9 +108,9 @@ def glass_available() -> bool:
 
 
 def make_glass():
-    """macOS 26 Liquid Glass for the panel card (NSGlassEffectView), set up
-    like LumaCenter's (GLASS_TINT, GLASS_RADIUS); None where the system has
-    no glass, and the panel draws its own card instead."""
+    """macOS 26 Liquid Glass for the panel card (NSGlassEffectView): the
+    GLASS_STYLE, GLASS_TINT and GLASS_RADIUS above; None where the system
+    has no glass, and the panel draws its own card instead."""
     if not glass_available():
         return None
     import objc
@@ -114,7 +118,8 @@ def make_glass():
     from AppKit import NSColor
     glass = objc.lookUpClass("NSGlassEffectView").alloc().initWithFrame_(((MARGIN, MARGIN), (10, 10)))
     glass.setCornerRadius_(GLASS_RADIUS)
-    glass.setStyle_(getattr(AppKit, "NSGlassEffectViewStyleRegular", 0))
+    glass.setStyle_(getattr(AppKit, "NSGlassEffectViewStyleClear", 1) if GLASS_STYLE == "clear"
+                    else getattr(AppKit, "NSGlassEffectViewStyleRegular", 0))
     r, g, b, alpha = GLASS_TINT
     glass.setTintColor_(NSColor.colorWithSRGBRed_green_blue_alpha_(r / 255, g / 255, b / 255, alpha))
     return glass
