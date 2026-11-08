@@ -14,20 +14,21 @@ import agent_hints
 
 
 class HintTests(unittest.TestCase):
-    def test_context_uses_only_live_agent_labels_and_a_usage_line_never_quota(self):
+    def test_context_uses_only_live_agent_labels_without_usage_or_quota(self):
         agents = [
             {"provider": "codex", "live": True, "title": "修复额度预测", "doing": "运行测试",
              "request": "PRIVATE REQUEST", "folder": "C:/private/secret"},
             {"provider": "claude", "live": False, "title": "旧任务"},
             {"provider": "codex", "live": True, "schedule": "heartbeat:x", "title": "定时任务"},
         ]
-        data = agent_hints.context(agents, [{"name": "Codex 引擎", "processes": 2}], "今天输出 1.2M，Claude 占 70%")
+        data = agent_hints.context(agents, [{"name": "Codex 引擎", "processes": 2}])
         packed = json.dumps(data, ensure_ascii=False)
         self.assertNotIn("PRIVATE REQUEST", packed)
         self.assertNotIn("secret", packed)
         self.assertNotIn("定时任务", packed)
         self.assertNotIn("quotas", data)                                   # quota never reaches the hint
-        self.assertEqual(agent_hints.local_hint(data)[1], "今天输出 1.2M，Claude 占 70%")   # a usage insight
+        self.assertNotIn("usage", data)
+        self.assertEqual(agent_hints.local_hint(data)[1], "手头的线收尾后再开新线，节奏更稳")
         self.assertNotIn("hovered", data)
         bare = agent_hints.context(agents, [])
         self.assertNotIn("额度", agent_hints.local_hint(bare)[1])
@@ -35,6 +36,12 @@ class HintTests(unittest.TestCase):
         self.assertIn("比昨天此时", agent_hints.SYSTEM_PROMPT)                 # told not to compare with yesterday
         self.assertIn("宏观洞察或建议", agent_hints.SYSTEM_PROMPT)
         self.assertIn("不要给具体的操作或改动建议", agent_hints.SYSTEM_PROMPT)
+        self.assertIn("不要给出用量有关的提示", agent_hints.SYSTEM_PROMPT)
+
+    def test_local_hint_ignores_legacy_usage_stats(self):
+        data = {"tasks": [], "detected_clients": [], "usage": "今天输出 1.6M，Claude 占 48%"}
+        self.assertNotIn("输出", agent_hints.local_hint(data)[1])
+        self.assertNotIn("48%", agent_hints.local_hint(data)[1])
 
     def test_idle_process_does_not_claim_active_generation(self):
         data = agent_hints.context([], [{"name": "Claude Code", "processes": 3}])
@@ -71,7 +78,20 @@ class HintTests(unittest.TestCase):
         data["usage"] = "今天输出 81K"                                     # figures move every second
         self.assertEqual(advisor.lookup(data)[0], "正在修复额度预测")      # the suggestion stays
         self.assertEqual(len(seen), 1)
-        self.assertEqual(json.loads(payload["messages"][1]["content"])["usage"], "今天输出 80K")
+        self.assertNotIn("usage", json.loads(payload["messages"][1]["content"]))
+        self.assertNotIn("80K", payload["messages"][1]["content"])
+
+    def test_mimo_usage_advice_is_not_cached_or_displayed(self):
+        def opener(request, timeout):
+            return io.BytesIO(json.dumps({"choices": [{"message": {"content":
+                '{"now":"正在整理任务","next":"今天输出 1.6M，Claude 占 48%"}'}}]}).encode())
+
+        advisor = agent_hints.HintAdvisor({"url": "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+                                          "key": "SECRET", "model": "mimo-v2.6-flash"}, opener)
+        data = agent_hints.context([], [])
+        advisor._fetch("test", data)
+        self.assertIsNone(advisor.result)
+        self.assertEqual(advisor.lookup(data), agent_hints.local_hint(data))
 
     def test_non_mimo_endpoint_uses_local_hint(self):
         advisor = agent_hints.HintAdvisor({"url": "https://example.com/chat/completions", "key": "x", "model": "m"})

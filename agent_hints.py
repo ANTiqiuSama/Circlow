@@ -1,7 +1,7 @@
 """Short, optional MiMo advice for the hover panel.
 
-Only compact agent labels/actions, a one-line usage summary (output totals,
-no quota) and detected AI client names leave the machine. No transcripts, paths, cookies or credentials
+Only compact agent labels/actions, sampled history topics and detected AI
+client names leave the machine. No usage figures, transcripts, paths, cookies or credentials
 are placed in the prompt. Results stay in memory and refresh at a bounded pace.
 """
 from __future__ import annotations
@@ -25,16 +25,20 @@ RESULT_SECONDS = 120
 FAILURE_GAP = 300
 
 SYSTEM_PROMPT = (
-    "你是本机编程工作台的旁观顾问。参考当前工作状态、usage 中的用量概况以及各 agent 的历史话题，"
-    "给出宏观的观察与建议：工作节奏、精力和来源的分配、几个方向之间的取舍、哪类事情占了大头。"
+    "你是本机编程工作台的旁观顾问。参考当前任务以及各 agent 的历史话题，"
+    "给出宏观的观察与建议：几个工作方向之间的取舍、话题之间的联系、值得探索的新方向。"
     "历史话题是抽样线索，不代表仍在进行。"
     "只输出 JSON：{\"now\":\"正在做什么，不超过24字\",\"next\":\"一条宏观洞察或建议，不超过26字\"}。"
     "now 必须只依据当前任务，不编造工作或登录状态；客户端进程存在不代表正在生成。"
-    "next 是旁观者的一句话，站在整体看：例如用量都集中在一个方向、修修补补占了大半、可以先收尾再开新线。"
+    "next 是旁观者的一句话，站在整体看：例如几条工作线索之间的联系、可以先收尾再开新线，或从历史话题发散一个新方向。"
     "不要给具体的操作或改动建议：不提某个文件、函数、功能、命令、测试或修复，不说“去改/加/检查某某”。"
+    "不要给出用量有关的提示：不谈输出量、token 数量、占比、消耗、使用高峰、来源使用分配或用量统计。"
     "不要提余量不足、限额或额度告急，也不要推算额度会剩多少、何时用完（面板另有唯一的额度预测）；"
     "不要做“比昨天此时”这类与过去的对比。建议是可选的，不要执行操作。用中文，避免套话。"
 )
+USAGE_ADVICE = re.compile(
+    r"用量|占比|消耗|使用高峰|(?:今天|今日|本日|累计|总计)输出|输出(?:量|总量)|"
+    r"\d+(?:\.\d+)?\s*[%％]|\b\d+(?:\.\d+)?\s*[KMB]?\s*(?:tokens?|tok/s)\b", re.I)
 
 
 def _label(value: object, length: int = 48) -> str:
@@ -44,17 +48,15 @@ def _label(value: object, length: int = 48) -> str:
     return agent_tasks.shorten(re.sub(r"\s+", " ", text).strip(), length)
 
 
-def context(agents: list[dict], software: list[dict], usage: str = "") -> dict:
-    """What the hint may know: live agents' short labels, a one-line usage
-    summary (usage_store.hint_line) and running AI clients. No quota: the
-    hint is for usage insight and ideas, not quota warnings."""
+def context(agents: list[dict], software: list[dict]) -> dict:
+    """Task labels and running clients, without usage statistics or quota."""
     active = [agent for agent in agents if agent.get("live") and not agent.get("schedule")]
     tasks = [{"provider": str(agent.get("provider") or ""),
               "title": _label(agent.get("title") or agent.get("thread_title")),
               "doing": _label(agent.get("doing"), 32)} for agent in active]
     tasks = sorted(tasks, key=lambda item: (item["provider"], item["title"], item["doing"]))[:5]
     clients = sorted({str(row.get("name")) for row in software if row.get("name") and row.get("processes", 0) > 0})[:8]
-    return {"tasks": tasks, "usage": _label(usage, 40), "detected_clients": clients}
+    return {"tasks": tasks, "detected_clients": clients}
 
 
 def local_hint(data: dict) -> tuple[str, str]:
@@ -68,9 +70,7 @@ def local_hint(data: dict) -> tuple[str, str]:
         current = "检测到 AI 客户端，暂无可确认的生成任务"
     else:
         current = "当前未检测到生成中的 agent"
-    if data.get("usage"):
-        next_step = data["usage"]                       # a usage insight, never a quota warning
-    elif tasks:
+    if tasks:
         next_step = "手头的线收尾后再开新线，节奏更稳"
     else:
         next_step = "可准备下一项任务，或查看刚完成的结果"
@@ -78,8 +78,8 @@ def local_hint(data: dict) -> tuple[str, str]:
 
 
 def _signature(data: dict) -> str:
-    # Tool actions change every few seconds and the usage figures every
-    # second. Keep one suggestion per set of tasks, then ask MiMo again after
+    # Tool actions change every few seconds. Keep one suggestion per set of tasks,
+    # then ask MiMo again after
     # its short cache expires.
     stable = {"tasks": [{"provider": task["provider"], "title": task["title"]} for task in data["tasks"]],
               "detected_clients": data.get("detected_clients", [])}
@@ -236,7 +236,9 @@ class HintAdvisor:
 
     def _fetch(self, signature: str, data: dict, monitor=None) -> None:
         try:
-            material = {**data, "past_topics": history_topics(monitor)}
+            # Do not forward legacy callers' usage fields to the model either.
+            material = {"tasks": data["tasks"], "detected_clients": data.get("detected_clients", []),
+                        "past_topics": history_topics(monitor)}
             payload = {"model": self.config["model"], "temperature": 0.85,
                        "max_completion_tokens": 180, "thinking": {"type": "disabled"},
                        "messages": [{"role": "system", "content": SYSTEM_PROMPT},
@@ -253,6 +255,8 @@ class HintAdvisor:
             result = (_label(values.get("now"), 42), _label(values.get("next"), 50))
             if not all(result):
                 raise ValueError("MiMo advice lacked now/next")
+            if any(USAGE_ADVICE.search(text) for text in result):
+                raise ValueError("MiMo returned usage advice")
             with self.lock:
                 self.signature, self.result, self.result_at = signature, result, time.time()
         except Exception as error:
