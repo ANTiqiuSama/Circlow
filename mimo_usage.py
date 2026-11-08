@@ -682,7 +682,7 @@ def edge_path() -> str | None:
     candidates = [override] if override else []
     if sys.platform == "darwin":
         for folder in (Path("/Applications"), Path.home() / "Applications"):
-            candidates += [str(folder / name) for name in MAC_BROWSERS]
+            candidates += [(folder / name).as_posix() for name in MAC_BROWSERS]   # POSIX paths, also when tested on Windows
     for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
                  os.environ.get("LOCALAPPDATA") if os.name == "nt" else None):
         if base:
