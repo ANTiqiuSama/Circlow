@@ -52,7 +52,7 @@ A 来源面向 **Claude Code 的 CLI 和本地会话记录**。Claude 桌面应�
 
 Windows 运行 `CodexQuotaTray.exe --install-claude-statusline` 接入 Claude 官方 status line 数据。它保留其他 Claude 设置，只在没有已有自定义 status line 时安装；当前会话会自动重载，随后把原生 `rate_limits` 同步到本机托盘，不读取 OAuth 凭据、不发送模型请求。脚本只保存会话 ID、采样时间与数值额度，不保存聊天内容。已安装实时接入时不再启动 `/usage` 终端；旧版或未接入环境保留有超时的 `/usage` 兼容读取。macOS 运行 `/Applications/Circlow.app/Contents/MacOS/Circlow --install-claude-statusline`：接收脚本 `circlow-statusline.py` 由系统自带的 `/usr/bin/python3`（Xcode 命令行工具）以 `-I -S` 运行，只用标准库，每次刷新约 60 毫秒，写入同一个 `claude-status.json`。`CODEX_QUOTA_PROVIDERS` 和设置页的来源开关仍然有效。
 
-macOS 26 上，菜单栏图标的圆盘是一个 Liquid Glass 玻璃球（`NSGlassEffectView`，参考控制中心的圆形按钮）：透明玻璃样式加一层浅色着色，环的空余部分画成半透明的亮边，球内有顶部高光和底部暗影；正在生成的来源整颗球染成该来源的强调色并显示浅色 TPS 数字。额度圆环、字母和角标照常画在玻璃上。深色壁纸下玻璃几乎只呈现这层光影；浅色壁纸会透进来让球变亮，若象牙色字母因此难以辨认，设置环境变量 `CIRCLOW_STATUS_GLASS=dark` 改用墨色着色的常规玻璃；`CIRCLOW_GLASS=0` 关闭所有玻璃效果（悬停面板与图标都回到实心绘制）。
+macOS 菜单栏图标是黑白的模板图像（template image）：由系统按菜单栏自身的文字颜色绘制，深色菜单栏上为白色、浅色上为黑色，点击高亮时自动反色，对比度最高。没有圆盘：额度圆弧与字母实心，环的空余部分是三成透明的刻度；正在生成时整颗图标变成实心圆盘，TPS 数字从中镂空；倒计时数字、单位和角标同样只有黑白。设置环境变量 `CIRCLOW_MENU_ICONS=color` 恢复 Windows 托盘那样的彩色圆盘。悬停面板的 Liquid Glass 不受影响（`CIRCLOW_GLASS=0` 关闭）。
 
 ### Xiaomi MiMo Token Plan
 

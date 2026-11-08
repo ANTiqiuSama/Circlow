@@ -32,7 +32,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 from providers import SPECS
 
@@ -188,60 +188,48 @@ def _stale_badge(canvas: Image.Image) -> None:
     alpha = canvas.getchannel("A")
     alpha.paste(0, (0, 0), knock)
     canvas.putalpha(alpha)
-    ImageDraw.Draw(canvas).ellipse((cx - r, cy - r, cx + r, cy + r), fill=AMBER)
+    ImageDraw.Draw(canvas).ellipse((cx - r, cy - r, cx + r, cy + r), fill=_ink(AMBER))
 
 
 # Shared geometry: both states are full-bleed discs so the icon uses the
 # whole tray slot.  The ring hugs the edge; the glyph gets the rest.
 DISC = (0, 0, CANVAS - 1, CANVAS - 1)
 RING_W = 32
-# macOS 26 menu bar: the disc is a Liquid Glass view behind the picture
-# (mac_panel.status_glass), so the picture carries only the ring, glyph and
-# badges. A lit (live) icon then asks for its accent as the glass tint.
-GLASS = False
+# macOS menu bar: a template image, which the system draws in the bar's own
+# label colour (white on a dark bar, black on a light one, inverted while the
+# item is highlighted), so only the alpha counts: no disc, solid quota arcs
+# and glyph, a dim empty track; a generating source is a solid disc with the
+# number knocked out of it. Everything else keeps the coloured discs.
+MONO = False
+WHITE = (255, 255, 255, 255)
+CLEAR = (0, 0, 0, 0)
+MONO_TRACK = (255, 255, 255, 84)      # the empty track at a third
+MONO_MUTED = (255, 255, 255, 150)     # the "?" of an unknown reading
 
 
-def set_glass(on: bool) -> None:
-    global GLASS
-    if GLASS != bool(on):
-        GLASS = bool(on)
+def set_mono(on: bool) -> None:
+    global MONO
+    if MONO != bool(on):
+        MONO = bool(on)
         for cached in (quota_icon, live_icon, ring_icon, waiting_icon):
             cached.cache_clear()
 
 
-GLASS_TRACK = (255, 255, 255, 60)   # the ring's empty part on glass: a light rim, not a grey band
+def _ink(color):
+    """A colour, or solid white in mono mode (the template's shape)."""
+    return WHITE if MONO else color
 
 
 def _disc(draw: ImageDraw.ImageDraw, fill=INK) -> None:
-    if not GLASS:
+    """The full-bleed disc; none in mono mode, where the bar is the ground."""
+    if not MONO:
         draw.ellipse(DISC, fill=fill)
 
 
 def _track():
-    return GLASS_TRACK if GLASS else TRACK
+    return MONO_TRACK if MONO else TRACK
 
 
-def _sheen(canvas: Image.Image) -> None:
-    """Glass mode: the volume of a Control Center orb, inside the ring: a soft
-    highlight at the top, a bright rim fading towards the bottom and a darker
-    base. The glass view itself is flat at 20 points; this makes it a ball."""
-    if not GLASS:
-        return
-    size = CANVAS
-    inner = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(inner).ellipse((RING_W, RING_W, size - 1 - RING_W, size - 1 - RING_W), fill=255)
-    rim = inner.copy()
-    ImageDraw.Draw(rim).ellipse((RING_W + 9, RING_W + 9, size - 10 - RING_W, size - 10 - RING_W), fill=0)
-    down = Image.linear_gradient("L").resize((size, size))          # 0 at the top, 255 at the bottom
-
-    def layer(color, mask):
-        sheet = Image.new("RGBA", (size, size), color + (0,))
-        sheet.putalpha(mask)
-        canvas.alpha_composite(sheet)
-
-    layer((255, 255, 255), ImageChops.multiply(inner, down.point(lambda v: int(66 * max(0.0, 1 - v / 150)))))   # highlight: 26 % at the top
-    layer((255, 255, 255), ImageChops.multiply(rim, down.point(lambda v: int(140 - 104 * v / 255))))            # rim: 55 % → 14 %
-    layer((0, 0, 0), ImageChops.multiply(inner, down.point(lambda v: int(61 * max(0.0, (v - 153) / 102)))))     # base: 24 % at the bottom
 RING_BOX = (RING_W / 2 + 1, RING_W / 2 + 1, CANVAS - RING_W / 2 - 2, CANVAS - RING_W / 2 - 2)
 
 
@@ -277,7 +265,7 @@ def _pace_tick(draw: ImageDraw.ImageDraw, marker: float) -> None:
     centre = (RING_BOX[0] + RING_BOX[2]) / 2
     inner, outer = radius - RING_W * 0.5, radius + RING_W * 0.62
     points = [(centre + r * math.cos(angle), centre + r * math.sin(angle)) for r in (inner, outer)]
-    draw.line(points, fill=(0, 0, 0, 0) if GLASS else INK, width=30)     # on glass the notch shows the glass
+    draw.line(points, fill=CLEAR if MONO else INK, width=30)     # in mono the notch shows the bar
     draw.line(points, fill=IVORY, width=13)
 
 
@@ -292,7 +280,7 @@ def _reset_badge(canvas: Image.Image) -> None:
     alpha = canvas.getchannel("A")
     alpha.paste(0, (0, 0), knock)
     canvas.putalpha(alpha)
-    ImageDraw.Draw(canvas).ellipse((cx - r, cy - r, cx + r, cy + r), fill=RESET_BLUE)
+    ImageDraw.Draw(canvas).ellipse((cx - r, cy - r, cx + r, cy + r), fill=_ink(RESET_BLUE))
 
 
 @lru_cache(maxsize=128)
@@ -302,12 +290,11 @@ def quota_icon(remaining: float | None, letter: str, stale: bool = False, marker
     draw = ImageDraw.Draw(canvas)
     _disc(draw)
     value = None if remaining is None else max(0.0, min(100.0, remaining))
-    _ring(draw, value, window_shade(letter, 0, value, False), _track())
+    _ring(draw, value, _ink(window_shade(letter, 0, value, False)), _track())
     if marker is not None and value is not None:
         _pace_tick(draw, marker)
-    _sheen(canvas)
 
-    label, fill = (letter, IVORY) if remaining is not None else ("?", MUTED)
+    label, fill = (letter, _ink(IVORY)) if remaining is not None else ("?", MONO_MUTED if MONO else MUTED)
     _centered_text(draw, label, _glyph_face(label, draw), (0, 0, CANVAS, CANVAS), fill)
     if stale:
         _stale_badge(canvas)
@@ -327,18 +314,13 @@ def live_icon(tps: float, letter: str, reset_hint: bool = False) -> Image.Image:
     """Same disc, lit in the provider accent, carrying the TPS number."""
     canvas = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
-    color = accent(letter)
-    _disc(draw, color)
-    _sheen(canvas)
+    # Mono: a solid disc with the number knocked out, so the bar shows through it.
+    draw.ellipse(DISC, fill=WHITE if MONO else accent(letter))
     text = tps_text(tps)
-    # On an accent-tinted glass orb the numeral is light, as on Control Center's active buttons.
-    _centered_text(draw, text, _numeral_face(text, draw), (0, 0, CANVAS, CANVAS), IVORY if GLASS else TILE_TEXT)
+    _centered_text(draw, text, _numeral_face(text, draw), (0, 0, CANVAS, CANVAS), CLEAR if MONO else TILE_TEXT)
     if reset_hint:
         _reset_badge(canvas)
-    image = _finish(canvas)
-    if GLASS:
-        image.info["glass_tint"] = color
-    return image
+    return _finish(canvas)
 
 
 # Gemini's three pools share the ring with no gap: 120 degrees each.
@@ -358,7 +340,7 @@ def _third_segments(draw: ImageDraw.ImageDraw, outer, values: tuple, shades: tup
         if value is None or value <= 0:
             continue
         sweep = THIRD_SPAN * min(100.0, float(value)) / 100
-        color = shades[index % len(shades)]
+        color = _ink(shades[index % len(shades)])
         draw.arc(outer, center - sweep / 2, center + sweep / 2, fill=color, width=RING_W)
 
 
@@ -391,11 +373,10 @@ def ring_icon(values: tuple, letter: str, stale: bool = False, marker: float | N
             if value is None or value <= 0:
                 continue
             sweep = 168 * min(100.0, float(value)) / 100
-            color = shades[index]
+            color = _ink(shades[index])
             start, end = (hi - sweep, hi) if index == 0 else (lo, lo + sweep)
             draw.arc(outer, start, end, fill=color, width=RING_W)
-    _sheen(canvas)
-    label, fill = (letter, IVORY) if any(value is not None for value in values) else ("?", MUTED)
+    label, fill = (letter, _ink(IVORY)) if any(value is not None for value in values) else ("?", MONO_MUTED if MONO else MUTED)
     _centered_text(draw, label, _glyph_face(label, draw), (0, 0, CANVAS, CANVAS), fill)
     if stale:
         _stale_badge(canvas)
@@ -424,6 +405,8 @@ def _unit_face(draw):
 
 
 def _on_digit(pixel) -> bool:
+    if MONO:                         # the digit is solid white; the track behind the unit is a third
+        return pixel[3] > 160
     return pixel[3] > 80 and pixel[0] > 150 and pixel[0] > pixel[1] + 30 and pixel[0] > pixel[2] + 30
 
 
@@ -439,10 +422,10 @@ def _draw_unit(canvas: Image.Image, unit: str) -> None:
     nudge_x, nudge_y = {"d": (24, 0), "m": (24, -12)}.get(unit, (0, 0))
     origin = ((CANVAS - 6) - right + nudge_x, 50 - (top + bottom) / 2 + nudge_y)
     if unit == "h":
-        draw.text(origin, unit, font=face, fill=IVORY)
+        draw.text(origin, unit, font=face, fill=_ink(IVORY))
         return
     layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    ImageDraw.Draw(layer).text(origin, unit, font=face, fill=IVORY)
+    ImageDraw.Draw(layer).text(origin, unit, font=face, fill=_ink(IVORY))
     src = layer.load()
     base = canvas.load()
     for y in range(canvas.height):
@@ -462,9 +445,8 @@ def waiting_icon(amount: int, letter: str, reset_hint: bool = False, stale: bool
     # slightly thicker stroke remains visible at 16-pixel tray size.  Use the
     # original empty-ring track rather than a full provider-coloured arc.
     draw.ellipse(DISC, outline=_track(), width=38)
-    _sheen(canvas)
     text = str(max(1, int(amount)))
-    _centered_text(draw, text, _numeral_face(text, draw), (0, 0, CANVAS, CANVAS), CLAY)
+    _centered_text(draw, text, _numeral_face(text, draw), (0, 0, CANVAS, CANVAS), _ink(CLAY))
     if reset_hint:
         _reset_badge(canvas)
     _draw_unit(canvas, unit if unit in ("d", "h", "m") else "h")
