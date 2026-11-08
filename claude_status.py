@@ -12,8 +12,13 @@ import app_identity
 import providers
 
 
-RECEIVER = "circlow-statusline.ps1"
+MAC = sys.platform == "darwin"
+# Windows runs the PowerShell receiver; macOS the stdlib-only Python twin,
+# with the system Python so a redraw never starts the app itself.
+RECEIVER = "circlow-statusline.py" if MAC else "circlow-statusline.ps1"
 LEGACY_RECEIVER = "codexquotatray-statusline.ps1"     # before the rename to Circlow
+RECEIVERS = ("circlow-statusline.ps1", "circlow-statusline.py", LEGACY_RECEIVER)
+MAC_PYTHON = "/usr/bin/python3"
 
 
 def data_dir() -> Path:
@@ -21,11 +26,23 @@ def data_dir() -> Path:
 
 
 def _ours(command: str) -> bool:
-    return RECEIVER in command or LEGACY_RECEIVER in command
+    return any(name in command for name in RECEIVERS)
 
 
 def _command(receiver: Path) -> str:
+    if MAC:
+        return f'{MAC_PYTHON} -I -S "{receiver.as_posix()}"'
     return f'powershell.exe -NoLogo -NoProfile -NonInteractive -File "{receiver.as_posix()}"'
+
+
+def _mac_python_ready() -> bool:
+    """/usr/bin/python3 is a stub that offers to install the Command Line
+    Tools until they are there; never let a status line trigger that."""
+    import subprocess
+    try:
+        return subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True, timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _settings() -> tuple[Path, dict]:
@@ -50,7 +67,7 @@ def bridge_installed() -> bool:
 
 
 def _bundled_receiver() -> Path:
-    return Path(__file__).resolve().parent / "claude_status.ps1"
+    return Path(__file__).resolve().parent / ("claude_status_receiver.py" if MAC else "claude_status.ps1")
 
 
 def refresh_receiver() -> bool:
@@ -82,12 +99,14 @@ def refresh_receiver() -> bool:
 
 def install() -> None:
     """Explicit installation. Preserve unrelated settings and custom status lines."""
-    if os.name != "nt":
-        raise OSError("当前实时额度接入脚本适用于 Windows")
+    if os.name != "nt" and not MAC:
+        raise OSError("当前实时额度接入脚本适用于 Windows 与 macOS")
+    if MAC and not _mac_python_ready():
+        raise OSError("需要 Xcode 命令行工具提供的 /usr/bin/python3（运行 xcode-select --install）")
     path, settings = _settings()
     previous = settings.get("statusLine") or {}
     if previous and not _ours(previous.get("command", "")):
-        raise ValueError("已有自定义 Claude statusLine，保留现有配置；请手动接入 claude_status.ps1")
+        raise ValueError(f"已有自定义 Claude statusLine，保留现有配置；请手动接入 {_bundled_receiver().name}")
     folder = data_dir()
     folder.mkdir(parents=True, exist_ok=True)
     receiver = folder / RECEIVER

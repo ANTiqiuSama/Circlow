@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -244,6 +245,80 @@ class ClaudeStatusTests(unittest.TestCase):
             report = claude_status.latest(time.time(), rolling=rolling)
             self.assertEqual(report['rate_limits']['five_hour']['used_percentage'], 30)
             self.assertEqual(report['rate_limits']['seven_day']['used_percentage'], 4)
+
+    @unittest.skipIf(os.name == 'nt', 'macOS status-line receiver (POSIX file locks)')
+    def test_mac_receiver_saves_only_numeric_quota_and_session(self):
+        python = claude_status.MAC_PYTHON if Path(claude_status.MAC_PYTHON).exists() else sys.executable
+
+        def run(payload):
+            return subprocess.run([python, '-I', '-S', str(receiver)], input=json.dumps(payload),
+                                  capture_output=True, text=True, timeout=10)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            receiver = Path(tmp) / 'circlow-statusline.py'
+            receiver.write_bytes(Path(claude_status.__file__).with_name('claude_status_receiver.py').read_bytes())
+            payload = {'session_id': 'test-session', 'secret': 'NEVER-SAVE',
+                       'rate_limits': {'five_hour': {'used_percentage': 15, 'resets_at': 1900000000}}}
+            result = run(payload)
+            self.assertEqual((result.returncode, result.stderr), (0, ''))
+            rolling = Path(tmp) / 'claude-status.json'
+            output = rolling.read_text(encoding='utf-8')
+            self.assertNotIn('NEVER-SAVE', output)
+            saved = json.loads(output)['sessions']['test-session']
+            self.assertEqual(saved['rate_limits']['five_hour']['used_percentage'], 15)
+            self.assertEqual(result.stdout.strip(), 'Claude Code | 5h left 85%')
+            run({'session_id': 'other', 'rate_limits': {'five_hour': {'used_percentage': 30, 'resets_at': 1900000000}}})
+            # A later status line without five_hour keeps the last reading for the tray, not for display.
+            payload['rate_limits'] = {'seven_day': {'used_percentage': 4, 'resets_at': 1900000000}}
+            result = run(payload)
+            self.assertNotIn('5h', result.stdout)
+            sessions = json.loads(rolling.read_text(encoding='utf-8'))['sessions']
+            self.assertEqual(set(sessions), {'test-session', 'other'})
+            saved = sessions['test-session']['rate_limits']
+            self.assertEqual(saved['five_hour']['used_percentage'], 15)
+            self.assertLessEqual(saved['five_hour']['observed_at'], saved['seven_day']['observed_at'])
+            report = claude_status.latest(time.time(), rolling=rolling)
+            self.assertEqual(report['rate_limits']['five_hour']['used_percentage'], 30)
+            self.assertEqual(report['rate_limits']['seven_day']['used_percentage'], 4)
+            # Bad input writes nothing and prints nothing, not even an error.
+            before = rolling.read_bytes()
+            for bad in ('not json', json.dumps({'session_id': '../escape'})):
+                result = subprocess.run([python, '-I', '-S', str(receiver)], input=bad,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
+            self.assertEqual(rolling.read_bytes(), before)
+            self.assertEqual(sorted(path.name for path in Path(tmp).iterdir()),
+                             ['circlow-statusline.py', 'claude-status.json', 'claude-status.lock'])
+
+    def test_mac_install_points_claude_code_at_the_system_python(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, data = Path(tmp) / 'claude', Path(tmp) / 'data'
+            home.mkdir()
+            (home / 'settings.json').write_text(json.dumps({'model': 'opus'}), encoding='utf-8')
+            with patch.object(claude_status, 'MAC', True), \
+                    patch.object(claude_status, 'RECEIVER', 'circlow-statusline.py'), \
+                    patch.object(claude_status, '_mac_python_ready', return_value=True), \
+                    patch.object(claude_status.providers, 'claude_home', return_value=home), \
+                    patch.object(claude_status, 'data_dir', return_value=data):
+                claude_status.install()
+                settings = json.loads((home / 'settings.json').read_text(encoding='utf-8'))
+                self.assertEqual(settings['model'], 'opus')                     # other settings kept
+                receiver = data / 'circlow-statusline.py'
+                self.assertEqual(settings['statusLine'],
+                                 {'type': 'command', 'command': f'/usr/bin/python3 -I -S "{receiver.as_posix()}"'})
+                self.assertEqual(receiver.read_bytes(),
+                                 Path(claude_status.__file__).with_name('claude_status_receiver.py').read_bytes())
+                self.assertTrue(claude_status.bridge_installed())
+                self.assertFalse(claude_status.refresh_receiver())              # already current
+                # Without the Command Line Tools, /usr/bin/python3 would offer to install them.
+                with patch.object(claude_status, '_mac_python_ready', return_value=False):
+                    with self.assertRaises(OSError):
+                        claude_status.install()
+                # Someone else's status line stays.
+                settings['statusLine'] = {'type': 'command', 'command': 'my-own-line'}
+                (home / 'settings.json').write_text(json.dumps(settings), encoding='utf-8')
+                with self.assertRaises(ValueError):
+                    claude_status.install()
 
     def test_rolling_file_and_leftover_session_files_are_read_together(self):
         with tempfile.TemporaryDirectory() as tmp:

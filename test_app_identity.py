@@ -73,8 +73,11 @@ class RenameTests(unittest.TestCase):
         (home / "settings.json").write_text(json.dumps({"model": "opus", "statusLine": {"type": "command", "command": old_command, "padding": 0}}),
                                             encoding="utf-8")
         (local / "Circlow" / "codexquotatray-statusline.ps1").write_text("old", encoding="utf-8")
+        # The Windows receiver: the rename only ever happened there.
         with mock.patch.object(claude_status.providers, "claude_home", return_value=home), \
-                mock.patch.object(claude_status.providers, "_local_appdata", return_value=local):
+                mock.patch.object(claude_status.providers, "_local_appdata", return_value=local), \
+                mock.patch.object(claude_status, "MAC", False), \
+                mock.patch.object(claude_status, "RECEIVER", "circlow-statusline.ps1"):
             self.assertFalse(claude_status.bridge_installed())
             self.assertTrue(claude_status.refresh_receiver())
             self.assertTrue(claude_status.bridge_installed())

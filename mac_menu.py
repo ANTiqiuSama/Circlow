@@ -563,6 +563,15 @@ def main() -> int:
         return mac_notify.self_test()
     if len(sys.argv) == 2 and sys.argv[1] == "--mimo-login":
         return mimo_login_cli()
+    if len(sys.argv) == 2 and sys.argv[1] == "--install-claude-statusline":
+        import claude_status
+        try:
+            claude_status.install()
+        except (OSError, ValueError) as error:
+            print(f"Claude 实时额度接入失败：{error}")
+            return 1
+        print("已接入 Claude Code status line：新开的 Claude Code 会话把 5 小时与每周额度实时同步到环流")
+        return 0
     if len(sys.argv) == 4 and sys.argv[1] in ("--grok-quota-worker", "--claude-quota-worker"):
         import cli_quota
         return cli_quota.worker(sys.argv[2], sys.argv[3], "grok" if sys.argv[1] == "--grok-quota-worker" else "claude")

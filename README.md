@@ -50,7 +50,7 @@ A 来源面向 **Claude Code 的 CLI 和本地会话记录**。Claude 桌面应�
 
 在设置 → **来源**打开 **A · Claude Code**，或在托盘菜单勾选“Claude Code 额度与 TPS”。免费桌面端和 API Key 计费环境没有 Pro/Max 的订阅额度窗口。进程列表分别统计 Claude Code 和 Claude 桌面客户端。
 
-Windows 运行 `CodexQuotaTray.exe --install-claude-statusline` 接入 Claude 官方 status line 数据。它保留其他 Claude 设置，只在没有已有自定义 status line 时安装；当前会话会自动重载，随后把原生 `rate_limits` 同步到本机托盘，不读取 OAuth 凭据、不发送模型请求。脚本只保存会话 ID、采样时间与数值额度，不保存聊天内容。已安装实时接入时不再启动 `/usage` 终端；旧版或未接入环境保留有超时的 `/usage` 兼容读取。`CODEX_QUOTA_PROVIDERS` 和设置页的来源开关仍然有效。
+Windows 运行 `CodexQuotaTray.exe --install-claude-statusline` 接入 Claude 官方 status line 数据。它保留其他 Claude 设置，只在没有已有自定义 status line 时安装；当前会话会自动重载，随后把原生 `rate_limits` 同步到本机托盘，不读取 OAuth 凭据、不发送模型请求。脚本只保存会话 ID、采样时间与数值额度，不保存聊天内容。已安装实时接入时不再启动 `/usage` 终端；旧版或未接入环境保留有超时的 `/usage` 兼容读取。macOS 运行 `/Applications/Circlow.app/Contents/MacOS/Circlow --install-claude-statusline`：接收脚本 `circlow-statusline.py` 由系统自带的 `/usr/bin/python3`（Xcode 命令行工具）以 `-I -S` 运行，只用标准库，每次刷新约 60 毫秒，写入同一个 `claude-status.json`。`CODEX_QUOTA_PROVIDERS` 和设置页的来源开关仍然有效。
 
 ### Xiaomi MiMo Token Plan
 
