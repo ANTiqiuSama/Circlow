@@ -22,6 +22,7 @@ BUNDLE_ID = "com.antiqiusama.circlow"
 REPO_URL = "https://github.com/ANTiqiuSama/Circlow"
 USER_AGENT = f"{APP_NAME} (+{REPO_URL})"
 ENV_PREFIX = "CIRCLOW_"
+ICON_NAME = "circlow-fox-tray-mascot"   # assets/<name>.ico / .icns / .png: the app's icon
 
 LEGACY_NAME = "CodexQuotaTray"
 LEGACY_BUNDLE_ID = "com.antiqiusama.codexquotatray"
@@ -39,6 +40,16 @@ def local_root() -> Path:
 
 def data_dir() -> Path:
     return local_root() / APP_NAME
+
+
+def icon_file(suffix: str) -> Path | None:
+    """The app icon as .ico, .icns or .png: bundled next to the code in a
+    build, under assets/ when run from source."""
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    for path in (root / f"{ICON_NAME}{suffix}", root / "assets" / f"{ICON_NAME}{suffix}"):
+        if path.is_file():
+            return path
+    return None
 
 
 def adopt_legacy_env(environ=os.environ) -> list[str]:
