@@ -561,6 +561,8 @@ def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "--notify-test":
         import mac_notify
         return mac_notify.self_test()
+    if len(sys.argv) == 2 and sys.argv[1] == "--mimo-login":
+        return mimo_login_cli()
     if len(sys.argv) == 4 and sys.argv[1] in ("--grok-quota-worker", "--claude-quota-worker"):
         import cli_quota
         return cli_quota.worker(sys.argv[2], sys.argv[3], "grok" if sys.argv[1] == "--grok-quota-worker" else "claude")
@@ -573,6 +575,26 @@ def main() -> int:
         logging.basicConfig(level=logging.INFO, handlers=[handler])
         return settings_mac.run_settings(sys.argv[2] if len(sys.argv) == 3 else None)
     return run_mac()
+
+
+def mimo_login_cli() -> int:
+    """`Circlow --mimo-login`: the same console login as Settings → 来源 →
+    登录小米 MiMo, from a terminal; then the menu bar reads the plan again."""
+    import mimo_usage
+    import settings_mac
+    if not mimo_usage.edge_path():
+        print("未找到 Chrome / Edge / Chromium / Brave，无法打开登录窗口", flush=True)
+        return 2
+    print("已打开登录窗口：请在弹出的浏览器窗口中登录小米账号，进入套餐页后会自动读取并关闭。", flush=True)
+    try:
+        plan = mimo_usage.login(interactive=True)
+    except Exception as error:
+        print(f"登录未完成：{error}", flush=True)
+        return 1
+    settings_mac.send_command(settings_mac.MENU, "refresh", providers=["mimo"])
+    total = mimo_usage.credits_text(plan.total) if getattr(plan, "total", None) is not None else "未知"
+    print(f"登录成功：{plan.plan_name or '套餐'} · 总量 {total}；菜单栏正在读取。", flush=True)
+    return 0
 
 
 def smoke_menu() -> int:

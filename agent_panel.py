@@ -1774,11 +1774,15 @@ def _background(header: tuple, field_h: int, scale: float) -> Image.Image:
             blit_at(content, figure(value or "—", unit, TEXT, TEXT, s), px(x), px(y + 38))
     if header_offset(model):
         _banner(draw, px, s, banner, alert, intel, note, letter)
+    # On glass the sections are a faint lift with no outline (LumaCenter's
+    # .primary.opacity(0.05)); on the drawn card, a hairline plate.
+    plate = {"fill": (255, 255, 255, 13)} if GLASS else {"outline": (240, 238, 230, 14), "width": max(1, round(s))}
     draw.rounded_rectangle((px(PAD - 6), px(top - 6), px(right + 6), px(top + field_h + 4)), radius=px(12),
-                           fill=(240, 238, 230, 7), outline=(240, 238, 230, 14), width=max(1, round(s)))
+                           **({"fill": (240, 238, 230, 7)} | plate))
     chart_y = chart_top(model, field_h)
-    draw.rounded_rectangle((px(PAD - 6), px(chart_y - 4), px(right + 6), px(chart_y + CHART_H + chart_extra_for(model) + 2)), radius=px(10),
-                           fill=(240, 238, 230, 6), outline=(240, 238, 230, 12), width=max(1, round(s)))
+    plate = {"fill": (255, 255, 255, 13)} if GLASS else {"outline": (240, 238, 230, 12), "width": max(1, round(s))}
+    draw.rounded_rectangle((px(PAD - 6), px(chart_y - 4), px(right + 6), px(chart_y + CHART_H + chart_extra_for(model) + 2)), radius=px(12 if GLASS else 10),
+                           **({"fill": (240, 238, 230, 6)} | plate))
     middle = footer_middle(model, field_h)
     tint = FORECAST_TONES.get(model.forecast_tone, MUTED_TEXT)
     _trend(draw, px(PAD), px(middle), s, tint, max(1, round(s)))

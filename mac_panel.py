@@ -64,7 +64,11 @@ def to_nsimage(image, scale: float):
     return native
 
 
-GLASS_TINT = (22, 21, 19, 0.62)   # the card's own dark colour, so the light text reads on any wallpaper
+# As in LumaCenter's hover card: regular glass, a light black tint (darker
+# than the system default, still clearly glass) so the light figures read on
+# any wallpaper, and the softer 26 pt corners of macOS 26.
+GLASS_TINT = (0, 0, 0, 0.42)
+GLASS_RADIUS = 26.0
 
 
 def glass_available() -> bool:
@@ -80,16 +84,17 @@ def glass_available() -> bool:
 
 
 def make_glass():
-    """macOS 26 Liquid Glass for the panel card (NSGlassEffectView), tinted
-    with the card colour and rounded like the drawn card; None where the
-    system has no glass, and the panel draws its own card instead."""
+    """macOS 26 Liquid Glass for the panel card (NSGlassEffectView), set up
+    like LumaCenter's (GLASS_TINT, GLASS_RADIUS); None where the system has
+    no glass, and the panel draws its own card instead."""
     if not glass_available():
         return None
     import objc
+    import AppKit
     from AppKit import NSColor
-    from detail_card import RADIUS
     glass = objc.lookUpClass("NSGlassEffectView").alloc().initWithFrame_(((MARGIN, MARGIN), (10, 10)))
-    glass.setCornerRadius_(float(RADIUS))
+    glass.setCornerRadius_(GLASS_RADIUS)
+    glass.setStyle_(getattr(AppKit, "NSGlassEffectViewStyleRegular", 0))
     r, g, b, alpha = GLASS_TINT
     glass.setTintColor_(NSColor.colorWithSRGBRed_green_blue_alpha_(r / 255, g / 255, b / 255, alpha))
     return glass

@@ -237,9 +237,8 @@ class LiquidGlassTest(unittest.TestCase):
             self.assertIsNone(mac_panel.make_glass())
         if not mac_panel.glass_available():
             self.skipTest("no NSGlassEffectView on this system")
-        from detail_card import RADIUS
         glass = mac_panel.make_glass()
-        self.assertEqual(float(glass.cornerRadius()), float(RADIUS))
+        self.assertEqual(float(glass.cornerRadius()), mac_panel.GLASS_RADIUS)
         self.assertAlmostEqual(float(glass.tintColor().alphaComponent()), mac_panel.GLASS_TINT[3], places=3)
 
 if __name__ == "__main__":
