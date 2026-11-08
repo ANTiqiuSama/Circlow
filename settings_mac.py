@@ -270,11 +270,240 @@ def make_settings_tray():
     return SettingsTray()
 
 
+_VIEW_CLASSES = None
+
+
+def _view_classes():
+    """Click-through NSViews: the overlay only draws; Tk keeps every click."""
+    global _VIEW_CLASSES
+    if _VIEW_CLASSES is None:
+        from AppKit import NSImageView, NSView
+
+        class PassThroughClip(NSView):
+            def hitTest_(self, _point):
+                return None
+
+            def isFlipped(self):
+                return True                     # top-left origin, like Tk
+
+        class PassThroughImage(NSImageView):
+            def hitTest_(self, _point):
+                return None
+
+        _VIEW_CLASSES = (PassThroughClip, PassThroughImage)
+    return _VIEW_CLASSES
+
+
+def intersect(a, b):
+    """(x, y, w, h) rectangles, top-left origin; None when they do not overlap."""
+    if a is None or b is None:
+        return None
+    x0, y0 = max(a[0], b[0]), max(a[1], b[1])
+    x1, y1 = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+    return (x0, y0, x1 - x0, y1 - y0) if x1 > x0 and y1 > y0 else None
+
+
+class RetinaOverlay:
+    """Sharp pictures for a Tk window on a 2x screen.
+
+    Tk on macOS shows one image pixel per point, so the settings window's
+    Pillow pictures (cards, buttons, charts) are stretched and soft. The
+    window draws them at f times their size (SettingsWindow.f); this lays a
+    native image view with that original exactly over each picture label,
+    clipped to the label's ancestors (scrolling pages, slides), and passes
+    every click through to Tk. The sidebar's selection bar, a plain frame
+    above the menu pictures, is kept above them as a coloured view."""
+
+    INTERVAL_MS = 16
+    RESCAN_SECONDS = 1.0
+
+    def __init__(self, window):
+        self.window = window
+        self.root = window.root
+        self.f = window.f
+        self.tracked: dict[str, object] = {}
+        self.views: dict[str, list] = {}          # path -> [clip, image view, picture shown]
+        self.bar = None
+        self.content = None
+        self.scanned_at = 0.0
+        window.on_picture = self.picture_changed
+
+    # ----- bookkeeping -----------------------------------------------------------
+    def picture_changed(self, widget):
+        self.tracked[str(widget)] = widget
+
+    def rescan(self):
+        """Pick up picture labels made before the hook was set (window build)."""
+        hires = self.window.hires
+        stack = [self.root]
+        while stack:
+            widget = stack.pop()
+            stack.extend(widget.winfo_children())
+            if widget.winfo_class() == "Label":
+                try:
+                    if str(widget.cget("image")) in hires:
+                        self.tracked[str(widget)] = widget
+                except Exception:
+                    pass
+        self.scanned_at = time.monotonic()
+
+    def attach(self) -> bool:
+        from AppKit import NSApplication
+        title = str(self.root.title())
+        for candidate in NSApplication.sharedApplication().windows():
+            if str(candidate.title()) == title:
+                self.content = candidate.contentView()
+                return True
+        return False
+
+    def start(self):
+        self.root.after(self.INTERVAL_MS, self.tick)
+
+    def tick(self):
+        try:
+            self.sync()
+        except Exception:
+            log.exception("retina overlay sync failed")
+        finally:
+            try:
+                self.root.after(self.INTERVAL_MS, self.tick)
+            except Exception:
+                pass                              # the window is gone
+
+    # ----- geometry --------------------------------------------------------------
+    def to_content(self, rect, height):
+        """Top-left rect in window points -> the content view's own coordinates."""
+        x, y, w, h = rect
+        if self.content.isFlipped():
+            return ((x, y), (w, h))
+        return ((x, height - y - h), (w, h))
+
+    def rect_of(self, widget, origin, cache):
+        path = str(widget)
+        if path not in cache:
+            cache[path] = (widget.winfo_rootx() - origin[0], widget.winfo_rooty() - origin[1],
+                           widget.winfo_width(), widget.winfo_height())
+        return cache[path]
+
+    def clip_of(self, widget, origin, cache):
+        """The part of the window where `widget` can be seen: its ancestors' intersection."""
+        key = ("clip", str(widget))
+        if key in cache:
+            return cache[key]
+        parent = widget.master
+        if parent is None:
+            result = self.rect_of(widget, origin, cache)
+        else:
+            result = intersect(self.rect_of(parent, origin, cache), self.clip_of(parent, origin, cache))
+        cache[key] = result
+        return result
+
+    # ----- one frame -------------------------------------------------------------
+    def sync(self):
+        if self.content is None and not self.attach():
+            return
+        if str(self.root.state()) == "withdrawn":
+            return
+        if time.monotonic() - self.scanned_at >= self.RESCAN_SECONDS:
+            self.rescan()
+        height = float(self.content.frame().size.height)
+        origin = (self.root.winfo_rootx(), self.root.winfo_rooty())
+        cache: dict = {}
+        for path, widget in list(self.tracked.items()):
+            try:
+                if not widget.winfo_exists():
+                    self.drop(path)
+                    continue
+                self.place(path, widget, origin, cache, height)
+            except Exception:
+                self.drop(path)
+        self.place_bar(origin, cache, height)
+
+    def place(self, path, widget, origin, cache, height):
+        picture = self.window.hires.get(str(widget.cget("image")))
+        if picture is None or not widget.winfo_viewable():
+            self.hide(path)
+            return
+        x, y, w, h = self.rect_of(widget, origin, cache)
+        iw, ih = picture.width / self.f, picture.height / self.f
+        image_rect = (x + (w - iw) / 2, y + (h - ih) / 2, iw, ih)   # a label centres its image
+        visible = intersect(image_rect, intersect((x, y, w, h), self.clip_of(widget, origin, cache)))
+        if visible is None:
+            self.hide(path)
+            return
+        clip, view, shown = self.views.get(path) or self.make(path)
+        if shown is not picture:
+            from mac_panel import to_nsimage
+            view.setImage_(to_nsimage(picture, self.f))
+            self.views[path][2] = picture
+        clip.setFrame_(self.to_content(visible, height))
+        view.setFrame_(((image_rect[0] - visible[0], image_rect[1] - visible[1]), (iw, ih)))
+        clip.setHidden_(False)
+
+    def make(self, path):
+        clip_class, image_class = _view_classes()
+        clip = clip_class.alloc().initWithFrame_(((0, 0), (1, 1)))
+        clip.setWantsLayer_(True)
+        clip.layer().setMasksToBounds_(True)
+        view = image_class.alloc().initWithFrame_(((0, 0), (1, 1)))
+        view.setImageScaling_(1)                  # NSImageScaleAxesIndependently: fill exactly
+        clip.addSubview_(view)
+        self.content.addSubview_(clip)
+        self.views[path] = [clip, view, None]
+        if self.bar is not None:                  # keep the selection bar on top
+            self.content.addSubview_(self.bar[0])
+        return self.views[path]
+
+    def place_bar(self, origin, cache, height):
+        widget = getattr(self.window, "nav_bar", None)
+        if widget is None or not widget.winfo_exists():
+            return
+        if self.bar is None:
+            _, image_class = _view_classes()
+            view = image_class.alloc().initWithFrame_(((0, 0), (1, 1)))
+            view.setImageScaling_(1)              # a one-colour image stretched to the bar
+            self.bar = [view, None]
+            self.content.addSubview_(view)
+        view, color = self.bar
+        rect = intersect(self.rect_of(widget, origin, cache), self.clip_of(widget, origin, cache)) \
+            if widget.winfo_viewable() else None
+        if rect is None:
+            view.setHidden_(True)
+            return
+        fill = str(widget.cget("bg"))
+        if fill != color:
+            from PIL import Image
+            from mac_panel import to_nsimage
+            rgb = tuple(value // 257 for value in widget.winfo_rgb(fill))
+            view.setImage_(to_nsimage(Image.new("RGBA", (2, 2), rgb + (255,)), 1))
+            self.bar[1] = fill
+        view.setFrame_(self.to_content(rect, height))
+        view.setHidden_(False)
+
+    def hide(self, path):
+        entry = self.views.get(path)
+        if entry is not None:
+            entry[0].setHidden_(True)
+
+    def drop(self, path):
+        self.tracked.pop(path, None)
+        entry = self.views.pop(path, None)
+        if entry is not None:
+            entry[0].removeFromSuperview()
+
+
 def make_window(tray, commands):
     import settings_window
 
     class MacSettingsWindow(settings_window.SettingsWindow):
-        """Closing ends the process (the Windows window only hides, for its tray thread)."""
+        """Closing ends the process (the Windows window only hides, for its tray
+        thread); pictures are laid over sharp on 2x screens (RetinaOverlay)."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.overlay = RetinaOverlay(self) if self.f > 1 else None
+            if self.overlay is not None:
+                self.overlay.start()
 
         def close(self):
             super().close()

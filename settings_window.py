@@ -30,6 +30,23 @@ import settings_view as view
 import ui_motion
 
 
+def picture_factor() -> int:
+    """How many times larger than their Tk size pictures are drawn: the
+    screen's backing scale on macOS (2 on Retina), where settings_mac lays the
+    sharp pictures over Tk's one-pixel-per-point copies; 1 elsewhere."""
+    override = os.environ.get("CODEX_QUOTA_PICTURE_SCALE", "").strip()
+    if override.isdigit() and int(override) >= 1:
+        return int(override)
+    if sys.platform != "darwin":
+        return 1
+    try:
+        from AppKit import NSScreen
+        screen = NSScreen.mainScreen()
+        return max(1, round(float(screen.backingScaleFactor()))) if screen is not None else 1
+    except Exception:
+        return 1
+
+
 def load_summary() -> dict:
     try:
         stored = json.loads(agent_tasks.SUMMARY_CONFIG.read_text(encoding="utf-8"))
@@ -390,6 +407,12 @@ class SettingsWindow:
         root.configure(bg=view.BG)
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         S = self.S = lambda value: round(value * self.scale)  # noqa: E731
+        # Pictures are drawn `f` times larger than their Tk size. Tk shows one
+        # image pixel per point, so on a 2x (Retina) Mac screen its copy is
+        # soft; a frontend can lay the sharp original over it (on_picture).
+        self.f = picture_factor()
+        self.hires = {}               # PhotoImage name -> the picture at f
+        self.on_picture = None        # callback(widget) after a label's picture changes
         root.geometry(f"{S(1060)}x{S(760)}")
         root.minsize(S(820), S(600))
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -490,15 +513,17 @@ class SettingsWindow:
     # a Pillow picture (drawn at 3x and scaled down, so the curve is smooth) or
     # a square frame with four such corner pictures laid over its corners.
     def rounded(self, size, radius, fill, outside, edge=None):
+        """A rounded block of Tk size `size`, drawn at f times that."""
         from PIL import Image, ImageDraw
-        key = ("rounded", size, radius, fill, outside, edge)
+        key = ("rounded", size, radius, fill, outside, edge, self.f)
         art = self.art_cache.get(key)
         if art is None:
-            k = 3
-            big = Image.new("RGB", (size[0] * k, size[1] * k), outside)
-            extra = {"outline": edge, "width": max(1, round(self.scale)) * k} if edge else {}
-            ImageDraw.Draw(big).rounded_rectangle((0, 0, size[0] * k - 1, size[1] * k - 1), radius=radius * k, fill=fill, **extra)
-            art = big.resize(size, Image.LANCZOS)
+            k, f = 3, self.f
+            big = Image.new("RGB", (size[0] * f * k, size[1] * f * k), outside)
+            extra = {"outline": edge, "width": max(1, round(self.scale)) * f * k} if edge else {}
+            ImageDraw.Draw(big).rounded_rectangle((0, 0, size[0] * f * k - 1, size[1] * f * k - 1), radius=radius * f * k,
+                                                  fill=fill, **extra)
+            art = big.resize((size[0] * f, size[1] * f), Image.LANCZOS)
             if len(self.art_cache) > 600:
                 self.art_cache.clear()
             self.art_cache[key] = art
@@ -510,12 +535,10 @@ class SettingsWindow:
 
         def put(picture):
             widget.art = picture
-            photo = getattr(widget, "photo", None)
-            if photo is not None and (photo.width(), photo.height()) == picture.size:
-                photo.paste(picture)
-            else:
-                widget.photo = self.ImageTk.PhotoImage(picture)
+            widget.photo = self.photo(picture, getattr(widget, "photo", None))
+            if str(widget.cget("image")) != str(widget.photo):
                 widget.configure(image=widget.photo)
+            self.picture_changed(widget)
         current = getattr(widget, "art", None)
         name = ("art", str(widget))
         if current is None or current.size != image.size or duration <= 0 or not self.motion.enabled:
@@ -524,17 +547,38 @@ class SettingsWindow:
             return
         self.motion.run(name, duration, lambda fraction: put(Image.blend(current, image, fraction)))
 
+    def photo(self, picture, photo=None):
+        """The Tk photo for a picture drawn at f: Tk gets a copy at its own
+        size (pasted into `photo` when that is the same size), the original
+        is kept in self.hires for a sharp overlay."""
+        from PIL import Image
+        f = self.f
+        small = picture if f == 1 else picture.resize((max(1, round(picture.width / f)), max(1, round(picture.height / f))),
+                                                     Image.LANCZOS)
+        if photo is not None and (photo.width(), photo.height()) == small.size:
+            photo.paste(small)
+        else:
+            photo = self.ImageTk.PhotoImage(small)
+        if f != 1:
+            self.hires[str(photo)] = picture
+        return photo
+
+    def picture_changed(self, widget):
+        if self.on_picture is not None:
+            self.on_picture(widget)
+
     def text_art(self, size, radius, fill, outside, text, ink, points=10, weight="regular", left=None):
-        """A rounded block with one line of text, centred or from `left`."""
+        """A rounded block with one line of text, centred or from `left` (Tk sizes; drawn at f)."""
         from PIL import ImageDraw
         from detail_card import ui_font
+        f = self.f
         image = self.rounded(size, radius, fill, outside)
-        face = ui_font(round(points * 4 / 3 * self.scale), weight)
+        face = ui_font(round(points * 4 / 3 * self.scale * f), weight)
         draw = ImageDraw.Draw(image)
         if left is None:
-            draw.text((size[0] / 2, size[1] / 2), text, font=face, fill=ink, anchor="mm")
+            draw.text((size[0] * f / 2, size[1] * f / 2), text, font=face, fill=ink, anchor="mm")
         else:
-            draw.text((left, size[1] / 2), text, font=face, fill=ink, anchor="lm")
+            draw.text((left * f, size[1] * f / 2), text, font=face, fill=ink, anchor="lm")
         return image
 
     def text_width(self, text, points=10, weight="regular") -> int:
@@ -547,8 +591,8 @@ class SettingsWindow:
         key = ("corners", radius, outside, fill, edge)
         if key not in self.images:
             whole = self.rounded((2 * radius, 2 * radius), radius, fill, outside, edge)
-            r = radius
-            self.images[key] = [self.ImageTk.PhotoImage(whole.crop(box))
+            r = radius * self.f
+            self.images[key] = [self.photo(whole.crop(box))
                                 for box in ((0, 0, r, r), (r, 0, 2 * r, r), (0, r, r, 2 * r), (r, r, 2 * r, 2 * r))]
         return self.images[key]
 
@@ -572,6 +616,7 @@ class SettingsWindow:
             outer.configure(bg=color)
             for corner, image in zip(corners, self.corner_art(S(radius), outside, fill, color)):
                 corner.configure(image=image)
+                self.picture_changed(corner)
         paint(edge)
         outer.inner, outer.paint = inner, paint
         return outer
@@ -821,16 +866,15 @@ class SettingsWindow:
             ground = Image.new("RGB", image.size, str(parent["bg"]))
             ground.paste(image, mask=image.getchannel("A"))
             image = ground
-        if photo is not None and (photo.width(), photo.height()) == image.size:
-            photo.paste(image)
-        else:
-            photo = self.images[key] = self.ImageTk.PhotoImage(image)
+        new = self.photo(image, photo)
+        if new is not photo:
+            photo = self.images[key] = new
             if widget is not None and widget.winfo_exists():
                 widget.configure(image=photo)
-        if widget is not None and widget.winfo_exists():
-            return widget
-        widget = self.tk.Label(parent, image=photo, bg=parent["bg"], bd=0, **kw)
-        self.images[key + ":widget"] = widget
+        if widget is None or not widget.winfo_exists():
+            widget = self.tk.Label(parent, image=photo, bg=parent["bg"], bd=0, **kw)
+            self.images[key + ":widget"] = widget
+        self.picture_changed(widget)
         return widget
 
     def scrollable(self, page, key):
@@ -1204,7 +1248,7 @@ class SettingsWindow:
         if chart["drawn"] == drawn:
             return
         chart["drawn"] = drawn
-        image = view.activity_chart(activity, providers, self.scale, width=round(width), height=self.CHART_H,
+        image = view.activity_chart(activity, providers, self.scale * self.f, width=round(width), height=self.CHART_H,
                                     hover=chart["hover"], grow=chart["grow"], trend=bool(zoom))
         widget = self.picture(chart["holder"], "chart:" + chart["name"], image)
         if not widget.winfo_manager():
@@ -1257,7 +1301,7 @@ class SettingsWindow:
         for provider, (card, icon) in cards.items():
             def fit(row, card=card, icon=icon):
                 slots = max(len(cards[key][0].rows) or 1 for key in row if key in cards)
-                return self._draw_card(card, icon, view.CARD_W, slots).size[1]
+                return round(self._draw_card(card, icon, view.CARD_W, slots).size[1] / self.f)   # Tk size, not picture pixels
             if self.images.get("card:" + provider + ":widget") is None:
                 self._draw_card(card, icon, view.CARD_W, len(card.rows) or 1)
             tiles.append((provider, self.images["card:" + provider + ":widget"], fit, view.CARD_W))
@@ -1271,7 +1315,7 @@ class SettingsWindow:
         signature = (card, id(icon), icon.tobytes() if icon is not None else None, width, slots)
         art = self.card_art.get(card.provider)
         if art is None or art[0] != signature:
-            normal = view.source_card(card, icon, self.scale, hover=False, slots=slots, width=width)
+            normal = view.source_card(card, icon, self.scale * self.f, hover=False, slots=slots, width=width)
             art = self.card_art[card.provider] = [signature, normal, None, icon]
             self._show_card(card.provider)
         return art[1]
@@ -1283,7 +1327,7 @@ class SettingsWindow:
         glow = self.card_lit.get(provider, 0.0)
         if glow > 0 and art[2] is None:
             card, _icon_id, _bytes, width, slots = art[0]
-            art[2] = view.source_card(card, art[3], self.scale, hover=True, slots=slots, width=width)
+            art[2] = view.source_card(card, art[3], self.scale * self.f, hover=True, slots=slots, width=width)
         from PIL import Image
         image = art[1] if glow <= 0 else art[2] if glow >= 1 else Image.blend(art[1], art[2], glow)
         key = "card:" + provider
@@ -1370,10 +1414,10 @@ class SettingsWindow:
         if found is not None:
             card, icon = found
             tile("card", (card, id(icon), height),
-                 lambda: view.source_card(card, icon, self.scale, slots=slots, width=width, height=height))
+                 lambda: view.source_card(card, icon, self.scale * self.f, slots=slots, width=width, height=height))
         for index, (title, rows) in enumerate(self.detail_groups):
             tile(str(index), (title, tuple(rows), height),
-                 lambda title=title, rows=rows: view.fact_tile(title, rows, self.scale, width, height))
+                 lambda title=title, rows=rows: view.fact_tile(title, rows, self.scale * self.f, width, height))
         used = {"detail:tile:" + key for key, *_ in tiles}
         for name in [name for name in self.tile_art if name not in used]:
             self.tile_art.pop(name)
@@ -1764,7 +1808,7 @@ class SettingsWindow:
         letters = {provider: letter_of(provider) for provider in PROVIDER_NAMES}
         agents = [agent for agent in (getattr(self.app, "agents", None) or []) if not agent.get("schedule")]
         width = round(self.page_width("tasks"))
-        widget = self.picture(self.agent_holder, "agents", view.agent_rows(agents, letters, self.scale, width=max(400, width)))
+        widget = self.picture(self.agent_holder, "agents", view.agent_rows(agents, letters, self.scale * self.f, width=max(400, width)))
         if not widget.winfo_manager():
             widget.pack(anchor="w")
 

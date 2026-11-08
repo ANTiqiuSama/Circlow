@@ -152,5 +152,63 @@ class SettingsTrayTest(TempData):
         show.assert_called_once()
 
 
+class RetinaPictureTest(unittest.TestCase):
+    """Settings pictures drawn at the screen's scale, Tk given 1x copies."""
+
+    def test_intersect_and_flip_to_the_content_view(self):
+        self.assertEqual(settings_mac.intersect((0, 0, 10, 10), (5, 5, 10, 10)), (5, 5, 5, 5))
+        self.assertIsNone(settings_mac.intersect((0, 0, 10, 10), (10, 0, 5, 5)))
+        self.assertIsNone(settings_mac.intersect(None, (0, 0, 1, 1)))
+        overlay = settings_mac.RetinaOverlay.__new__(settings_mac.RetinaOverlay)
+        overlay.content = Mock(isFlipped=Mock(return_value=False))
+        self.assertEqual(overlay.to_content((10, 20, 30, 40), 760), ((10, 700), (30, 40)))
+        overlay.content.isFlipped.return_value = True
+        self.assertEqual(overlay.to_content((10, 20, 30, 40), 760), ((10, 20), (30, 40)))
+
+    def test_picture_factor_follows_the_override(self):
+        import settings_window
+        with patch.dict(os.environ, {"CODEX_QUOTA_PICTURE_SCALE": "2"}):
+            self.assertEqual(settings_window.picture_factor(), 2)
+        with patch.dict(os.environ, {"CODEX_QUOTA_PICTURE_SCALE": "1"}):
+            self.assertEqual(settings_window.picture_factor(), 1)
+
+    def test_photo_gives_tk_a_one_x_copy_and_keeps_the_original(self):
+        from PIL import Image
+        import settings_window
+
+        class Photo:
+            count = 0
+
+            def __init__(self, image):
+                Photo.count += 1
+                self.name, self.size, self.pasted = f"photo{Photo.count}", image.size, []
+
+            def width(self):
+                return self.size[0]
+
+            def height(self):
+                return self.size[1]
+
+            def paste(self, image):
+                self.pasted.append(image.size)
+
+            def __str__(self):
+                return self.name
+
+        window = settings_window.SettingsWindow.__new__(settings_window.SettingsWindow)
+        window.f, window.hires, window.ImageTk = 2, {}, Mock(PhotoImage=Photo)
+        sharp = Image.new("RGB", (480, 338), "#202020")
+        photo = window.photo(sharp)
+        self.assertEqual(photo.size, (240, 169))                 # Tk lays it out at its own size
+        self.assertIs(window.hires["photo1"], sharp)             # the overlay shows this one
+        again = window.photo(Image.new("RGB", (480, 338), "#303030"), photo)
+        self.assertIs(again, photo)                              # same size: pasted, no new photo
+        self.assertEqual(photo.pasted, [(240, 169)])
+        window.f, window.hires = 1, {}
+        plain = window.photo(Image.new("RGB", (10, 10)))
+        self.assertEqual(plain.size, (10, 10))
+        self.assertEqual(window.hires, {})                       # Windows: nothing kept
+
+
 if __name__ == "__main__":
     unittest.main()
