@@ -47,6 +47,7 @@ from quota_sources import (
 )
 import herdr_source
 import launchers
+import sync_hub
 from local_sync import LocalSync, PERFORMANCE_SAVE_SECONDS  # noqa: F401
 from quota_charts import ChartData, provider_letter, weekly_series_name, window_label  # noqa: F401
 from tray_slots import IconSlots, REORDER_MIN_SECONDS  # noqa: F401
@@ -1030,7 +1031,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         return build_stamp()
 
     def diagnostic_text(self) -> str:
-        sections = [f"构建：{build_stamp()}", "", dump_snapshot(self.snapshots), "", "数据源边界："]
+        sections = [f"构建：{build_stamp()}", f"多端同步：{self.sync_status()}", "", dump_snapshot(self.snapshots), "", "数据源边界："]
         sections += [f"- {provider_registry.get(p).label}：{provider_registry.get(p).source_note}" for p in PROVIDERS]
         for item in self.snapshots.values():
             if item.error:
@@ -1178,6 +1179,55 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         self.hint_advisor = agent_hints.HintAdvisor(agent_tasks.summary_config())
         log.info("agent summary settings applied: enabled=%s", self.summarizer.enabled)
 
+    # ----- multi-device sync ----------------------------------------------------------------
+
+    def start_sync(self) -> bool:
+        """Sync with the other devices through the hub (sync_hub), when
+        sync.json sets it up; off otherwise."""
+        config = sync_hub.load_config()
+        if config is None:
+            self.sync = None
+            return False
+        self.sync = sync_hub.SyncLoop(sync_hub.HubClient(config), config["device"], self.sync_payload, self.sync_merge)
+        threading.Thread(target=self.sync.run, args=(self.stop_event,), name="device-sync", daemon=True).start()
+        log.info("sync: on as %s via %s", config["device"], config["url"])
+        return True
+
+    def sync_payload(self, now: float) -> dict:
+        """What this device shares: its quota readings, its own hourly output
+        totals, and the weekly ledger. Numbers only."""
+        usage, ledger = getattr(self, "usage", None), getattr(self, "weekly", None)
+        return {"label": sync_hub.device_label(), "platform": sys.platform, "sent_at": now,
+                "snapshots": sync_hub.snapshot_payload(dict(self.snapshots)),
+                "usage": usage.export_hours(now - sync_hub.USAGE_DAYS * 86400) if usage is not None else {},
+                "weekly": ledger.export() if ledger is not None else {}}
+
+    def sync_merge(self, payloads: dict, now: float) -> None:
+        """Take the other devices' newer quota readings, their output hours
+        and their weeks."""
+        me = self.sync.device if getattr(self, "sync", None) is not None else ""
+        taken = sync_hub.merge_snapshots(payloads, me, dict(self.snapshots), self.accept_snapshot)
+        if taken and self.history is not None and any([self.history.record(snapshot) for _, snapshot in taken]):
+            self.history.save()
+        usage, ledger = getattr(self, "usage", None), getattr(self, "weekly", None)
+        if usage is not None:
+            usage.keep_remote(payloads)
+        for device, record in payloads.items():
+            if device == me or not isinstance(record, dict):
+                continue
+            payload = record.get("payload") or {}
+            if usage is not None:
+                usage.set_remote(device, str(payload.get("label") or device), payload.get("usage"))
+            if ledger is not None:
+                ledger.merge(payload.get("weekly"))
+        if taken:
+            log.info("sync: newer readings from other devices for %s", ", ".join(sorted({p for p, _ in taken})))
+            self.update_ui()
+
+    def sync_status(self) -> str:
+        sync = getattr(self, "sync", None)
+        return sync.status() if sync is not None else "未开启（没有 sync.json）"
+
     def exit_app(self, _icon=None, _item=None) -> None:
         self.stop_event.set()
         self.wake.set()
@@ -1199,6 +1249,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         if reset_watch.ENABLED and "codex" in PROVIDERS:
             threading.Thread(target=self.reset_loop, name="codex-reset-watch", daemon=True).start()
         threading.Thread(target=self.iq_loop, name="model-iq", daemon=True).start()
+        self.start_sync()
 
     def run(self) -> None:
         self.start_workers()

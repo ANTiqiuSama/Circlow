@@ -389,7 +389,7 @@ def run_mac() -> int:
                 menu.setDelegate_(self)          # open menu = hover: fastest refresh tier
                 parts = {}
                 for name, title in (("summary", key), ("quota0", ""), ("quota1", ""), ("quota2", ""),
-                                    ("speed", ""), ("updated", ""), ("error", "")):
+                                    ("speed", ""), ("updated", ""), ("error", ""), ("sync", "")):
                     line = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
                     line.setEnabled_(False)
                     menu.addItem_(line)
@@ -450,6 +450,9 @@ def run_mac() -> int:
                                     ("updated", model["updated"]), ("error", model["error"])):
                     self.menus[key][name].setTitle_(value)
                     self.menus[key][name].setHidden_(not bool(value))
+                sync = f"同步：{tray.sync_status()}" if getattr(tray, "sync", None) is not None else ""
+                self.menus[key]["sync"].setTitle_(sync)
+                self.menus[key]["sync"].setHidden_(not sync)
                 for index in range(3):
                     value = rows[index] if index < len(rows) else ""
                     line = self.menus[key][f"quota{index}"]

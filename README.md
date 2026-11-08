@@ -481,10 +481,23 @@ Claude 原生实时额度使用 `claude-status.json`：接收脚本把所有会�
 | `agent_groups.json` | 手动合并的任务分组与拆开记录（仅会话 ID，7 天未用自动清理） |
 | `agent_summary.json` | 可选的气泡命名接口配置 |
 | `mimo-login.log` | MiMo 登录/续期诊断：步骤、HTTP 状态码、cookie 与请求头的**名称**（不含值） |
+| `sync.json` | 可选的多端同步配置：同步服务地址、两个令牌、本机设备名（见“多端同步”一节；勿外传） |
 
 TPS 读取器会在内存解析本地会话记录。任务气泡所需的请求摘要、工具名和线程标题同样只在内存中，不写入任何文件；只有配置了命名接口时，才会把上节所述的截断请求发往该接口。`performance.json` 保存数值投影、模型名等统计字段，不包含已解析的消息正文。程序不直接打开客户端的 `auth.json` 或提取 token、cookie；登录由已有客户端处理。唯一例外是 MiMo：控制台会话 cookie 由程序自己的登录窗口取得，并加密保存在上表位置。
 
 日志与诊断可能包含本地路径、错误文本、账户用量和软件状态。`--check-claude --raw` 额外保存终端文本，仅自动遮盖邮箱，其他内容仍需在共享前检查。仓库的 `.gitignore` 排除了运行缓存、日志、构建输出和常见本地凭据文件。
+
+## 多端同步（可选）
+
+Windows 托盘与 Mac 菜单栏可以通过一台自己的服务器互通数据，两边看到同一份额度和用量。服务端是标准库写的 `sync_server.py`（作者部署在 Instabox 沙箱上，systemd 服务 `quota-sync`，端口 8090 以私有方式发布）；客户端是 `sync_hub.py`，托盘和菜单栏各起一个后台线程。
+
+- **共享什么**：只有数字。各来源最新的额度读数；本机最近 8 天每小时的输出 tokens 与回复数；周额度台账（`weekly.json`，Mac 端暂不记录）。不含对话内容、路径、cookie 或任何客户端凭据。
+- **怎么合并**：额度属于账户而不属于设备，任何一端读到更新的读数（按 `updated_at`）就采用；读取失败的结果不同步，不会盖掉另一端正常的读数；转发回来的读数不比已有的新，所以不会在两端之间来回跳。输出时长每台设备只上传自己那份，对方计入用量洞察（悬停面板出现“设备：本机 X · Mac Y”）。周台账按重置时间对齐，已用比例和 tokens 取较大值。
+- **节奏**：每 2 分钟一轮，内容不变时只读不写，至少每 10 分钟上传一次心跳。连不上时按 2、5、10 分钟退避，两端照常本地工作。Instabox 沙箱闲置 30 分钟会暂停（访问时约 45 秒内唤醒）；每运行 8 小时会强制冷却约 140 分钟，期间同步暂停，恢复后自动续上。
+- **开启**：把 `sync.json` 放进数据目录（Windows `%LOCALAPPDATA%\CodexQuotaTray\`，macOS `~/Library/Application Support/CodexQuotaTray/`）后重启程序。字段是 `url`、`link_token`（Instabox 私有端口的访问令牌，以 `Authorization: Bearer` 发送）、`token`（服务端自己的令牌，以 `X-Sync-Token` 发送）、`device`（留空时为 `win-主机名` / `mac-主机名`）。也可以用环境变量 `CODEX_QUOTA_SYNC_URL`、`_LINK_TOKEN`、`_TOKEN`、`_DEVICE` 覆盖。
+- **状态**：设置 → 常规 → “多端同步”、诊断信息和 Mac 菜单中的“同步：”一行，显示上次同步时间、其他设备，或连不上的原因。
+
+自建服务端时，运行 `SYNC_TOKEN_FILE=… SYNC_DIR=… PORT=8090 python3 sync_server.py`，前面最好加一层 HTTPS 和访问控制。接口为 `PUT /v1/devices/<设备>`、`GET /v1/devices`、`DELETE /v1/devices/<设备>`、`GET /v1/health`；30 天没上传的设备不再列出。
 
 ## 构建 EXE
 
@@ -564,7 +577,9 @@ launchers.py          点击图标打开来源的方式列表（Claude App / her
 local_sync.py         托盘每秒一次的本机同步（状态栏、Codex 会话记录、MiMo 账本、每周摘要）
 quota_charts.py       悬停面板折线图的数据：各来源的额度窗口、使用中判断、历史与预测曲线
 tray_slots.py         托盘图标槽位：各来源在五个固定图标间的分配、图片与提示的更新
-usage_store.py        本机保存的输出记录（逐条一天、每小时汇总 90 天）与用量洞察
+usage_store.py        本机保存的输出记录（逐条一天、每小时汇总 90 天）与用量洞察；其他设备同步来的每小时汇总
+sync_hub.py           多端同步客户端：配置、上传/拉取、读数与用量合并、退避与状态文案
+sync_server.py        多端同步服务端（部署在自己的服务器上，仅标准库，不打包进 EXE）
 reset_watch.py        Codex 全局重置的社区预测读取与提示文案
 model_iq.py           AI Stupid Level 模型智商读取、每日调用预算与面板显示选择
 grok_iq.py            LiveBench 榜单读取：Grok 4.7 相对最高分模型的百分比
