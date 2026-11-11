@@ -29,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,6 +42,8 @@ SYNC_EVERY = 120          # seconds between rounds
 HEARTBEAT = 600           # an unchanged payload is still sent this often
 BACKOFF = (120, 300, 600)  # after 1, 2, 3+ failed rounds
 TIMEOUT = 60              # a paused box can take ~45 s to wake on a request
+COOLDOWN_MARGIN = 5       # seconds past the end of a cool-down before the first call
+COOLDOWN_MAX = 6 * 3600   # a stated cool-down longer than this is not believed
 USAGE_DAYS = 8
 # Live TPS: while any device is working, every LIVE_ACTIVE seconds; otherwise
 # every LIVE_IDLE. A device not heard from for LIVE_FRESH seconds (by the
@@ -180,6 +183,7 @@ class SyncLoop:
         self.last_error = ""
         self.devices: dict[str, str] = {}       # device -> label, from the last read
         self.next_at = 0.0
+        self.cooling_until = 0.0                # the hub's machine is in its forced cool-down until then
         self.lock = threading.Lock()
 
     def tick(self, now: float) -> bool:
@@ -195,17 +199,25 @@ class SyncLoop:
             payloads = self.client.get_all()
             self.merge(payloads, now)
         except (OSError, ValueError, urllib.error.URLError) as error:
+            until = cooldown_end(error, now)
             with self.lock:
                 self.failures += 1
-                self.last_error = _reason(error)
-                self.next_at = now + BACKOFF[min(self.failures, len(BACKOFF)) - 1]
-            if self.failures in (1, 4) or self.failures % 20 == 0:
+                news = until is not None and abs(until - self.cooling_until) > 60
+                self.cooling_until = until or 0.0
+                self.last_error = "服务器冷却中" if until else _reason(error)
+                # A cooling machine answers nothing until it is back: wait for that, not the back-off.
+                self.next_at = until + COOLDOWN_MARGIN if until else now + BACKOFF[min(self.failures, len(BACKOFF)) - 1]
+            if until:
+                if news:
+                    log.info("sync: hub machine cooling down until %s; next try then",
+                             time.strftime("%H:%M:%S", time.localtime(until)))
+            elif self.failures in (1, 4) or self.failures % 20 == 0:
                 log.info("sync: hub unreachable (%s); next try in %.0f s", self.last_error, self.next_at - now)
             return False
         with self.lock:
             if self.failures:
                 log.info("sync: hub reachable again after %d failed rounds", self.failures)
-            self.failures, self.last_error, self.last_ok = 0, "", now
+            self.failures, self.last_error, self.last_ok, self.cooling_until = 0, "", now, 0.0
             self.devices = {device: str(((record.get("payload") or {}).get("label")) or device)
                             for device, record in payloads.items() if isinstance(record, dict)}
             self.next_at = now + SYNC_EVERY
@@ -224,6 +236,9 @@ class SyncLoop:
         with self.lock:
             others = [label for device, label in self.devices.items() if device != self.device]
             if self.failures:
+                if self.cooling_until > now:
+                    when = time.strftime("%H:%M", time.localtime(self.cooling_until))
+                    return f"同步服务器冷却中，{when} 恢复后自动续上"
                 return f"暂时连不上同步服务器（{self.last_error}），{max(0, round((self.next_at - now) / 60))} 分钟后重试"
             if not self.last_ok:
                 return "正在连接同步服务器"
@@ -331,6 +346,7 @@ class LiveLoop:
         self.read_at = 0.0
         self.failures = 0
         self.next_at = 0.0
+        self.cooling_until = 0.0
         self.lock = threading.Lock()
 
     def busy(self, payload: dict) -> bool:
@@ -350,19 +366,23 @@ class LiveLoop:
             payload = self.collect(now)
             self.client.put_live(self.device, payload)
             live, hub_now = self.client.get_live()
-        except (OSError, ValueError, urllib.error.URLError):
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            until = cooldown_end(error, now)
             self.failures += 1
-            self.next_at = now + BACKOFF[min(self.failures, len(BACKOFF)) - 1]
+            self.cooling_until = until or 0.0
+            self.next_at = until + COOLDOWN_MARGIN if until else now + BACKOFF[min(self.failures, len(BACKOFF)) - 1]
             return False
         with self.lock:
             self.live, self.hub_now, self.read_at = live, hub_now, now
-        self.failures = 0
+        self.failures, self.cooling_until = 0, 0.0
         self.next_at = now + (LIVE_ACTIVE if self.busy(payload) else LIVE_IDLE)
         return True
 
     def wake(self) -> None:
-        """This device started working: swap at once rather than at the idle pace."""
-        self.next_at = 0.0
+        """This device started working: swap at once rather than at the idle
+        pace, unless the hub's machine is cooling down and cannot answer."""
+        if time.time() >= self.cooling_until:
+            self.next_at = 0.0
 
     def view(self, now: float) -> tuple[dict[str, dict], float]:
         with self.lock:
@@ -377,6 +397,34 @@ class LiveLoop:
             except Exception:
                 log.exception("live TPS round failed")
             stop.wait(0.5)
+
+
+def cooldown_end(error: Exception, now: float) -> float | None:
+    """When the hub's machine is back, if `error` is Instabox's answer for a
+    machine in its forced cool-down: HTTP 409 with {"error": {"code":
+    "machine_cooldown", "retryAfterSeconds": N, "message": "machine is cooling
+    down until <ISO time>"}}. None for any other failure, or when the answer
+    names no believable time. Reads the error's body, which can be read once."""
+    if not isinstance(error, urllib.error.HTTPError) or error.code != 409:
+        return None
+    try:
+        detail = json.loads(error.read().decode("utf-8", "replace")).get("error")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(detail, dict) or detail.get("code") != "machine_cooldown":
+        return None
+    seconds = detail.get("retryAfterSeconds")
+    if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and 0 < seconds <= COOLDOWN_MAX:
+        return now + float(seconds)                    # relative: the two clocks need not agree
+    stated = re.search(r"until (\S+)", str(detail.get("message") or ""))
+    if stated:
+        try:
+            until = datetime.fromisoformat(stated.group(1).rstrip(".,").replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+        if 0 < until - now <= COOLDOWN_MAX:
+            return until
+    return None
 
 
 def _reason(error: Exception) -> str:

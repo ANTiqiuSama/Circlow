@@ -26,6 +26,14 @@ def record(payload, received=1000.0):
     return {"received_at": received, "payload": payload}
 
 
+def cooling(seconds=3389, until="2026-11-11T18:24:25Z", code="machine_cooldown"):
+    """Instabox's answer while the hub's machine is in its forced cool-down (the body reads once)."""
+    detail = {"code": code, "message": f"machine is cooling down until {until}", "retryable": True}
+    if seconds is not None:
+        detail["retryAfterSeconds"] = seconds
+    return urllib.error.HTTPError("u", 409, "Conflict", None, io.BytesIO(json.dumps({"error": detail}).encode()))
+
+
 class FakeClient:
     def __init__(self, devices=None):
         self.devices = devices if devices is not None else {}
@@ -179,6 +187,44 @@ class LoopTests(unittest.TestCase):
         self.assertTrue(loop.tick(loop.next_at))
         self.assertIn("已同步", loop.status())
         self.assertIn("暂无其他设备", loop.status())
+
+    def test_a_cooling_machine_is_left_alone_until_it_is_back(self):
+        client = FakeClient()
+        loop, _ = self.make(client)
+        now = 1_794_000_000.0
+        client.fail = cooling(3389)
+        with self.assertLogs("Circlow", "INFO") as logs:
+            self.assertFalse(loop.tick(now))
+        self.assertIn("cooling down until", logs.output[0])
+        back = now + 3389
+        self.assertEqual(loop.next_at, back + sync_hub.COOLDOWN_MARGIN)       # the stated end, not the 2-minute back-off
+        status = loop.status(now + 60)
+        self.assertIn("冷却中", status)
+        self.assertIn(time.strftime("%H:%M", time.localtime(back)), status)   # when it is back
+        self.assertNotIn("409", status)
+        client.fail = OSError("must not be called")
+        self.assertFalse(loop.tick(now + 1800))                                # still cooling: no call at all
+        self.assertEqual(loop.failures, 1)
+        client.fail = None
+        with self.assertLogs("Circlow", "INFO"):
+            self.assertTrue(loop.tick(loop.next_at))
+        self.assertIn("已同步", loop.status(loop.next_at))
+        self.assertEqual(loop.cooling_until, 0.0)
+
+    def test_only_a_stated_cool_down_counts(self):
+        from datetime import datetime, timezone
+        now = 1_794_000_000.0
+        self.assertEqual(sync_hub.cooldown_end(cooling(3389), now), now + 3389)
+        until = datetime(2026, 11, 11, 18, 24, 25, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(sync_hub.cooldown_end(cooling(None), until - 600), until)            # no seconds: the time in the message
+        self.assertIsNone(sync_hub.cooldown_end(cooling(None), until + 60))                   # already over
+        self.assertIsNone(sync_hub.cooldown_end(cooling(None, until="later"), now))           # no time at all
+        self.assertIsNone(sync_hub.cooldown_end(cooling(10 ** 7, until="later"), now))        # absurd: not believed
+        self.assertIsNone(sync_hub.cooldown_end(cooling(3389, code="machine_busy"), now))     # another 409
+        self.assertIsNone(sync_hub.cooldown_end(urllib.error.HTTPError("u", 503, "x", None, None), now))
+        self.assertIsNone(sync_hub.cooldown_end(urllib.error.HTTPError("u", 409, "x", None, io.BytesIO(b"not json")), now))
+        self.assertIsNone(sync_hub.cooldown_end(urllib.error.HTTPError("u", 409, "x", None, None), now))
+        self.assertIsNone(sync_hub.cooldown_end(OSError("down"), now))
 
 
 class UsageMergeTests(unittest.TestCase):
@@ -418,6 +464,26 @@ class LiveTpsTests(unittest.TestCase):
         live, hub_now = loop.view(20)
         self.assertIn("mac-air", live)
         self.assertEqual(hub_now, 1000.0 + 12)
+
+    def test_the_live_loop_waits_out_a_cool_down(self):
+        client = mock.Mock()
+        client.put_live.side_effect = cooling(600)
+        loop = sync_hub.LiveLoop(client, "win-pc", lambda now: {"providers": {}})
+        now = 1_794_000_000.0
+        self.assertFalse(loop.tick(now))
+        back = now + 600 + sync_hub.COOLDOWN_MARGIN
+        self.assertEqual(loop.next_at, back)
+        with mock.patch.object(sync_hub.time, "time", return_value=now + 60):
+            loop.wake()                                    # work starts while the hub cools: no point calling
+        self.assertEqual(loop.next_at, back)
+        self.assertFalse(loop.tick(now + 300))
+        self.assertEqual(client.put_live.call_count, 1)
+        client.put_live.side_effect = None
+        client.get_live.return_value = ({}, 1000.0)
+        self.assertTrue(loop.tick(back))
+        with mock.patch.object(sync_hub.time, "time", return_value=back + 1):
+            loop.wake()                                    # the hub is back: waking works again
+        self.assertEqual(loop.next_at, 0.0)
 
     def test_the_tray_shows_the_shared_figure_and_its_own(self):
         from tray_app import QuotaTray
