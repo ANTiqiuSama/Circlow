@@ -109,6 +109,19 @@ class SettingsViewTests(unittest.TestCase):
         self.assertEqual(scheduler.plan("codex", now), (scheduler.due["codex"] - now, "空闲"))
         self.assertEqual(scheduler.plan("grok", now), (None, ""))
 
+    def test_menu_bar_switches_become_the_shown_list_and_never_empty_the_bar(self):
+        import settings_window
+        staged = {"source:codex": True, "bar:claude": True, "bar:codex": False, "bar:grok": False, "herdr": True}
+        self.assertEqual(settings_window.menu_bar_choice(staged, ["claude", "codex", "grok"]), ["claude"])
+        with self.assertRaises(ValueError):                      # every icon off: the app would be unreachable
+            settings_window.menu_bar_choice({"bar:claude": False, "bar:codex": False}, ["claude", "codex"])
+        with self.assertRaises(ValueError):                      # the only icon left belongs to a source that is off
+            settings_window.menu_bar_choice({"bar:claude": False, "bar:mimo": True}, ["claude", "codex"])
+        self.assertEqual(settings_window.bar_note(True, True), "在菜单栏显示图标")
+        self.assertIn("照常读取", settings_window.bar_note(True, False))
+        self.assertIn("来源未开启", settings_window.bar_note(False, True))
+        self.assertEqual(settings_window.save_delay(["bar:claude"]), settings_window.SAVE_DELAYS["switch"])
+
     def test_paragraphs_wrap_chinese_by_character_and_keep_latin_words_whole(self):
         import settings_window
         measure = len                                   # one unit per character

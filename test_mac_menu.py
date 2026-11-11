@@ -106,6 +106,17 @@ class MacMenuTests(unittest.TestCase):
         icon_art.set_mono(False)
         self.assertEqual(icon_art.live_icon(98.0, "A").getpixel((32, 4)), icon_art.accent("A"))   # cache cleared with the mode
 
+    def test_the_settings_page_chooses_which_sources_get_a_menu_bar_icon(self):
+        keys = ["codex", "grok", "gemini", "claude", "mimo"]
+        self.assertEqual(mac_menu.menu_bar_keys(keys, {}), keys)                                   # nothing saved: all
+        self.assertEqual(mac_menu.menu_bar_keys(keys, None), keys)
+        self.assertEqual(mac_menu.menu_bar_keys(keys, {"menu_bar": ["claude"]}), ["claude"])
+        self.assertEqual(mac_menu.menu_bar_keys(keys, {"menu_bar": ["mimo", "codex"]}), ["codex", "mimo"])
+        # Never an empty bar: a choice that names no running source shows them all.
+        self.assertEqual(mac_menu.menu_bar_keys(["codex", "grok"], {"menu_bar": ["claude"]}), ["codex", "grok"])
+        self.assertEqual(mac_menu.menu_bar_keys(keys, {"menu_bar": []}), keys)
+        self.assertEqual(mac_menu.menu_bar_keys(keys, {"menu_bar": "claude"}), keys)               # not a list: ignored
+
     def test_status_items_have_stable_autosave_names(self):
         names = {mac_menu.autosave_name(key) for key in ("claude", "codex", "gemini", "grok", "mimo")}
         self.assertEqual(names, {"Circlow.claude", "Circlow.codex", "Circlow.gemini", "Circlow.grok", "Circlow.mimo"})

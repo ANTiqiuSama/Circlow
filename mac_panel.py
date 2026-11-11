@@ -1,12 +1,13 @@
-"""macOS hover panel: the Windows agent panel (agent_panel.Scene) shown in a
+"""macOS agent panel: the Windows agent panel (agent_panel.Scene) shown in a
 borderless, non-activating NSPanel under its menu bar item.
 
-Same model as hover_details.HoverDetails: a timer on the AppKit main thread
-polls the pointer and mouse buttons, opens the panel after a short dwell on a
-status item, steps the scene with that input and presents a frame only when
-something moved. The panel never takes focus; it disappears the moment the
-pointer is on neither the item, the visible card, nor the short bridge between
-them: no grace period and no fade-out.
+A click on a source's status item opens its panel; nothing opens on hover. A
+second click on the item, a mouse press anywhere off the card (seen by
+mouse-down monitors, in this app and in others), or a status menu opening
+closes it at once, with no fade-out. While a panel is shown a timer on the
+AppKit main thread polls the pointer and mouse buttons, steps the scene with
+that input and presents a frame only when something moved; neither the timer
+nor the monitors exist while no panel is shown. The panel never takes focus.
 
 Geometry is kept in screen points with Cocoa's bottom-left origin; the scene
 works in panel points with a top-left origin (its logical units), so the
@@ -22,11 +23,8 @@ from detail_card import MARGIN
 
 log = logging.getLogger("Circlow")
 
-DWELL = 0.4                 # pointer rest on an item before its panel opens
 GAP = 6                     # menu bar bottom to the card's top edge, in points
 CARD_SLACK = 2              # points around the visible card that still count as on it
-BRIDGE_SLACK = 16           # either side of the item: the way down to the card
-SWITCH_SECONDS = 0.35       # back on an item this soon after leaving: no dwell
 
 
 def contains(frame, point, slack: float = 0.0) -> bool:
@@ -48,26 +46,28 @@ def panel_origin(anchor, size, visible) -> tuple[float, float]:
     return x, max(vy, top - height)
 
 
-def over_panel(point, frame, anchor) -> bool:
-    """On the visible card (the panel frame minus its transparent shadow
-    margin) or on the strip between the item and the card's top edge, a little
-    wider than the item, so moving down from the item never drops the panel."""
+def on_card(point, frame) -> bool:
+    """On the visible card: the panel frame minus its transparent shadow
+    margin. A mouse press anywhere else closes the panel."""
     if point is None or frame is None:
         return False
     (x, y), (w, h) = frame
-    if contains(((x + MARGIN, y + MARGIN), (w - 2 * MARGIN, h - 2 * MARGIN)), point, CARD_SLACK):
-        return True
-    if anchor is None:
-        return False
-    (ax, ay), (aw, _ah) = anchor
-    top = y + h - MARGIN
-    return contains(((ax - BRIDGE_SLACK, top), (aw + 2 * BRIDGE_SLACK, max(0.0, ay - top) + 1)), point)
+    return contains(((x + MARGIN, y + MARGIN), (w - 2 * MARGIN, h - 2 * MARGIN)), point, CARD_SLACK)
 
 
 def local_point(frame, point) -> tuple[float, float]:
     """Screen point -> scene coordinates (top-left origin, inside the margin)."""
     (x, y), (_w, h) = frame
     return point[0] - x - MARGIN, y + h - point[1] - MARGIN
+
+
+def event_point(event) -> tuple[float, float]:
+    """Where a mouse event happened, in screen points. An event with no
+    window (one seen by a global monitor) is already in screen coordinates."""
+    location, window = event.locationInWindow(), event.window()
+    if window is not None:
+        location = window.convertPointToScreen_(location)
+    return float(location.x), float(location.y)
 
 
 def to_nsimage(image, scale: float):
@@ -137,14 +137,14 @@ def panel_class():
     if _PANEL_CLASS is None:
         from AppKit import NSPanel
 
-        class HoverPanelWindow(NSPanel):
+        class CirclowPanelWindow(NSPanel):
             def constrainFrameRect_toScreen_(self, rect, screen):
                 return rect
 
             def canBecomeKeyWindow(self):
                 return False
 
-        _PANEL_CLASS = HoverPanelWindow
+        _PANEL_CLASS = CirclowPanelWindow
     return _PANEL_CLASS
 
 
@@ -229,8 +229,8 @@ class PanelWindow:
     def contains(self, point, slack: float = 6) -> bool:
         return self.frame is not None and contains(self.frame, point, slack)
 
-    def over(self, point) -> bool:
-        return over_panel(point, self.frame, self.anchor)
+    def on_card(self, point) -> bool:
+        return on_card(point, self.frame)
 
     def step(self, point, left, right, now):
         """Advance the scene and present a frame if one is due; returns its events."""
@@ -267,77 +267,84 @@ class PanelWindow:
         self.has_image = False
 
 
-class MacHoverPanel:
-    """Drives PanelWindow from a main-thread timer.
+class MacPanel:
+    """Shows PanelWindow for a clicked status item.
+
+    A click on a source's item opens its panel under it; a second click on
+    the item, a mouse press off the card, or a status menu opening closes it.
+    Nothing happens on hover. The frame timer and the mouse-down monitors
+    exist only while a panel is shown.
 
     tray: QuotaTray (panel(), merge(), split()); items: source -> NSStatusItem;
-    icons: source -> stand-in icon whose details_visible marks the hovered
+    icons: source -> stand-in icon whose details_visible marks the shown
     source for the refresh scheduler; on_settings(provider, page) handles the
     panel's settings gear and right-click."""
 
     PANEL_REFRESH = 0.5
     RETRY_SECONDS = 2.0
-    FAST, SLOW = 1 / 60, 0.1
+    FRAME_SECONDS = 1 / 60
+    MOUSE_DOWN = (1 << 1) | (1 << 3) | (1 << 25)     # NSEventMask: left, right and other mouse down
 
     def __init__(self, tray, items: dict, icons: dict, on_settings):
         self.tray, self.items, self.icons, self.on_settings = tray, items, icons, on_settings
         self.window: PanelWindow | None = None
-        self.candidate = None
-        self.entered_at = 0.0
         self.panel_built = 0.0
-        self.left_at = -1e9                  # when the pointer last moved off a shown panel
         self.retry_at = 0.0
-        self.menu_open: str | None = None    # a status menu is tracking: no panel meanwhile
-        self.suppressed: set[str] = set()    # clicked items stay quiet until the pointer leaves them
+        self.target = None
         self.timer = None
-        self.period = None
+        self.monitors: list = []             # mouse-down monitors, while a panel is shown
+
+    @property
+    def shown(self) -> str | None:
+        """The source whose panel is on screen."""
+        return self.window.provider if self.window is not None and self.window.active else None
 
     # ----- timer ----------------------------------------------------------------
 
     def start(self, target):
         """`target` is the NSObject whose `panelTick:` calls tick()."""
         self.target = target
-        self._schedule(self.SLOW)
 
-    def _schedule(self, period):
-        from Foundation import NSRunLoop, NSRunLoopCommonModes, NSTimer
-        if self.period == period:
+    def _run(self, on: bool):
+        """The frame timer and the mouse-down monitors: there while a panel
+        is shown, gone otherwise."""
+        if on == (self.timer is not None):
             return
-        if self.timer is not None:
-            self.timer.invalidate()
-        self.timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-            period, self.target, "panelTick:", None, True)
-        # Common modes: keeps stepping while a menu or a drag runs its own loop.
-        NSRunLoop.currentRunLoop().addTimer_forMode_(self.timer, NSRunLoopCommonModes)
-        self.period = period
-
-    def stop(self):
-        if self.timer is not None:
+        from AppKit import NSEvent
+        if not on:
             self.timer.invalidate()
             self.timer = None
-        if self.window is not None:
-            self.window.hide()
+            for monitor in self.monitors:
+                NSEvent.removeMonitor_(monitor)
+            self.monitors = []
+            return
+        from Foundation import NSRunLoop, NSRunLoopCommonModes, NSTimer
+        self.timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            self.FRAME_SECONDS, self.target, "panelTick:", None, True)
+        # Common modes: keeps stepping while a menu or a drag runs its own loop.
+        NSRunLoop.currentRunLoop().addTimer_forMode_(self.timer, NSRunLoopCommonModes)
 
-    # ----- menus ----------------------------------------------------------------
+        # Monitors rather than the timer's button polling: a trackpad tap is
+        # shorter than a frame and would be missed. The global one sees
+        # presses in other apps, the local one those in this app (the panel's
+        # shadow margin, another of its status items). Each press is placed by
+        # its own event, not by the pointer: an accessibility press arrives
+        # with the pointer somewhere else.
+        def elsewhere(event):
+            self.mouse_down(event_point(event))
 
-    def menu_will_open(self, provider: str):
-        self.menu_open = provider
-        if self.window is not None and self.window.active:
-            self.window.hide()
+        def here(event):
+            if not self.on_own_item(event.window()):
+                self.mouse_down(event_point(event))
+            return event
+        self.monitors = [monitor for monitor in (
+            NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(self.MOUSE_DOWN, elsewhere),
+            NSEvent.addLocalMonitorForEventsMatchingMask_handler_(self.MOUSE_DOWN, here)) if monitor is not None]
 
-    def menu_did_close(self, provider: str):
-        self.menu_open = None
-        self.suppressed.add(provider)
-        self.candidate = None
+    def stop(self):
+        self.close()
 
-    def clicked(self, provider: str):
-        """A left-click opened the source: drop the panel until the pointer leaves the item."""
-        if self.window is not None and self.window.active:
-            self.window.hide()
-        self.suppressed.add(provider)
-        self.candidate = None
-
-    # ----- input ----------------------------------------------------------------
+    # ----- open and close -------------------------------------------------------
 
     @staticmethod
     def pointer():
@@ -346,104 +353,115 @@ class MacHoverPanel:
         buttons = int(NSEvent.pressedMouseButtons())
         return (float(location.x), float(location.y)), bool(buttons & 1), bool(buttons & 2)
 
-    def target_at(self, point):
-        """(source, anchor frame, screen) of the status item under the pointer."""
-        for key, item in self.items.items():
-            button = item.button()
-            window = button.window() if button is not None else None
-            if window is None:
-                continue
-            frame = window.frame()
-            anchor = ((float(frame.origin.x), float(frame.origin.y)), (float(frame.size.width), float(frame.size.height)))
-            if contains(anchor, point):
-                if key in self.suppressed:
-                    return None, None, None
-                return key, anchor, window.screen()
-        return None, None, None
+    def anchor_of(self, provider):
+        """(frame, screen) of the source's status item; (None, None) while it is not in the bar."""
+        item = self.items.get(provider)
+        button = item.button() if item is not None else None
+        window = button.window() if button is not None else None
+        if window is None:
+            return None, None
+        frame = window.frame()
+        return (((float(frame.origin.x), float(frame.origin.y)), (float(frame.size.width), float(frame.size.height))),
+                window.screen())
 
-    def release_suppressed(self, point):
-        for key in list(self.suppressed):
-            window = self.items[key].button().window() if key in self.items else None
-            if window is None:
-                self.suppressed.discard(key)
-                continue
-            frame = window.frame()
-            anchor = ((frame.origin.x, frame.origin.y), (frame.size.width, frame.size.height))
-            if not contains(anchor, point):
-                self.suppressed.discard(key)
+    def toggle(self, provider: str) -> bool:
+        """A click on the source's status item: its panel opens, or closes if
+        it was the one shown. False when there is nothing to show (a source
+        without a panel, or the window could not be built), so the caller can
+        show the source's menu instead."""
+        if self.shown == provider:
+            self.close("its item clicked again")
+            return True
+        now = time.monotonic()
+        try:
+            model = self.tray.panel(provider)
+            anchor, screen = self.anchor_of(provider)
+            if model is None or anchor is None or now < self.retry_at:
+                self.close()
+                return False
+            if self.window is None:
+                self.window = PanelWindow()
+            window = self.window
+            if window.active:
+                window.hide()                # another source's panel: this one opens afresh
+            window.open(provider, model, anchor, screen, now)
+            self.panel_built = now
+            window.step(self.pointer()[0], False, False, now)
+        except Exception:
+            self._failed(now)
+            return False
+        self._mark(provider)
+        self._run(True)
+        return True
+
+    def close(self, why: str = ""):
+        if self.window is not None and self.window.active:
+            log.info("agent panel closed: provider=%s%s", self.window.provider, f" ({why})" if why else "")
+            self.window.hide()
+        self._mark(None)
+        self._run(False)
+
+    def on_own_item(self, window) -> bool:
+        """`window` is the status item of the source whose panel is shown."""
+        item = self.items.get(self.shown)
+        button = item.button() if item is not None else None
+        return window is not None and button is not None and window == button.window()
+
+    def mouse_down(self, point):
+        """A mouse button went down at `point` (screen): off the card, the
+        panel closes, as a menu would. A press on the panel's own item is
+        left to the item's click, which toggles it."""
+        window = self.window
+        if window is None or not window.active:
+            return
+        if window.on_card(point) or contains(window.anchor, point):
+            return
+        self.close(f"press at {point[0]:.0f}, {point[1]:.0f}")
+
+    def _mark(self, shown):
+        for key, icon in self.icons.items():
+            icon.details_visible = key == shown
+
+    def _failed(self, now):
+        # A failed frame must not end panels for the rest of the run.
+        log.exception("mac agent panel failed")
+        if self.window is not None:
+            try:
+                self.window.hide()
+            except Exception:
+                pass
+        self.window = None
+        self.retry_at = now + self.RETRY_SECONDS
+        self._mark(None)
+        self._run(False)
 
     # ----- one tick -------------------------------------------------------------
 
     def tick(self):
-        now = time.monotonic()
-        point, left, right = self.pointer()
-        self.release_suppressed(point)
-        shown = None
-        try:
-            if self.menu_open is not None:
-                self.candidate = None
-            else:
-                provider, anchor, screen = self.target_at(point) if not (left or right) else (None, None, None)
-                if self.window is None and provider and now >= self.retry_at:
-                    self.window = PanelWindow()
-                window = self.window
-                if window is not None and window.active:
-                    self.drive(window, point, provider, anchor, screen, left, right, now)
-                elif window is not None:
-                    if provider != self.candidate:
-                        self.candidate, self.entered_at = provider, now
-                    # Sliding from one item to the next reopens at once.
-                    if provider and (now - self.entered_at >= DWELL or now - self.left_at <= SWITCH_SECONDS):
-                        model = self.tray.panel(provider)
-                        if model is not None:
-                            window.open(provider, model, anchor, screen, now)
-                            self.panel_built = now
-                            window.step(point, left, right, now)
-                shown = window.provider if window is not None and window.active else None
-        except Exception:
-            # A failed frame must not end hover panels for the rest of the run.
-            log.exception("mac agent panel failed")
-            if self.window is not None:
-                try:
-                    self.window.hide()
-                except Exception:
-                    pass
-            self.window = None
-            self.retry_at = now + self.RETRY_SECONDS
-            shown = None
-        for key, icon in self.icons.items():
-            icon.details_visible = key == shown
-        self._schedule(self.FAST if shown else self.SLOW)
-
-    def drive(self, window: PanelWindow, point, provider, anchor, screen, left, right, now):
-        if provider:
-            self.candidate = provider
-        if provider and provider != window.provider and not window.scene.dragging:
-            model = self.tray.panel(provider)
-            if model is None:
-                window.hide()
-                return
-            window.open(provider, model, anchor, screen, now)
-        if provider != window.provider and not window.over(point) and not window.scene.dragging:
-            # Off the item and the card: gone at once, no grace period or fade.
-            window.hide()
-            self.left_at = now
+        window = self.window
+        if window is None or not window.active:
+            self._run(False)
             return
+        now = time.monotonic()
+        try:
+            point, left, right = self.pointer()
+            self.drive(window, point, left, right, now)
+        except Exception:
+            self._failed(now)
+
+    def drive(self, window: PanelWindow, point, left, right, now):
         if (now - self.panel_built >= self.PANEL_REFRESH
                 and not window.scene.press and not window.scene.dragging):
             model = self.tray.panel(window.provider)
             if model is None:
-                window.hide()
+                self.close("the source has no panel now")
                 return
             window.refresh(model, now)
             self.panel_built = now
         for event in window.step(point, left, right, now):
             if event[0] == "settings":
                 provider = window.provider
-                window.hide()
-                self.candidate = None
-                if provider:
-                    self.suppressed.add(provider)
+                self.close("settings opened")
                 self.on_settings(provider, event[1] if len(event) > 1 else None)
                 return
             if event[0] == "merge":

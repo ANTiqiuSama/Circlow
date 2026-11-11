@@ -3,8 +3,10 @@
 AppKit stays on the main thread. The data side is the Windows tray's own
 QuotaTray run headless (quotas, TPS, agents, forecasts, reset watch), fed
 stand-in icons (MacIcon) instead of pystray ones; a short timer copies their
-pictures into NSStatusItems/NSMenus. Hovering an item opens the same agent
-panel as on Windows (mac_panel); clicking it opens the native menu.
+pictures into NSStatusItems/NSMenus. Clicking an item opens the same agent
+panel as on Windows (mac_panel); right-clicking it opens the native menu.
+Nothing opens on hover. The settings page chooses which sources get an item
+(menu_bar_keys); the others are still read.
 """
 from __future__ import annotations
 
@@ -157,6 +159,18 @@ def autosave_name(key: str) -> str:
     source changes. Without one, AppKit numbers items in creation order and
     saves nothing, so every restart puts the items back at the far left."""
     return f"Circlow.{key}"
+
+
+def menu_bar_keys(keys: list[str], prefs: dict | None = None) -> list[str]:
+    """The sources that get a menu bar icon: the `menu_bar` list saved by the
+    settings page (来源 → 菜单栏图标), every source when nothing is saved.
+    Sources left out are still read and shown in the settings window. The
+    bar never ends up empty, since the icons are the way into the app: a
+    choice that names none of the running sources shows them all."""
+    chosen = (prefs or {}).get("menu_bar")
+    if not isinstance(chosen, list):
+        return list(keys)
+    return [key for key in keys if key in chosen] or list(keys)
 
 
 def open_source(key: str, state, popen=subprocess.Popen, run=subprocess.run) -> str | None:
@@ -389,7 +403,7 @@ def run_mac() -> int:
     import objc
     import settings_mac
     import tray_app
-    from mac_panel import MacHoverPanel, to_nsimage
+    from mac_panel import MacPanel, to_nsimage
     import icon_art
 
     settings_mac.take_commands(settings_mac.MENU)      # requests left over from an earlier run
@@ -453,9 +467,9 @@ def run_mac() -> int:
                     line.setTarget_(self)
                     line.setRepresentedObject_(key)
                     menu.addItem_(line)
-                # Like the Windows tray: left-click opens the source, right-click
-                # (or Control-click) shows the menu. A menu attached to the item
-                # would take every click, so it is attached only while shown.
+                # A click shows the source's panel, a right-click (or
+                # Control-click) its menu. A menu attached to the item would
+                # take every click, so it is attached only while shown.
                 button = item.button()
                 button.setTag_(len(self.order))
                 button.setTarget_(self)
@@ -465,18 +479,36 @@ def run_mac() -> int:
                 self.items[key] = item
                 self.menus[key] = parts
                 self.menu_objs[key] = menu
-            self.hover = MacHoverPanel(tray, self.items, icons, self.panelSettings)
+            self.panel = MacPanel(tray, self.items, icons, self.panelSettings)
+            self.panel.start(self)
+            self.bar_shown = None
+            self.applyBarChoice()
             self.updateUI_(None)
             self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 1.0, self, "updateUI:", None, True)
             tray.start_workers()
-            self.hover.start(self)
+
+        @objc.python_method
+        def applyBarChoice(self):
+            """Show the items the settings page chose (来源 → 菜单栏图标). The
+            others stay created but hidden, so a change needs no restart."""
+            shown = menu_bar_keys(keys, tray_app.load_preferences())
+            for key, item in self.items.items():
+                if bool(item.isVisible()) != (key in shown):
+                    item.setVisible_(key in shown)
+            if self.panel.shown is not None and self.panel.shown not in shown:
+                self.panel.close("its icon was turned off")
+            if shown != self.bar_shown:
+                log.info("menu bar shows %s", ", ".join(shown))
+                self.bar_shown = shown
 
         def updateUI_(self, _timer):
             now = time.time()
             for command in settings_mac.take_commands(settings_mac.MENU):
                 outcome = settings_mac.handle_menu_command(tray, command, now)
                 log.info("settings command %s -> %s", command.get("name"), outcome or "applied")
+                if command.get("name") == "reload":
+                    self.applyBarChoice()         # the saved preferences may have changed the shown set
                 if outcome == "restart":
                     subprocess.Popen(settings_mac.relaunch_command(), start_new_session=True,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -495,7 +527,7 @@ def run_mac() -> int:
                     picture.setTemplate_(mono)       # the system colours it: white on a dark bar, black on a light one
                     button.setImage_(picture)
                     self.pictures[key] = image
-                # Sources with a hover panel skip the native tooltip, which would cover it.
+                # Sources with a panel have no tooltip: nothing appears on hover, a click shows the panel.
                 tip = "" if tray_app.has_panel(key, snapshot) else "\n".join(
                     part for part in (model["summary"], model["speed"]) if part)
                 button.setToolTip_(tip)
@@ -518,16 +550,15 @@ def run_mac() -> int:
             if key in icons:
                 icons[key].hover_open = True     # open menu = hover: fastest refresh tier
                 tray.wake.set()
-            self.hover.menu_will_open(key)
+            self.panel.close("a menu opened")    # a menu and the panel are never up together
 
         def menuDidClose_(self, menu):
             key = str(menu.title())
             if key in icons:
                 icons[key].hover_open = False
-            self.hover.menu_did_close(key)
 
         def panelTick_(self, _timer):
-            self.hover.tick()
+            self.panel.tick()
 
         def statusClicked_(self, sender):
             index = int(sender.tag())
@@ -540,9 +571,12 @@ def run_mac() -> int:
             if secondary:
                 self.showMenu(key)
                 return
-            self.hover.clicked(key)
-            kind = open_source(key, launcher)
-            log.info("clicked %s: opened via %s", key, kind)
+            # A click shows the source's panel, or closes it when it is the
+            # one shown; a source without a panel gets its menu instead.
+            if self.panel.toggle(key):
+                tray.wake.set()                  # the shown source reads at the fastest tier
+            else:
+                self.showMenu(key)
 
         @objc.python_method
         def showMenu(self, key):
@@ -573,7 +607,7 @@ def run_mac() -> int:
             open_source(str(sender.representedObject()), launcher)
 
         def quitApp_(self, _sender):
-            self.hover.stop()
+            self.panel.stop()
             tray.exit_app()
             NSApplication.sharedApplication().terminate_(None)
 

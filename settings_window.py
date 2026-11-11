@@ -111,6 +111,25 @@ def save_delay(keys) -> int:
     if any(key.startswith(("field:", "mimo:")) or key == "iq:key" for key in keys):
         return SAVE_DELAYS["text"]
     return SAVE_DELAYS["switch"]
+
+
+def menu_bar_choice(staged: dict, enabled) -> list[str]:
+    """The sources whose "bar:<key>" switch is on, for the `menu_bar`
+    preference (macOS: which sources get a menu bar icon). One running
+    source must keep its icon: the icons are the way into the app."""
+    shown = [name[4:] for name, value in staged.items() if name.startswith("bar:") and value]
+    if not set(shown).intersection(enabled):
+        raise ValueError("至少保留一个已开启来源的图标")
+    return shown
+
+
+def bar_note(enabled: bool, shown: bool) -> str:
+    """The line under a source's menu bar switch."""
+    if not enabled:
+        return "来源未开启" + ("；开启后显示图标" if shown else "")
+    return "在菜单栏显示图标" if shown else "不显示图标，仍照常读取"
+
+
 _LATIN = re.compile(r"[A-Za-z0-9_./:@%+-]")
 
 
@@ -1573,13 +1592,35 @@ class SettingsWindow:
             self.source_rows[key] = row
             if key == "mimo":
                 self._mimo(box)
+        if hasattr(self.app, "menu_bar_choice"):
+            self._menu_bar(page, states)
         self.section(page, "本机记录", "各读取器使用的本机数据")
         self.health_box = tk.Frame(page, bg=view.BG)
         self.health_box.pack(fill="x")
 
+    def _menu_bar(self, page, states):
+        """macOS: which sources get a menu bar icon. The others are still read
+        and shown in this window; only their icon is left out. Applied live."""
+        tk, S = self.tk, self.S
+        self.section(page, "菜单栏图标", "选择在菜单栏显示哪些来源；未显示的来源照常读取，可在概览查看")
+        box = self.card(page)
+        self.bar_rows = {}
+        for index, key in enumerate(in_tray_order(states)):
+            state = states[key]
+            if index:
+                tk.Frame(box, bg=view.BORDER, height=1).pack(fill="x", pady=S(12))
+            self.vars["bar:" + key] = tk.BooleanVar(value=True)
+            self.vars["bar:" + key].trace_add("write", lambda *_: self.update_footer())
+            self.bar_rows[key] = self.setting(box, PROVIDER_NAMES.get(key, key), "", self.vars["bar:" + key],
+                                              command=self._fill_sources,
+                                              badge=(state["letter"], view.hex_color(view.accent(state["letter"]))))
+
     def _fill_sources(self):
         import providers
         for state in providers.provider_states():
+            bar = getattr(self, "bar_rows", {}).get(state["key"])
+            if bar is not None:
+                self.set_text(bar.detail, bar_note(state["enabled"], bool(self.vars["bar:" + state["key"]].get())))
             row = self.source_rows.get(state["key"])
             if row is None:
                 continue
@@ -2039,6 +2080,8 @@ class SettingsWindow:
                 text = "任务命名"
             elif name.startswith("mimo:"):
                 text = "手动套餐"
+            elif name.startswith("bar:"):
+                text = "菜单栏图标"
             else:
                 text = labels.get(name, name)
             if text not in seen:
@@ -2131,6 +2174,11 @@ class SettingsWindow:
         for state in providers.provider_states():
             if "source:" + state["key"] in self.vars:
                 self.vars["source:" + state["key"]].set(state["enabled"])
+        if hasattr(self.app, "menu_bar_choice"):
+            chosen = self.app.menu_bar_choice()       # None: nothing saved, every source has its icon
+            for name, var in self.vars.items():
+                if name.startswith("bar:"):
+                    var.set(chosen is None or name[4:] in chosen)
         manual = {}
         try:
             import mimo_usage
@@ -2195,6 +2243,11 @@ class SettingsWindow:
         if hasattr(self.app, "save_preferences"):
             group("herdr", "herdr 适配", ["herdr"], lambda: self.app.save_preferences({"herdr": bool(self.vars["herdr"].get())}))
         group("mimo", "手动套餐", ["mimo:" + name for name in getattr(self, "mimo_fields", {})], self._save_mimo_manual)
+        bars = [name for name in self.vars if name.startswith("bar:")]
+        if bars and hasattr(self.app, "save_preferences"):
+            import providers
+            group("menu_bar", "菜单栏图标", bars,
+                  lambda: self.app.save_preferences({"menu_bar": menu_bar_choice(staged, providers.enabled_keys())}))
         sources = {name[7:]: bool(var.get()) for name, var in self.vars.items()
                    if name.startswith("source:") and bool(var.get()) != self.origins.get(name)}
         self.save_problems = problems

@@ -1,4 +1,4 @@
-"""macOS hover panel: geometry, headless tray wiring and menu bar stand-ins.
+"""macOS agent panel: geometry, click logic, headless tray wiring and menu bar stand-ins.
 The AppKit window itself is exercised on a Mac by hand; these stay pure."""
 import time
 import unittest
@@ -42,59 +42,139 @@ class GeometryTest(unittest.TestCase):
         self.assertTrue(mac_panel.contains(frame, (114, 30), slack=6))
 
 
-    def test_only_the_card_and_the_way_down_to_it_keep_the_panel(self):
+    def test_only_the_visible_card_counts_as_the_panel(self):
         size = (448.0, 467.0)
         frame = (mac_panel.panel_origin(self.ANCHOR, size, self.VISIBLE), size)
         (x, y), (w, h) = frame
         card_top = y + h - MARGIN
-        self.assertTrue(mac_panel.over_panel((x + w / 2, y + h / 2), frame, self.ANCHOR))       # the card
-        self.assertTrue(mac_panel.over_panel((1078, card_top + 3), frame, self.ANCHOR))          # gap under the item
-        self.assertTrue(mac_panel.over_panel((1063 - 10, card_top + 3), frame, self.ANCHOR))     # a little to its side
-        self.assertFalse(mac_panel.over_panel((x + MARGIN / 2, y + h / 2), frame, self.ANCHOR))  # shadow margin only
-        self.assertFalse(mac_panel.over_panel((x + 40, card_top + 3), frame, self.ANCHOR))       # gap far from the item
-        self.assertFalse(mac_panel.over_panel((x + w / 2, y + MARGIN - 6), frame, self.ANCHOR))  # under the card
-        self.assertFalse(mac_panel.over_panel(None, frame, self.ANCHOR))
+        self.assertTrue(mac_panel.on_card((x + w / 2, y + h / 2), frame))              # the card
+        self.assertTrue(mac_panel.on_card((x + MARGIN + 1, card_top - 1), frame))      # its top-left corner
+        self.assertFalse(mac_panel.on_card((x + MARGIN / 2, y + h / 2), frame))        # shadow margin only
+        self.assertFalse(mac_panel.on_card((1078, card_top + 4), frame))               # the gap under the item
+        self.assertFalse(mac_panel.on_card((x + w / 2, y + MARGIN - 6), frame))        # under the card
+        self.assertFalse(mac_panel.on_card(None, frame))
 
 
-class HoverPanelLogicTest(unittest.TestCase):
-    def controller(self):
+class PanelLogicTest(unittest.TestCase):
+    """The panel opens on a click and closes on the next press off its card; nothing opens on hover."""
+    ANCHOR = ((1063.0, 949.0), (30.0, 33.0))
+    FRAME = ((854.0, 476.0), (448.0, 467.0))
+    AWAY = (300.0, 300.0)
+    ON_ITEM = (1078.0, 960.0)
+    ON_CARD = (854.0 + 224, 476.0 + 233)
+
+    def controller(self, model="model"):
         icons = {"codex": Mock(details_visible=False), "grok": Mock(details_visible=False)}
-        hover = mac_panel.MacHoverPanel(Mock(), {}, icons, Mock())
-        hover._schedule = Mock()
-        return hover, icons
+        tray = Mock()
+        tray.panel.return_value = model
+        panel = mac_panel.MacPanel(tray, {}, icons, Mock())
+        panel._run = Mock()
+        panel.pointer = Mock(return_value=(self.AWAY, False, False))
+        panel.anchor_of = Mock(return_value=(self.ANCHOR, Mock()))
+        return panel, icons
 
-    def test_open_menu_hides_the_panel_and_suppresses_until_the_pointer_leaves(self):
-        hover, _ = self.controller()
-        hover.window = Mock(active=True)
-        hover.menu_will_open("codex")
-        hover.window.hide.assert_called_once()
-        hover.menu_did_close("codex")
-        self.assertIn("codex", hover.suppressed)
-        item = Mock()
-        item.button.return_value.window.return_value.frame.return_value = Mock(
-            origin=Mock(x=0, y=0), size=Mock(width=20, height=20))
-        hover.items = {"codex": item}
-        hover.release_suppressed((10, 10))
-        self.assertIn("codex", hover.suppressed)      # still on the item
-        hover.release_suppressed((300, 300))
-        self.assertNotIn("codex", hover.suppressed)
+    def window(self):
+        """A stand-in PanelWindow that tracks open and hide like the real one."""
+        window = Mock(provider=None, anchor=None, frame=self.FRAME, active=False)
 
-    def test_tick_marks_only_the_shown_source_and_slows_down_when_idle(self):
-        hover, icons = self.controller()
-        hover.pointer = Mock(return_value=((500.0, 500.0), False, False))
-        hover.target_at = Mock(return_value=(None, None, None))
-        hover.tick()
+        def opened(provider, _model, anchor, _screen, _now):
+            window.provider, window.anchor, window.active = provider, anchor, True
+
+        def hidden():
+            window.provider, window.active = None, False
+        window.open.side_effect = opened
+        window.hide.side_effect = hidden
+        window.on_card.side_effect = lambda point: mac_panel.on_card(point, self.FRAME)
+        window.step.return_value = []
+        window.scene = Mock(press=None, dragging=False)
+        return window
+
+    def shown(self):
+        panel, icons = self.controller()
+        window = self.window()
+        with patch.object(mac_panel, "PanelWindow", return_value=window):
+            self.assertTrue(panel.toggle("codex"))
+        return panel, icons, window
+
+    def point(self, panel, at, left=False, right=False):
+        panel.pointer = Mock(return_value=(at, left, right))
+        panel.tick()
+
+    def test_a_click_opens_the_panel_and_a_second_click_closes_it(self):
+        panel, icons, window = self.shown()
+        self.assertEqual(panel.shown, "codex")
+        window.open.assert_called_once()
+        self.assertTrue(icons["codex"].details_visible)        # the shown source reads at the fastest tier
+        self.assertFalse(icons["grok"].details_visible)
+        panel._run.assert_called_with(True)
+        self.assertTrue(panel.toggle("codex"))                 # the same item again
+        self.assertIsNone(panel.shown)
         self.assertFalse(icons["codex"].details_visible)
-        hover._schedule.assert_called_with(hover.SLOW)
+        panel._run.assert_called_with(False)                   # no timer while nothing is shown
+
+    def test_a_click_on_another_item_shows_that_source(self):
+        panel, icons, window = self.shown()
+        with patch.object(mac_panel, "PanelWindow", return_value=window):
+            self.assertTrue(panel.toggle("grok"))
+        self.assertEqual(panel.shown, "grok")
+        self.assertTrue(icons["grok"].details_visible)
+        self.assertFalse(icons["codex"].details_visible)
+
+    def test_a_source_without_a_panel_has_nothing_to_show(self):
+        panel, _ = self.controller(model=None)
+        with patch.object(mac_panel, "PanelWindow") as build:
+            self.assertFalse(panel.toggle("codex"))            # the caller shows its menu instead
+        build.assert_not_called()
+        self.assertIsNone(panel.shown)
+
+    def test_nothing_opens_on_hover(self):
+        panel, icons = self.controller()
+        with patch.object(mac_panel, "PanelWindow") as build:
+            for _ in range(120):                               # two seconds resting on the item
+                self.point(panel, self.ON_ITEM)
+        build.assert_not_called()
+        self.assertIsNone(panel.shown)
+        self.assertFalse(icons["codex"].details_visible)
+
+    def test_the_panel_stays_until_a_press_off_the_card(self):
+        panel, _, _ = self.shown()
+        self.point(panel, self.AWAY)                           # the pointer leaving is not a reason to close
+        self.assertEqual(panel.shown, "codex")
+        panel.mouse_down(self.AWAY)                            # a click on something else
+        self.assertIsNone(panel.shown)
+        panel.mouse_down(self.AWAY)                            # nothing shown: nothing to do
+
+    def test_a_press_in_the_shadow_margin_closes_it_too(self):
+        panel, _, _ = self.shown()
+        (x, y), (_w, h) = self.FRAME
+        panel.mouse_down((x + MARGIN / 2, y + h / 2))
+        self.assertIsNone(panel.shown)
+
+    def test_presses_on_the_card_and_on_its_item_keep_it(self):
+        panel, _, _ = self.shown()
+        panel.mouse_down(self.ON_CARD)
+        self.assertEqual(panel.shown, "codex")
+        self.point(panel, self.AWAY, left=True)                # dragged off the card with the button held
+        self.assertEqual(panel.shown, "codex")
+        panel.mouse_down(self.ON_ITEM)                         # on its own item: the item's click toggles it
+        self.assertEqual(panel.shown, "codex")
+
+    def test_the_gear_closes_the_panel_and_opens_settings(self):
+        panel, _, window = self.shown()
+        window.step.return_value = [("settings", "sources")]
+        self.point(panel, self.ON_CARD)
+        self.assertIsNone(panel.shown)
+        panel.on_settings.assert_called_once_with("codex", "sources")
 
     def test_a_failed_frame_backs_off_instead_of_raising(self):
-        hover, _ = self.controller()
-        hover.pointer = Mock(return_value=((1.0, 1.0), False, False))
-        hover.target_at = Mock(side_effect=RuntimeError("boom"))
+        panel, icons, window = self.shown()
+        window.step.side_effect = RuntimeError("boom")
         with self.assertLogs("Circlow", "ERROR"):
-            hover.tick()
-        self.assertIsNone(hover.window)
-        self.assertGreater(hover.retry_at, time.monotonic())
+            self.point(panel, self.ON_CARD)
+        self.assertIsNone(panel.window)
+        self.assertGreater(panel.retry_at, time.monotonic())
+        self.assertFalse(icons["codex"].details_visible)
+        self.assertFalse(panel.toggle("codex"))                # backing off: the caller shows the menu
 
 
 class HeadlessTrayTest(unittest.TestCase):
@@ -182,13 +262,6 @@ class ClickRoutingTest(unittest.TestCase):
                 patch.object(herdr_source, "ghostty_app", return_value="/Applications/Ghostty.app"):
             herdr_source.open_window("/opt/homebrew/bin/herdr", popen)
         self.assertEqual(popen.call_args.args[0][:3], ["open", "-na", "/Applications/Ghostty.app"])
-
-    def test_a_click_drops_the_panel_until_the_pointer_leaves(self):
-        hover = mac_panel.MacHoverPanel(Mock(), {}, {}, Mock())
-        hover.window = Mock(active=True)
-        hover.clicked("grok")
-        hover.window.hide.assert_called_once()
-        self.assertIn("grok", hover.suppressed)
 
 
 class ClaudeProbeTest(unittest.TestCase):

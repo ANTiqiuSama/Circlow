@@ -144,6 +144,18 @@ class SettingsTrayTest(TempData):
         self.assertEqual(settings_mac.take_commands(settings_mac.MENU), [{"name": "restart"}, {"name": "restart"}])
         self.assertFalse(tray.stop_event.is_set())                # the window stays open while the menu bar restarts
 
+    def test_the_menu_bar_choice_is_a_preference_applied_without_a_restart(self):
+        import tray_app
+        tray = self.settings_tray()
+        with patch.object(tray_app, "load_preferences", return_value={}):
+            self.assertIsNone(tray.menu_bar_choice())             # nothing saved: every source has its icon
+        with patch.object(tray_app, "load_preferences", return_value={"menu_bar": ["claude"]}):
+            self.assertEqual(tray.menu_bar_choice(), ["claude"])
+        with patch.object(tray_app.QuotaTray, "save_preferences") as save:
+            tray.save_preferences({"menu_bar": ["claude"]})
+        save.assert_called_once_with({"menu_bar": ["claude"]})
+        self.assertEqual(settings_mac.take_commands(settings_mac.MENU), [{"name": "reload"}])
+
     def test_startup_switch_uses_the_login_item(self):
         tray = self.settings_tray()
         with patch.object(settings_mac, "login_item_enabled", return_value=False), \

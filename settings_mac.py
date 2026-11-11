@@ -215,6 +215,13 @@ def make_settings_tray():
             super().save_preferences(prefs)
             send_command(MENU, "reload")
 
+        def menu_bar_choice(self) -> list | None:
+            """The sources chosen for the menu bar on 来源 → 菜单栏图标 (the
+            `menu_bar` preference); None while nothing is saved and every
+            source has its icon. Its presence gives the page that section."""
+            value = tray_app.load_preferences().get("menu_bar")
+            return [str(key) for key in value] if isinstance(value, list) else None
+
         def apply_summary_settings(self, config: dict, enabled: bool) -> None:
             super().apply_summary_settings(config, enabled)
             send_command(MENU, "reload")
