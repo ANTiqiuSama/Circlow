@@ -28,24 +28,22 @@ class HintTests(unittest.TestCase):
         self.assertNotIn("定时任务", packed)
         self.assertNotIn("quotas", data)                                   # quota never reaches the hint
         self.assertNotIn("usage", data)
-        self.assertEqual(agent_hints.local_hint(data)[1], "手头的线收尾后再开新线，节奏更稳")
+        self.assertEqual(agent_hints.local_hint(data), ("", ""))          # no stock advice without MiMo
         self.assertNotIn("hovered", data)
-        bare = agent_hints.context(agents, [])
-        self.assertNotIn("额度", agent_hints.local_hint(bare)[1])
-        self.assertIn("不要提余量不足", agent_hints.SYSTEM_PROMPT)
-        self.assertIn("比昨天此时", agent_hints.SYSTEM_PROMPT)                 # told not to compare with yesterday
-        self.assertIn("宏观洞察或建议", agent_hints.SYSTEM_PROMPT)
-        self.assertIn("不要给具体的操作或改动建议", agent_hints.SYSTEM_PROMPT)
-        self.assertIn("不要给出用量有关的提示", agent_hints.SYSTEM_PROMPT)
+        prompt = agent_hints.SYSTEM_PROMPT
+        for wanted in ("宏观、有新意、能启发人", "连成一个新想法", "反直觉", "收尾、准备", "具体的操作或改动", "额度", "与过去的比较"):
+            self.assertIn(wanted, prompt)
+        self.assertIn('"idea"', prompt)
+        self.assertNotIn('"now"', prompt)
 
     def test_local_hint_ignores_legacy_usage_stats(self):
         data = {"tasks": [], "detected_clients": [], "usage": "今天输出 1.6M，Claude 占 48%"}
         self.assertNotIn("输出", agent_hints.local_hint(data)[1])
         self.assertNotIn("48%", agent_hints.local_hint(data)[1])
 
-    def test_idle_process_does_not_claim_active_generation(self):
+    def test_without_mimo_the_hint_stays_empty(self):
         data = agent_hints.context([], [{"name": "Claude Code", "processes": 3}])
-        self.assertIn("暂无可确认的生成任务", agent_hints.local_hint(data)[0])
+        self.assertEqual(agent_hints.local_hint(data), ("", ""))
 
     def test_mimo_response_is_cached_and_key_is_never_in_prompt(self):
         seen = []
@@ -55,20 +53,20 @@ class HintTests(unittest.TestCase):
             seen.append((request, timeout))
             complete.set()
             return io.BytesIO(json.dumps({"choices": [{"message": {"content":
-                '{"now":"正在修复额度预测","next":"检查回归结果并合入"}'}}]}).encode())
+                '{"idea":"把额度预测和多端同步合起来，做成团队共享的 AI 工作台"}'}}]}).encode())
 
         advisor = agent_hints.HintAdvisor({"url": "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
                                             "key": "SECRET", "model": "mimo-v2.6-flash"}, opener)
         data = {"tasks": [{"provider": "codex", "title": "额度预测", "doing": "测试"}],
                 "usage": "今天输出 80K", "detected_clients": ["Codex 引擎"]}
-        fallback = advisor.lookup(data)
-        self.assertIn("额度预测", fallback[0])
+        self.assertEqual(advisor.lookup(data), ("", ""))                   # nothing until MiMo answers
         self.assertTrue(complete.wait(2))
         for _ in range(100):
             if not advisor.pending:
                 break
             time.sleep(.01)
-        self.assertEqual(advisor.lookup(data), ("正在修复额度预测", "检查回归结果并合入"))
+        idea = ("", "把额度预测和多端同步合起来，做成团队共享的 AI 工作台")
+        self.assertEqual(advisor.lookup(data), idea)
         self.assertEqual(len(seen), 1)
         payload = json.loads(seen[0][0].data)
         self.assertNotIn("SECRET", json.dumps(payload))
@@ -76,7 +74,7 @@ class HintTests(unittest.TestCase):
         self.assertEqual(seen[0][1], 10)
         data["tasks"][0]["doing"] = "构建"
         data["usage"] = "今天输出 81K"                                     # figures move every second
-        self.assertEqual(advisor.lookup(data)[0], "正在修复额度预测")      # the suggestion stays
+        self.assertEqual(advisor.lookup(data), idea)                       # the suggestion stays
         self.assertEqual(len(seen), 1)
         self.assertNotIn("usage", json.loads(payload["messages"][1]["content"]))
         self.assertNotIn("80K", payload["messages"][1]["content"])
@@ -92,6 +90,25 @@ class HintTests(unittest.TestCase):
         advisor._fetch("test", data)
         self.assertIsNone(advisor.result)
         self.assertEqual(advisor.lookup(data), agent_hints.local_hint(data))
+
+    def test_stock_advice_is_dropped(self):
+        for reply in ('{"idea":"手头的线收尾后再开新线，节奏更稳"}', '{"idea":"可准备下一项任务，或查看刚完成的结果"}',
+                      '{"next":"先梳理一下当前的工作再继续"}', '{"idea":"好"}'):
+            advisor = agent_hints.HintAdvisor({"url": "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+                                              "key": "SECRET", "model": "mimo-v2.6-flash"},
+                                             lambda request, timeout, reply=reply: io.BytesIO(json.dumps(
+                                                 {"choices": [{"message": {"content": reply}}]}).encode()))
+            advisor._fetch("test", agent_hints.context([], []))
+            self.assertIsNone(advisor.result, reply)
+
+    def test_an_old_idea_stays_while_a_new_one_is_on_its_way(self):
+        advisor = agent_hints.HintAdvisor({"url": "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+                                          "key": "SECRET", "model": "mimo-v2.6-flash"}, lambda *a, **k: None)
+        advisor.result, advisor.result_at, advisor.signature = ("", "旧的想法仍然有用"), time.time() - 900, "old"
+        advisor.pending = True                                             # a request is already out
+        self.assertEqual(advisor.lookup(agent_hints.context([], [])), ("", "旧的想法仍然有用"))
+        advisor.result_at = time.time() - agent_hints.KEEP_SECONDS - 1
+        self.assertEqual(advisor.lookup(agent_hints.context([], [])), ("", ""))
 
     def test_non_mimo_endpoint_uses_local_hint(self):
         advisor = agent_hints.HintAdvisor({"url": "https://example.com/chat/completions", "key": "x", "model": "m"})

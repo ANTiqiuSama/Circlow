@@ -812,23 +812,24 @@ class Scene:
             frame.alpha_composite(sprite.crop((0, label, width, sprite.height)), (left, top + label))
 
     def _hint(self, frame, model, field_h, scale, at):
-        """The shared MiMo/local hint as two marked rows, like LumaCenter's
-        notes beside it: what is going on now (a dot in the source's colour,
-        bright text) and an idea for next (a MiMo spark, dimmer text). Each
-        row is one line, cut with an ellipsis."""
+        """MiMo's one idea, beside its spark: up to two lines, the second cut
+        with an ellipsis. Nothing at all without one: no stand-in advice, and
+        no "what is going on" line (the bubbles above already show that)."""
+        idea = model.hint_next.strip("。；！ ")
+        if not idea:
+            return
         draw = ImageDraw.Draw(frame)
         text_font = ui_font(round(HINT_FONT * scale))
         top = chart_top(model, field_h) + CHART_H + chart_extra_for(model) + 15
-        now = model.hint_now.strip("。；！ ") or "正在整理可做的事项"
-        idea = model.hint_next.strip("。；！ ")
-        rows = [("now", now, TEXT, accent(model.letter))] + ([("next", idea, SECONDARY_TEXT, accent("M"))] if idea else [])
         limit = at(WIDTH - PAD) - at(PAD + HINT_TEXT_X)
-        for index, (kind, text, ink, tone) in enumerate(rows):
-            y = at(top + index * HINT_LINE)
-            mark = hint_mark(kind, tone, scale)
-            frame.alpha_composite(mark, (round(at(PAD + 2)), round(y - mark.height / 2)))
-            draw.text((at(PAD + HINT_TEXT_X), y), forecast_text(text, limit, text_font, draw), font=text_font, fill=ink,
-                      anchor="lm")
+        lines = _wrap(draw, idea, text_font, limit) or [idea]
+        if len(lines) > 2:
+            lines = [lines[0], forecast_text("".join(lines[1:]), limit, text_font, draw)]
+        mark = hint_mark("next", accent("M"), scale)
+        frame.alpha_composite(mark, (round(at(PAD + 2)), round(at(top) - mark.height / 2)))
+        for index, line in enumerate(lines[:2]):
+            draw.text((at(PAD + HINT_TEXT_X), at(top + index * HINT_LINE)), line, font=text_font,
+                      fill=TEXT if index == 0 else SECONDARY_TEXT, anchor="lm")
 
     def _bubble(self, frame, m: BubbleModel, x, y, r, scale, alpha, label=True, expanded=False, crisp=False):
         layout = round(m.radius * scale)
