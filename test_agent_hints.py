@@ -31,8 +31,10 @@ class HintTests(unittest.TestCase):
         self.assertEqual(agent_hints.local_hint(data), ("", ""))          # no stock advice without MiMo
         self.assertNotIn("hovered", data)
         prompt = agent_hints.SYSTEM_PROMPT
-        for wanted in ("宏观、有新意、能启发人", "连成一个新想法", "反直觉", "收尾、准备", "具体的操作或改动", "额度", "与过去的比较"):
+        for wanted in ("先选定一件事", "只围绕这一件事", "严禁把不同领域的话题拼在一起", "收尾、准备", "具体的操作或改动",
+                       "额度", "与过去的比较"):
             self.assertIn(wanted, prompt)
+        self.assertNotIn("连成一个新想法", prompt)                         # no forced cross-domain mash-ups
         self.assertIn('"idea"', prompt)
         self.assertNotIn('"now"', prompt)
 

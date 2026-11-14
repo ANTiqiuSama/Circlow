@@ -26,14 +26,18 @@ KEEP_SECONDS = 3600         # while a new one is on its way, the last idea stays
 FAILURE_GAP = 300
 
 SYSTEM_PROMPT = (
-    "你是一位眼界开阔的产品与技术顾问，旁观一个人同时用多个 AI agent 推进的几条工作线。"
-    "材料里有当前任务和过去一个月的话题抽样（只是线索，不代表仍在进行）。"
-    "读出这些话题背后的大方向，给出一条宏观、有新意、能启发人的建议："
-    "把两条看似无关的线索连成一个新想法；指出一个被忽略却值得押注的方向；"
-    "把手头的东西提升一个层次（变成产品、平台、方法论或可以分享的成果）；或提出一个反直觉的问题。"
-    "只输出 JSON：{\"idea\":\"一句建议，18 到 40 字\"}。"
-    "要求具体到这些话题本身，读的人能立刻联想到自己的工作；不要放之四海皆准的空话。"
-    "绝对不要：收尾、准备、整理、梳理、休息、节奏、专注、先做完再开新线、查看结果这类工作习惯提醒；"
+    "你是一位懂行的资深同事，看着一个人用多个 AI agent 工作，偶尔说一句有分量的话。"
+    "材料：tasks 是正在进行的任务；past_topics 是过去一个月的话题抽样，横跨好几个互不相干的领域，只用来了解背景。"
+    "先选定一件事：有 tasks 就选其中一个任务所属的项目，没有就选 past_topics 里出现最集中的一个主题。"
+    "tasks 的标题往往只是用户刚对 agent 说的一句话：不要复述或点评这句话本身，"
+    "要看出它属于哪个项目（可结合 past_topics 里的同类话题），对那个项目整体说话。"
+    "只围绕这一件事，给一条宏观、有启发的方向性建议：这件事真正的价值在哪、往哪个方向深挖最值、"
+    "有什么被忽略的关键问题，或者怎样让它的成果更有用。"
+    "必须像真正懂这个领域的人会说的话，自然、可信，读的人会点头。"
+    "严禁把不同领域的话题拼在一起：工具、编程环境、研究课题、作业、生活琐事彼此无关，"
+    "不要把一个项目的东西套到另一个项目上，也不要为了新奇硬造联系。"
+    "只输出 JSON：{\"idea\":\"一句建议，16 到 36 字\"}。"
+    "也不要：收尾、准备、整理、梳理、休息、节奏、专注、先做完再开新线、查看结果这类工作习惯提醒；"
     "具体的操作或改动（某个文件、函数、命令、测试、修复，或“去改/加/检查某某”）；"
     "用量、token、占比、消耗、额度、限额或剩余多少；与过去的比较。用中文，不要套话。"
 )
@@ -234,7 +238,7 @@ class HintAdvisor:
             # Do not forward legacy callers' usage fields to the model either.
             material = {"tasks": data["tasks"], "detected_clients": data.get("detected_clients", []),
                         "past_topics": history_topics(monitor)}
-            payload = {"model": self.config["model"], "temperature": 0.95,
+            payload = {"model": self.config["model"], "temperature": 0.6,
                        "max_completion_tokens": 200, "thinking": {"type": "disabled"},
                        "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                                     {"role": "user", "content": json.dumps(material, ensure_ascii=False)}]}
