@@ -176,9 +176,9 @@ def menu_bar_keys(keys: list[str], prefs: dict | None = None) -> list[str]:
 
 def bar_shown(chosen: list[str], snapshots: dict, now: float) -> tuple[list[str], dict[str, float]]:
     """The chosen sources that have an icon right now, and those left out
-    until their quota resets: {source: when it is usable again}. A source
-    whose quota is used up (used_up_until) leaves the bar and comes back at
-    its reset. When every chosen source is used up, the one that comes back
+    until their quota resets: {source: when its quota is back}. A source
+    whose plan quota is used up (used_up_until; purchased credits do not
+    count) leaves the bar and comes back at its reset. When every chosen source is used up, the one that comes back
     first keeps its icon, which shows its countdown: the bar is never empty."""
     waiting = {key: until for key in chosen
                if (until := used_up_until(snapshots.get(key), now)) is not None}

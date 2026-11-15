@@ -132,7 +132,9 @@ class MacMenuTests(unittest.TestCase):
         self.assertEqual(used_up_until(quota(left=0.0, week=0.0), now), now + 5 * 86400)  # both: the later one
         self.assertIsNone(used_up_until(quota(left=0.0, reset=now - 5), now))             # reset already passed
         self.assertIsNone(used_up_until(quota(left=0.0, reset=None), now))                # reset unknown
-        self.assertIsNone(used_up_until(quota("codex", left=0.0, credits_balance=12.0), now))   # purchased credits cover it
+        # Purchased credits do not count: the plan quota at 0 % is used up either way.
+        self.assertEqual(used_up_until(quota("codex", week=0.0, credits_balance=59618.6), now), now + 5 * 86400)
+        self.assertEqual(used_up_until(quota("codex", left=0.0, credits_balance=float("inf")), now), now + 3600)
         self.assertEqual(used_up_until(quota("codex", left=0.0, credits_balance=0.0), now), now + 3600)
         self.assertIsNone(used_up_until(None, now))
         pools = [{"key": "argon", "remaining_percent": 0.0, "resets_at": now + 600},

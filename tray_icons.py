@@ -155,15 +155,14 @@ def usable_again_at(snapshot: QuotaSnapshot, now: float) -> float | None:
 
 
 def used_up_until(snapshot: QuotaSnapshot | None, now: float) -> float | None:
-    """When a source whose quota is used up can run again. Used up means 0 %
-    left (quota_depleted), not the icon's early countdown threshold: the last
-    reset among its empty windows, or, for model pools, the first pool to come
-    back once every pool is empty. None while it can still run, while
-    purchased credits cover it (Codex), or when a reset time is unknown or
-    already past (the next reading will tell)."""
+    """When a source whose plan quota is used up gets it back. Used up means
+    0 % left (quota_depleted), not the icon's early countdown threshold: the
+    last reset among its empty windows, or, for model pools, the first pool to
+    come back once every pool is empty. Purchased credits do not count: a
+    Codex plan at 0 % is used up even while credits would let it run on.
+    None while quota is left, or when a reset time is unknown or already past
+    (the next reading will tell)."""
     if snapshot is None:
-        return None
-    if snapshot.credits_balance is not None and snapshot.credits_balance > 0:
         return None
     if snapshot.pools and len(snapshot.pools) > 1:
         rows = [(pool.get("remaining_percent"), pool.get("resets_at")) for pool in snapshot.pools]
