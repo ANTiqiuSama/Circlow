@@ -117,6 +117,40 @@ class MacMenuTests(unittest.TestCase):
         self.assertEqual(mac_menu.menu_bar_keys(keys, {"menu_bar": []}), keys)
         self.assertEqual(mac_menu.menu_bar_keys(keys, {"menu_bar": "claude"}), keys)               # not a list: ignored
 
+    def test_a_used_up_source_leaves_the_bar_until_its_reset(self):
+        from tray_icons import used_up_until
+        now = 1_800_000_000.0
+
+        def quota(provider="claude", left=40.0, reset=now + 3600, week=60.0, week_reset=now + 5 * 86400, **extra):
+            return QuotaSnapshot(provider=provider, label=provider, window_minutes=300, used_percent=None,
+                                 remaining_percent=left, resets_at=reset, updated_at=now - 60, stale=False, error=None,
+                                 secondary_window_minutes=10080, secondary_remaining_percent=week,
+                                 secondary_resets_at=week_reset, **extra)
+        self.assertIsNone(used_up_until(quota(left=3.0), now))                            # nearly empty is still usable
+        self.assertEqual(used_up_until(quota(left=0.0), now), now + 3600)                 # 5 h window empty: until it resets
+        self.assertEqual(used_up_until(quota(week=0.0), now), now + 5 * 86400)            # weekly empty: until the weekly reset
+        self.assertEqual(used_up_until(quota(left=0.0, week=0.0), now), now + 5 * 86400)  # both: the later one
+        self.assertIsNone(used_up_until(quota(left=0.0, reset=now - 5), now))             # reset already passed
+        self.assertIsNone(used_up_until(quota(left=0.0, reset=None), now))                # reset unknown
+        self.assertIsNone(used_up_until(quota("codex", left=0.0, credits_balance=12.0), now))   # purchased credits cover it
+        self.assertEqual(used_up_until(quota("codex", left=0.0, credits_balance=0.0), now), now + 3600)
+        self.assertIsNone(used_up_until(None, now))
+        pools = [{"key": "argon", "remaining_percent": 0.0, "resets_at": now + 600},
+                 {"key": "gemini", "remaining_percent": 0.0, "resets_at": now + 300}]
+        self.assertEqual(used_up_until(quota("gemini", pools=pools), now), now + 300)    # every pool empty: the first back
+        pools[0]["remaining_percent"] = 20.0
+        self.assertIsNone(used_up_until(quota("gemini", pools=pools), now))              # one pool still has quota
+
+        snapshots = {"claude": quota(left=0.0), "codex": quota("codex")}
+        shown, waiting = mac_menu.bar_shown(["claude", "codex"], snapshots, now)
+        self.assertEqual((shown, waiting), (["codex"], {"claude": now + 3600}))
+        shown, waiting = mac_menu.bar_shown(["claude", "codex"], snapshots, now + 3601)   # past the reset: back
+        self.assertEqual((shown, waiting), (["claude", "codex"], {}))
+        snapshots["codex"] = quota("codex", week=0.0)
+        shown, waiting = mac_menu.bar_shown(["claude", "codex"], snapshots, now)          # all used up: never an empty bar
+        self.assertEqual((shown, waiting), (["claude"], {"codex": now + 5 * 86400}))      # the one back first stays
+        self.assertEqual(mac_menu.bar_shown(["claude"], {}, now), (["claude"], {}))       # not read yet: shown
+
     def test_status_items_have_stable_autosave_names(self):
         names = {mac_menu.autosave_name(key) for key in ("claude", "codex", "gemini", "grok", "mimo")}
         self.assertEqual(names, {"Circlow.claude", "Circlow.codex", "Circlow.gemini", "Circlow.grok", "Circlow.mimo"})

@@ -120,6 +120,10 @@ class SettingsViewTests(unittest.TestCase):
         self.assertEqual(settings_window.bar_note(True, True), "在菜单栏显示图标")
         self.assertIn("照常读取", settings_window.bar_note(True, False))
         self.assertIn("来源未开启", settings_window.bar_note(False, True))
+        now = time.time()
+        self.assertIn("额度已用完", settings_window.bar_note(True, True, now + 3600, now))
+        self.assertIn("重置后恢复显示", settings_window.bar_note(True, True, now + 3600, now))
+        self.assertEqual(settings_window.bar_note(True, False, now + 3600, now), "不显示图标，仍照常读取")
         self.assertEqual(settings_window.save_delay(["bar:claude"]), settings_window.SAVE_DELAYS["switch"])
 
     def test_paragraphs_wrap_chinese_by_character_and_keep_latin_words_whole(self):

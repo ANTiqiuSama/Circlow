@@ -123,11 +123,17 @@ def menu_bar_choice(staged: dict, enabled) -> list[str]:
     return shown
 
 
-def bar_note(enabled: bool, shown: bool) -> str:
-    """The line under a source's menu bar switch."""
+def bar_note(enabled: bool, shown: bool, until: float | None = None, now: float | None = None) -> str:
+    """The line under a source's menu bar switch. `until`: the source's quota
+    is used up and its icon is away until then (tray_icons.used_up_until)."""
     if not enabled:
         return "来源未开启" + ("；开启后显示图标" if shown else "")
-    return "在菜单栏显示图标" if shown else "不显示图标，仍照常读取"
+    if not shown:
+        return "不显示图标，仍照常读取"
+    if until is not None:
+        from tray_icons import reset_clock
+        return f"额度已用完，{reset_clock(until, now if now is not None else time.time())} 重置后恢复显示"
+    return "在菜单栏显示图标"
 
 
 _LATIN = re.compile(r"[A-Za-z0-9_./:@%+-]")
@@ -1602,7 +1608,7 @@ class SettingsWindow:
         """macOS: which sources get a menu bar icon. The others are still read
         and shown in this window; only their icon is left out. Applied live."""
         tk, S = self.tk, self.S
-        self.section(page, "菜单栏图标", "选择在菜单栏显示哪些来源；未显示的来源照常读取，可在概览查看")
+        self.section(page, "菜单栏图标", "选择在菜单栏显示哪些来源；额度用完的来源在重置前自动隐藏，未显示的来源照常读取")
         box = self.card(page)
         self.bar_rows = {}
         for index, key in enumerate(in_tray_order(states)):
@@ -1617,10 +1623,14 @@ class SettingsWindow:
 
     def _fill_sources(self):
         import providers
+        from tray_icons import used_up_until
+        now = time.time()
+        snapshots = getattr(self.app, "snapshots", None) or {}
         for state in providers.provider_states():
             bar = getattr(self, "bar_rows", {}).get(state["key"])
             if bar is not None:
-                self.set_text(bar.detail, bar_note(state["enabled"], bool(self.vars["bar:" + state["key"]].get())))
+                until = used_up_until(snapshots.get(state["key"]), now)
+                self.set_text(bar.detail, bar_note(state["enabled"], bool(self.vars["bar:" + state["key"]].get()), until, now))
             row = self.source_rows.get(state["key"])
             if row is None:
                 continue

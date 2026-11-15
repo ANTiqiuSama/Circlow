@@ -6,7 +6,8 @@ stand-in icons (MacIcon) instead of pystray ones; a short timer copies their
 pictures into NSStatusItems/NSMenus. Clicking an item opens the same agent
 panel as on Windows (mac_panel); right-clicking it opens the native menu.
 Nothing opens on hover. The settings page chooses which sources get an item
-(menu_bar_keys); the others are still read.
+(menu_bar_keys); the others are still read. A chosen source whose quota is
+used up leaves the bar until it resets (bar_shown).
 """
 from __future__ import annotations
 
@@ -45,7 +46,7 @@ from forecast import reset_distance
 from quota_sources import QuotaSnapshot, collect, load_cached_snapshots, mimo_snapshot, mimo_tracker, placeholder, save_cached_snapshots
 from refresh_scheduler import RefreshScheduler
 from tps_sources import TpsMonitor, save_performance
-from tray_icons import make_display_icon, quota_depleted, stale_note
+from tray_icons import make_display_icon, quota_depleted, reset_clock, stale_note, used_up_until
 
 
 HERDR_AGENTS = launchers.HERDR_AGENTS      # "打开来源" starts these in a new Herdr workspace
@@ -171,6 +172,22 @@ def menu_bar_keys(keys: list[str], prefs: dict | None = None) -> list[str]:
     if not isinstance(chosen, list):
         return list(keys)
     return [key for key in keys if key in chosen] or list(keys)
+
+
+def bar_shown(chosen: list[str], snapshots: dict, now: float) -> tuple[list[str], dict[str, float]]:
+    """The chosen sources that have an icon right now, and those left out
+    until their quota resets: {source: when it is usable again}. A source
+    whose quota is used up (used_up_until) leaves the bar and comes back at
+    its reset. When every chosen source is used up, the one that comes back
+    first keeps its icon, which shows its countdown: the bar is never empty."""
+    waiting = {key: until for key in chosen
+               if (until := used_up_until(snapshots.get(key), now)) is not None}
+    shown = [key for key in chosen if key not in waiting]
+    if not shown and waiting:
+        first = min(waiting, key=lambda key: (waiting[key], chosen.index(key)))
+        shown = [first]
+        del waiting[first]
+    return shown, waiting
 
 
 def open_source(key: str, state, popen=subprocess.Popen, run=subprocess.run) -> str | None:
@@ -481,26 +498,32 @@ def run_mac() -> int:
                 self.menu_objs[key] = menu
             self.panel = MacPanel(tray, self.items, icons, self.panelSettings)
             self.panel.start(self)
-            self.bar_shown = None
-            self.applyBarChoice()
+            self.bar_prefs = tray_app.load_preferences()
+            self.bar_state = None
+            self.applyBarChoice(time.time())
             self.updateUI_(None)
             self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 1.0, self, "updateUI:", None, True)
             tray.start_workers()
 
         @objc.python_method
-        def applyBarChoice(self):
-            """Show the items the settings page chose (来源 → 菜单栏图标). The
-            others stay created but hidden, so a change needs no restart."""
-            shown = menu_bar_keys(keys, tray_app.load_preferences())
+        def applyBarChoice(self, now):
+            """Show the items the settings page chose (来源 → 菜单栏图标),
+            less those whose quota is used up until they reset (bar_shown).
+            The others stay created but hidden, so neither needs a restart.
+            Runs every second: an item comes back at its reset time."""
+            shown, waiting = bar_shown(menu_bar_keys(keys, self.bar_prefs), tray.snapshots, now)
             for key, item in self.items.items():
                 if bool(item.isVisible()) != (key in shown):
                     item.setVisible_(key in shown)
             if self.panel.shown is not None and self.panel.shown not in shown:
-                self.panel.close("its icon was turned off")
-            if shown != self.bar_shown:
-                log.info("menu bar shows %s", ", ".join(shown))
-                self.bar_shown = shown
+                self.panel.close("its quota is used up" if self.panel.shown in waiting else "its icon was turned off")
+            state = (shown, sorted(waiting))
+            if state != self.bar_state:
+                away = "".join(f"; {key} hidden until {reset_clock(until, now)} (quota used up)"
+                               for key, until in sorted(waiting.items()))
+                log.info("menu bar shows %s%s", ", ".join(shown), away)
+                self.bar_state = state
 
         def updateUI_(self, _timer):
             now = time.time()
@@ -508,13 +531,14 @@ def run_mac() -> int:
                 outcome = settings_mac.handle_menu_command(tray, command, now)
                 log.info("settings command %s -> %s", command.get("name"), outcome or "applied")
                 if command.get("name") == "reload":
-                    self.applyBarChoice()         # the saved preferences may have changed the shown set
+                    self.bar_prefs = tray_app.load_preferences()     # the shown set may have changed
                 if outcome == "restart":
                     subprocess.Popen(settings_mac.relaunch_command(), start_new_session=True,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if outcome in ("restart", "quit"):
                     self.quitApp_(None)
                     return
+            self.applyBarChoice(now)
             for key in keys:
                 snapshot = tray.snapshots[key]
                 performance = dict(tray.performance.get("providers", {}).get(key, {}))

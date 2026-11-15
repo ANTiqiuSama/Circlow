@@ -154,6 +154,37 @@ def usable_again_at(snapshot: QuotaSnapshot, now: float) -> float | None:
     return float(max(stamp for _, stamp in empty))
 
 
+def used_up_until(snapshot: QuotaSnapshot | None, now: float) -> float | None:
+    """When a source whose quota is used up can run again. Used up means 0 %
+    left (quota_depleted), not the icon's early countdown threshold: the last
+    reset among its empty windows, or, for model pools, the first pool to come
+    back once every pool is empty. None while it can still run, while
+    purchased credits cover it (Codex), or when a reset time is unknown or
+    already past (the next reading will tell)."""
+    if snapshot is None:
+        return None
+    if snapshot.credits_balance is not None and snapshot.credits_balance > 0:
+        return None
+    if snapshot.pools and len(snapshot.pools) > 1:
+        rows = [(pool.get("remaining_percent"), pool.get("resets_at")) for pool in snapshot.pools]
+        if any(not quota_depleted(value) for value, _ in rows) or any(not stamp or stamp <= now for _, stamp in rows):
+            return None
+        return float(min(stamp for _, stamp in rows))
+    empty = [stamp for value, stamp in ((snapshot.remaining_percent, snapshot.resets_at),
+                                        (snapshot.secondary_remaining_percent, snapshot.secondary_resets_at))
+             if quota_depleted(value)]
+    if not empty or any(not stamp or stamp <= now for stamp in empty):
+        return None
+    return float(max(empty))
+
+
+def reset_clock(timestamp: float, now: float) -> str:
+    """A reset time to read at a glance: "21:38" today, else "11-16 21:38"."""
+    moment = datetime.fromtimestamp(timestamp)
+    same_day = moment.date() == datetime.fromtimestamp(now).date()
+    return moment.strftime("%H:%M" if same_day else "%m-%d %H:%M")
+
+
 def make_provider_icon(snapshot: QuotaSnapshot, letter: str, reset_hint: bool = False, now: float | None = None) -> Image.Image:
     # Icons are cached in icon_art and shared: never draw on them afterwards.
     now = now or time.time()
