@@ -34,6 +34,7 @@ PERFORMANCE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Lo
 RECENT_SECONDS = 86400          # Only files touched within a day can matter.
 FORGET_SECONDS = 2 * 86400      # Readers idle this long are released.
 SLOW_DISCOVERY_SECONDS = 30     # Process list and full-history globbing.
+HOT_SECONDS = 3600              # A record that grew this recently is checked between polls (stirred).
 PROVIDER_NAMES = {"codex": "Codex", "grok": "Grok", "gemini": "Gemini", "claude": "Claude Code", "mimo": "Xiaomi MiMo", "other": "其他模型"}
 CLAUDE_IDLE_FLUSH = 30          # Emit an unfinished Claude message after this much silence.
 CLAUDE_STALE_ACTIVITY = 90      # Drop "generating" when a session went quiet this long.
@@ -184,6 +185,7 @@ class JsonlReader:
         self.skip_first = self.position > 0
         self.pending = b""
         self.skipped = 0
+        self.primed = False          # read once: later growth is new output
 
     def read(self):
         size = self.path.stat().st_size
@@ -238,6 +240,9 @@ class TpsMonitor:
         self.grok_paths: set[Path] = set()
         self.antigravity_cache: tuple[float, list] = (0.0, [])
         self.readers: dict[Path, JsonlReader] = {}
+        self.hot: dict[Path, float] = {}       # records that grew recently -> when (stirred)
+        self.codex_log_seen: tuple = ()        # Codex stream log's (mtime, size) at the last poll
+        self.last_output_at = 0.0              # newest observation added this run
         self.context: dict[str, dict[str, Any]] = {}
         self.events: deque[Observation] = deque()
         self.added_total = 0               # observations ever added (consumers read only the new tail)
@@ -290,6 +295,7 @@ class TpsMonitor:
         self.seen.add(observation.identity)
         self.events.append(observation)
         self.added_total += 1
+        self.last_output_at = max(self.last_output_at, observation.ended_at)
         if self.store is not None:
             self.store.note(observation)
         pair = (observation.provider, observation.source)
@@ -732,7 +738,41 @@ class TpsMonitor:
         if self.mimocode_paths:
             self.health["MiMo Code"] = {"status": "已接入", "databases": len(self.mimocode_paths)}
 
+    def _codex_log_stamp(self) -> tuple:
+        stamp = []
+        for name in ("logs_2.sqlite", "logs_2.sqlite-wal"):
+            try:
+                info = (self.codex_root / name).stat()
+                stamp.append((info.st_mtime_ns, info.st_size))
+            except OSError:
+                stamp.append(None)
+        return tuple(stamp)
+
+    def stirred(self, now: float) -> bool:
+        """A cheap look between polls, for the battery saver while nothing is
+        working: has a record that grew within HOT_SECONDS grown again, or
+        Codex's stream log changed, since the last poll? Then a poll reads
+        the new tails. New sessions are found by the next full poll."""
+        for path, grew in list(self.hot.items()):
+            reader = self.readers.get(path)
+            if reader is None or now - grew > HOT_SECONDS:
+                self.hot.pop(path, None)
+                continue
+            try:
+                if path.stat().st_size != reader.position:
+                    return True
+            except OSError:
+                continue
+        reader = self.grok_native_reader
+        try:
+            if reader is not None and reader.path.stat().st_size != reader.position:
+                return True
+        except OSError:
+            pass
+        return self._codex_log_stamp() != self.codex_log_seen
+
     def _codex_logs(self, now: float):
+        self.codex_log_seen = self._codex_log_stamp()
         path = self.codex_root / "logs_2.sqlite"
         if not path.is_file():
             return
@@ -1093,6 +1133,8 @@ class TpsMonitor:
             self.health["Codex 流式日志"] = {"status": "不可读取"}
         for path, reader in list(self.readers.items()):
             session = self.file_sessions[path]
+            before, primed = reader.position, reader.primed
+            reader.primed = True
             try:
                 source = self.context.get(session, {}).get("source")
                 if source == "Claude Code":
@@ -1120,6 +1162,8 @@ class TpsMonitor:
                         self._codex_record(record, session, now)
             except (OSError, ValueError, TypeError):
                 self.health[self.context.get(session or "", {}).get("source", "记录读取")] = {"status": "部分记录不可读取"}
+            if primed and reader.position != before:
+                self.hot[path] = now        # new output, not the first read of the history
         self._claude_flush(now)
         try:
             self._mimocode(now)

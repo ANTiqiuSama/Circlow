@@ -58,6 +58,7 @@ import mimo_usage
 import providers as provider_registry
 import model_iq
 import grok_iq
+import power_source
 import reset_watch
 from refresh_scheduler import RefreshScheduler
 from tray_icons import (  # noqa: F401  (re-exported for callers and tests)
@@ -162,6 +163,14 @@ def quota_line(snapshot: QuotaSnapshot) -> str:
 # Tray order is fixed (providers.TRAY_POSITIONS): Claude Code, Codex (GPT),
 # Grok, Gemini, MiMo.  It never changes with remaining quota or exhaustion.
 ORDER_CHECK_SECONDS = 2          # five icon rectangles and one registry read: cheap
+# Battery saver (power_source), while no source works, nothing produced output
+# for QUIET_AFTER seconds and no panel or menu is open: the local records are
+# scanned when they grew (TpsMonitor.stirred) or every QUIET_SCAN seconds, and
+# icons and tooltips are redrawn when their figures change or every QUIET_DRAW
+# seconds, so a reset countdown moves within that.
+QUIET_AFTER = 120
+QUIET_SCAN = 30
+QUIET_DRAW = 15
 PREFERENCES_PATH = DATA_DIR / "settings.json"
 
 
@@ -267,6 +276,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         self.grok_iq = grok_iq.load_state(GROK_IQ_PATH)
         self.iq_lock = threading.Lock()
         self.iq_wake = threading.Event()
+        self.power = power_source.PowerWatch()
         # Cached figures may use a different alert threshold.  Notify once
         # after a fresh high forecast arrives, then suppress repeats this run.
         self.reset_alerted = "unknown"
@@ -766,9 +776,43 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
             self.wake.set()                          # its next due time may be the earliest now
 
 
+    def looked_at(self) -> bool:
+        """A source's panel or menu is open."""
+        return any(getattr(icon, "details_visible", False) or getattr(icon, "hover_open", False)
+                   for icon in (getattr(self, "icons", None) or {}).values())
+
+    def saving(self, now: float) -> bool:
+        """The battery saver's quiet state: on battery, no source working,
+        no output for QUIET_AFTER seconds, no panel or menu open."""
+        power = getattr(self, "power", None)
+        if power is None or not power.battery(now) or self.looked_at():
+            return False
+        if any(self.source_working(provider) for provider in PROVIDERS):
+            return False
+        return now - getattr(self.tps_monitor, "last_output_at", 0.0) >= QUIET_AFTER
+
+    def claude_status_stamp(self) -> tuple:
+        """The Claude status-line receiver's file, which changes while Claude Code runs."""
+        import claude_status
+        try:
+            info = (claude_status.data_dir() / claude_status.ROLLING_NAME).stat()
+            return info.st_mtime_ns, info.st_size
+        except OSError:
+            return ()
+
+    def scan_due(self, now: float, saving: bool) -> bool:
+        """Read the local records this second? Always, unless saving: then
+        when they grew, the status line moved, or QUIET_SCAN has passed."""
+        if not saving or now - getattr(self, "scanned_at", 0.0) >= QUIET_SCAN or now < getattr(self, "scanned_at", 0.0):
+            return True
+        if "claude" in PROVIDERS and self.claude_status_stamp() != getattr(self, "claude_status_seen", ()):
+            return True
+        return self.tps_monitor.stirred(now)
+
     def tps_loop(self) -> None:
         last_wall = time.time()
         failures = 0
+        drawn: dict[str, tuple] = {}
         while not self.stop_event.wait(1):
             now = time.time()
             try:
@@ -777,18 +821,31 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                     self.scheduler.clock_jump(now)
                     self.wake.set()
                 last_wall = now
-                local = self.tps_monitor.poll(now)
-                self.performance = self.with_other_devices(local, now)
-                self.local_performance = local
-                self.agents = self.tps_monitor.agents(now)
-                self.save_performance_if_changed(local, now)
-                self.feed_scheduler(self.performance, now)
-                if "mimo" in PROVIDERS:
-                    self.update_mimo_locally(now)
-                if "codex" in PROVIDERS:
-                    self.update_codex_locally(now)
-                if "claude" in PROVIDERS:
-                    self.update_claude_locally(now)
+                power = getattr(self, "power", None)
+                if power is not None and self.scheduler.set_battery(power.battery(now), now):
+                    self.wake.set()
+                saving = self.saving(now)
+                scan = self.scan_due(now, saving)
+                if scan:
+                    if "claude" in PROVIDERS:
+                        self.claude_status_seen = self.claude_status_stamp()
+                    local = self.tps_monitor.poll(now)
+                    self.performance = self.with_other_devices(local, now)   # before local_performance: it compares the two
+                    self.local_performance = local
+                    self.agents = self.tps_monitor.agents(now)
+                    self.save_performance_if_changed(local, now)
+                    self.scanned_at = now
+                elif getattr(self, "live", None) is not None:
+                    # Other devices' live TPS moves without a local scan.
+                    self.performance = self.with_other_devices(getattr(self, "local_performance", None) or self.performance, now)
+                self.feed_scheduler(self.performance, now)      # every second: a click reads at once
+                if scan:
+                    if "mimo" in PROVIDERS:
+                        self.update_mimo_locally(now)
+                    if "codex" in PROVIDERS:
+                        self.update_codex_locally(now)
+                    if "claude" in PROVIDERS:
+                        self.update_claude_locally(now)
                 if now - getattr(self, "weeks_noted_at", 0.0) >= 60:
                     self.weeks_noted_at = now
                     self.note_weeks()
@@ -799,8 +856,19 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                     self.order_checked_at = now
                     self.maybe_reorder(now)   # a drag or Explorer reflow is undone within seconds
                 for provider, letter in PROVIDERS.items():
-                    if self.icons[provider].visible:
-                        self.update_icon(provider, letter)
+                    if not self.icons[provider].visible:
+                        continue
+                    if saving:
+                        # Redraw when the figures behind the icon changed, or every QUIET_DRAW s.
+                        inputs = (id(self.snapshots.get(provider)), performance_signature(
+                            {"providers": {provider: self.performance["providers"].get(provider, {})}}))
+                        last = drawn.get(provider)
+                        if last is not None and last[0] == inputs and now - last[1] < QUIET_DRAW:
+                            continue
+                        drawn[provider] = (inputs, now)
+                    else:
+                        drawn.pop(provider, None)
+                    self.update_icon(provider, letter)
                 failures = 0
             except Exception:
                 # Any unexpected error used to end this thread silently and

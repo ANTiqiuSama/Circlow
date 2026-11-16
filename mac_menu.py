@@ -463,6 +463,8 @@ def run_mac() -> int:
             self.menu_objs = {}
             self.order = []
             self.pictures = {}
+            self.applied = {}          # (source, part) -> the value last handed to AppKit
+            self.drawn = {}            # source -> (inputs, when) of its last refresh while saving
             bar = NSStatusBar.systemStatusBar()
             for key in bar_order(keys):
                 item = bar.statusItemWithLength_(NSVariableStatusItemLength)
@@ -504,6 +506,7 @@ def run_mac() -> int:
             self.updateUI_(None)
             self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 1.0, self, "updateUI:", None, True)
+            self.timer.setTolerance_(0.3)     # lets macOS group this wake-up with others
             tray.start_workers()
 
         @objc.python_method
@@ -539,13 +542,26 @@ def run_mac() -> int:
                     self.quitApp_(None)
                     return
             self.applyBarChoice(now)
+            saving = tray.saving(now)
+            sync = f"同步：{tray.sync_status()}" if getattr(tray, "sync", None) is not None else ""
             for key in keys:
+                item = self.items[key]
+                if not item.isVisible():
+                    continue                         # hidden: nothing to show until it comes back
                 snapshot = tray.snapshots[key]
+                if saving:
+                    # Battery saver: only when the reading or the icon changed,
+                    # or every QUIET_DRAW seconds (a countdown moves within that).
+                    inputs = (id(snapshot), id(icons[key].icon), sync)
+                    last = self.drawn.get(key)
+                    if last is not None and last[0] == inputs and now - last[1] < tray_app.QUIET_DRAW:
+                        continue
+                    self.drawn[key] = (inputs, now)
                 performance = dict(tray.performance.get("providers", {}).get(key, {}))
                 model = menu_model(key, snapshot, performance, tray.scheduler.describe(key, now), now)
                 # The tray draws the icon each second (TPS loop); until then draw it here.
                 image = icons[key].icon or status_image(snapshot, providers.get(key).letter, performance)
-                button = self.items[key].button()
+                button = item.button()
                 if self.pictures.get(key) is not image:
                     picture = to_nsimage(image, image.size[0] / ICON_POINTS)
                     picture.setTemplate_(mono)       # the system colours it: white on a dark bar, black on a light one
@@ -554,26 +570,25 @@ def run_mac() -> int:
                 # Sources with a panel have no tooltip: nothing appears on hover, a click shows the panel.
                 tip = "" if tray_app.has_panel(key, snapshot) else "\n".join(
                     part for part in (model["summary"], model["speed"]) if part)
-                button.setToolTip_(tip)
+                if self.applied.get((key, "tip")) != tip:
+                    button.setToolTip_(tip)
+                    self.applied[(key, "tip")] = tip
                 rows = model["quota"][:3]
-                for name, value in (("summary", model["summary"]), ("speed", model["speed"]),
-                                    ("updated", model["updated"]), ("error", model["error"])):
-                    self.menus[key][name].setTitle_(value)
-                    self.menus[key][name].setHidden_(not bool(value))
-                sync = f"同步：{tray.sync_status()}" if getattr(tray, "sync", None) is not None else ""
-                self.menus[key]["sync"].setTitle_(sync)
-                self.menus[key]["sync"].setHidden_(not sync)
-                for index in range(3):
-                    value = rows[index] if index < len(rows) else ""
-                    line = self.menus[key][f"quota{index}"]
-                    line.setTitle_(value)
-                    line.setHidden_(not bool(value))
+                lines = {name: model[name] for name in ("summary", "speed", "updated", "error")}
+                lines["sync"] = sync
+                lines.update({f"quota{index}": rows[index] if index < len(rows) else "" for index in range(3)})
+                for name, value in lines.items():
+                    if self.applied.get((key, name)) != value:     # AppKit is only told about changes
+                        self.menus[key][name].setTitle_(value)
+                        self.menus[key][name].setHidden_(not bool(value))
+                        self.applied[(key, name)] = value
 
         def menuWillOpen_(self, menu):
             key = str(menu.title())
             if key in icons:
                 icons[key].hover_open = True     # open menu = hover: fastest refresh tier
                 tray.wake.set()
+                self.updateUI_(None)             # the battery saver may have left its lines a few seconds old
             self.panel.close("a menu opened")    # a menu and the panel are never up together
 
         def menuDidClose_(self, menu):

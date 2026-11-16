@@ -10,6 +10,10 @@ Triggers, per provider:
 * the reset time of any window passes          -> a few seconds after it
 * read failed                                  -> 30 s, 1, 2, 5 min backoff
 * otherwise idle                               -> IDLE seconds (long)
+* idle on battery                              -> BATTERY_IDLE seconds (longer),
+                                                  back to IDLE in the last
+                                                  BATTERY_NEAR_RESET seconds
+                                                  before any of its resets
 * quota used up (Grok)                         -> rarely, then every couple of
                                                   minutes shortly before the reset
 * no such quota on this account (Claude without a subscription), or repeated
@@ -35,6 +39,8 @@ SETTLE = {spec.key: spec.settle_seconds for spec in SPECS}
 EXHAUSTED = {spec.key: spec.exhausted_seconds for spec in SPECS}
 NEAR_RESET = {spec.key: (spec.near_reset_seconds, spec.near_reset_poll) for spec in SPECS}
 GIVE_UP = {spec.key: spec.give_up_seconds for spec in SPECS}
+BATTERY_IDLE = {spec.key: spec.battery_idle_seconds for spec in SPECS}
+BATTERY_NEAR_RESET = 10 * 60  # on battery, the normal idle cadence again this long before a reset
 RETRY = (30, 60, 120, 300)
 GIVE_UP_AFTER = 3            # consecutive failures before GIVE_UP applies
 DURATION_GAP = 2             # a read that took 20 s waits at least 40 s before the next
@@ -109,17 +115,47 @@ class RefreshScheduler:
         self.running: set[str] = set()
         self.started = {p: 0.0 for p in self.providers}       # when the running read began
         self.again: set[str] = set()                           # hovered during a read: read once more
+        self.battery = False                                    # battery saver (set_battery)
+        self.resets: dict[str, tuple[float, ...]] = {p: () for p in self.providers}   # from the last reading
 
     def _gap(self, provider: str, interval: float) -> float:
         return max(interval, DURATION_GAP * self.duration[provider])
 
-    def _tier(self, provider: str) -> tuple[float, str]:
-        """(interval, reason) for the current attention: hover < active < idle."""
+    def _tier(self, provider: str, now: float) -> tuple[float, str]:
+        """(interval, reason) for the current attention: hover < active < idle.
+        Idle on battery waits BATTERY_IDLE instead, except within
+        BATTERY_NEAR_RESET of a reset, and never past the start of that span."""
         if self.hovered[provider]:
             return self._gap(provider, HOVER[provider]), "悬停"
         if self.active[provider]:
             return self._gap(provider, ACTIVE[provider]), "使用中"
-        return self._gap(provider, IDLE[provider]), "空闲"
+        idle = self._gap(provider, IDLE[provider])
+        saver = BATTERY_IDLE.get(provider)
+        if not (self.battery and saver):
+            return idle, "空闲"
+        starts = [reset - BATTERY_NEAR_RESET for reset in self.resets.get(provider, ()) if reset > now]
+        if any(start <= now for start in starts):
+            return idle, "临近重置"
+        interval = self._gap(provider, max(saver, IDLE[provider]))
+        if starts:
+            interval = max(1.0, min(interval, min(starts) - now))
+        return interval, "省电"
+
+    def set_battery(self, on: bool, now: float) -> bool:
+        """Battery saver on or off. Back on mains power, no idle source waits
+        longer than its normal idle interval. Returns True when a read moved
+        earlier."""
+        with self.lock:
+            if bool(on) == self.battery:
+                return False
+            self.battery = bool(on)
+            moved = False
+            if not self.battery:
+                for provider in self.providers:
+                    if provider not in self.running and self.reason.get(provider) == "省电":
+                        gap = self._gap(provider, IDLE[provider])
+                        moved |= self._forward(provider, max(now, self.last_done[provider] + gap), "空闲")
+            return moved
 
     def _forward(self, provider: str, when: float, reason: str) -> bool:
         if when < self.due[provider]:
@@ -153,10 +189,14 @@ class RefreshScheduler:
                 self.duration[provider] = duration
             error = getattr(snapshot, "error", None)
             self.dormant[provider] = False
+            if not error:
+                stamps = [getattr(snapshot, "resets_at", None), getattr(snapshot, "secondary_resets_at", None)]
+                stamps += [pool.get("resets_at") for pool in getattr(snapshot, "pools", None) or [] if isinstance(pool, dict)]
+                self.resets[provider] = tuple(float(stamp) for stamp in stamps if stamp)
             if getattr(snapshot, "held", False):
                 # A doubtful reading set aside is not a failure: no backoff and
                 # never the long "no quota" pause; check again shortly.
-                interval, reason = self._tier(provider)
+                interval, reason = self._tier(provider, now)
                 self.due[provider] = now + min(interval, HELD_RECHECK)
                 self.reason[provider] = "核对读数"
             elif error:
@@ -170,7 +210,7 @@ class RefreshScheduler:
                 self.reason[provider] = reason
             else:
                 self.failures[provider] = 0
-                interval, reason = self._tier(provider)
+                interval, reason = self._tier(provider, now)
                 self.due[provider] = now + interval
                 self.reason[provider] = reason
                 used_up, reset = exhausted_reset(snapshot)

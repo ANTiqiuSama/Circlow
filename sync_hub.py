@@ -348,6 +348,7 @@ class LiveLoop:
         self.next_at = 0.0
         self.cooling_until = 0.0
         self.lock = threading.Lock()
+        self.woken = threading.Event()        # wake(): run() stops waiting
 
     def busy(self, payload: dict) -> bool:
         if any(row.get("active") for row in (payload.get("providers") or {}).values()):
@@ -383,6 +384,7 @@ class LiveLoop:
         pace, unless the hub's machine is cooling down and cannot answer."""
         if time.time() >= self.cooling_until:
             self.next_at = 0.0
+            self.woken.set()
 
     def view(self, now: float) -> tuple[dict[str, dict], float]:
         with self.lock:
@@ -391,12 +393,15 @@ class LiveLoop:
             return self.live, self.hub_now + (now - self.read_at)
 
     def run(self, stop: threading.Event) -> None:
+        """Sleeps until the next round is due (wake() cuts that short), not
+        in half-second steps: an idle device wakes once a round."""
         while not stop.is_set():
             try:
                 self.tick(time.time())
             except Exception:
                 log.exception("live TPS round failed")
-            stop.wait(0.5)
+            self.woken.wait(min(LIVE_IDLE, max(0.5, self.next_at - time.time())))
+            self.woken.clear()
 
 
 def cooldown_end(error: Exception, now: float) -> float | None:
