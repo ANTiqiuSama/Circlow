@@ -8,6 +8,7 @@ import itertools
 import logging
 import os
 import sys
+import threading
 import time
 
 import pystray
@@ -197,12 +198,26 @@ user.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
 user.GetWindow.restype = wintypes.HWND
 user.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 user.GetWindowLongW.restype = wintypes.LONG
+user.GetLayeredWindowAttributes.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.COLORREF),
+    ctypes.POINTER(wintypes.BYTE), ctypes.POINTER(wintypes.DWORD)]
+user.GetLayeredWindowAttributes.restype = wintypes.BOOL
+try:
+    dwm = ctypes.WinDLL("dwmapi", use_last_error=True)
+    dwm.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    dwm.DwmGetWindowAttribute.restype = ctypes.HRESULT
+except (AttributeError, OSError):
+    dwm = None
 user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 user.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user.GetAsyncKeyState.restype = ctypes.c_short
 user.IsWindowVisible.argtypes = [wintypes.HWND]
 user.IsWindowVisible.restype = wintypes.BOOL
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+user.EnumWindows.restype = wintypes.BOOL
+user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user.GetWindowThreadProcessId.restype = wintypes.DWORD
 user.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
 user.MonitorFromRect.restype = wintypes.HANDLE
 user.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
@@ -237,8 +252,24 @@ def icon_rect(icon) -> tuple[int, int, int, int] | None:
     rect = wintypes.RECT()
     if shell.Shell_NotifyIconGetRect(ctypes.byref(identifier), ctypes.byref(rect)) == 0:
         if rect.right > rect.left and rect.bottom > rect.top:
-            return rect.left, rect.top, rect.right, rect.bottom
+            found = rect.left, rect.top, rect.right, rect.bottom
+            return found if plausible_icon_rect(found) else None
     return None
+
+
+def plausible_icon_rect(rect) -> bool:
+    """One icon slot, not a container. While the classic overflow window
+    (NotifyIconOverflowWindow) is open, the Shell answers every icon's query,
+    taskbar icons included, with that whole window's rectangle (measured:
+    200 x 188), so the panel opened wherever the pointer went inside it. A slot
+    is at most 48 px across its short side and 96 px along its long one (the
+    taskbar's height), scaled by the monitor's DPI."""
+    width, height = rect[2] - rect[0], rect[3] - rect[1]
+    try:
+        scale = monitor_scale(user.MonitorFromRect(ctypes.byref(wintypes.RECT(*rect)), 2))
+    except (AttributeError, OSError, ctypes.ArgumentError):
+        scale = 1.0
+    return min(width, height) <= 48 * scale and max(width, height) <= 96 * scale
 
 
 def contains(rect, x, y) -> bool:
@@ -271,11 +302,15 @@ def notification_area_at(point) -> bool:
 def is_window_covered(hwnd, rect) -> bool:
     # WindowFromPoint skips static text controls and transparent surfaces, so
     # hit testing cannot prove that a fullscreen window is behind our popup.
+    # A neighbouring tray card (LumaCenter's) stays visible while it fades to
+    # nothing; a layered window that is already see-through, or one DWM has
+    # cloaked, covers nothing even though IsWindowVisible still says yes.
     above = user.GetWindow(hwnd, 3)  # GW_HWNDPREV, actual z-order
     for _ in range(256):
         if not above:
             return False
-        if user.IsWindowVisible(above) and not (user.GetWindowLongW(above, -20) & 0x20):
+        style = user.GetWindowLongW(above, -20)
+        if user.IsWindowVisible(above) and not (style & 0x20) and not _see_through(above, style):
             other = wintypes.RECT()
             if user.GetWindowRect(above, ctypes.byref(other)):
                 if (other.left < rect.right and other.right > rect.left
@@ -283,6 +318,59 @@ def is_window_covered(hwnd, rect) -> bool:
                     return True
         above = user.GetWindow(above, 3)
     return False
+
+
+def _see_through(window, style) -> bool:
+    """A layered window faded below a visible alpha, or a cloaked one."""
+    try:
+        if style & WS_EX_LAYERED:
+            color, alpha, flags = wintypes.COLORREF(), wintypes.BYTE(), wintypes.DWORD()
+            if user.GetLayeredWindowAttributes(window, ctypes.byref(color), ctypes.byref(alpha),
+                    ctypes.byref(flags)) and (flags.value & 2) and alpha.value < 24:
+                return True
+        if dwm is not None:
+            cloaked = wintypes.DWORD()
+            if dwm.DwmGetWindowAttribute(window, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0 and cloaked.value:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def neighbour_card_over(anchor) -> bool:
+    """Another program's opaque always-on-top tool window (LumaCenter's hover
+    card, still open or fading) over the band above this icon where our panel
+    is about to open. Opening anyway stacked the two cards, and the z-order
+    check then kept pushing ours above theirs."""
+    try:
+        monitor, work = work_area(anchor)
+    except OSError:
+        return False
+    scale = monitor_scale(monitor)
+    band = (anchor[2] - round(480 * scale), work[1], anchor[2], anchor[1])
+    own, found = os.getpid(), []
+    name = ctypes.create_unicode_buffer(64)
+
+    def visit(window, _):
+        style = user.GetWindowLongW(window, -20)
+        if (style & 0x88) != 0x88 or not user.IsWindowVisible(window):   # TOPMOST | TOOLWINDOW
+            return True
+        pid = wintypes.DWORD()
+        user.GetWindowThreadProcessId(window, ctypes.byref(pid))
+        if pid.value == own:
+            return True
+        user.GetClassNameW(window, name, len(name))
+        if name.value == "tooltips_class32":         # the Shell's own short tooltips
+            return True
+        other = wintypes.RECT()
+        if (user.GetWindowRect(window, ctypes.byref(other)) and other.left < band[2] and other.right > band[0]
+                and other.top < band[3] and other.bottom > band[1] and not _see_through(window, style)):
+            found.append(window)
+            return False
+        return True
+
+    user.EnumWindows(WNDENUMPROC(visit), 0)
+    return bool(found)
 
 
 def enable_thread_dpi_awareness() -> bool:
@@ -597,18 +685,112 @@ class AgentPanelWindow:
             self.surface = None
 
 
+def disable_ghosting() -> bool:
+    """Keep Windows from swapping a busy panel for its "not responding" ghost.
+    A ghost is an opaque, frozen copy of the window: the panel's see-through
+    shadow margin turns into a solid black frame around it, and it goes on
+    showing the data it had when it froze. Process-wide; harmless to repeat."""
+    try:
+        user.DisableProcessWindowsGhosting()
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
+PENDING = object()      # PanelFeed has no model for this provider yet
+
+
+class PanelFeed:
+    """Builds panel models on a thread of its own. The hover thread owns the
+    panel window and must keep pumping its messages: building a model there
+    (the tray's quota history, task summaries, files on a disk that may have
+    to spin up first) once stalled it for seconds, long enough for Windows to
+    ghost the window. `get` never blocks: it hands back the newest model and
+    asks for a fresh one when that is older than the caller allows."""
+
+    def __init__(self, agents, inline=False):
+        self.agents = agents
+        self.inline = inline        # build on the caller's thread (tests)
+        self.lock = threading.Lock()
+        self.models = {}            # provider -> (model or None, monotonic time built)
+        self.wanted = set()
+        self.wake = threading.Event()
+        self.thread = None
+        self.stopped = False
+
+    def request(self, provider) -> None:
+        if not provider:
+            return
+        if self.inline:
+            self._build(provider)
+            return
+        with self.lock:
+            self.wanted.add(provider)
+            if self.thread is None or not self.thread.is_alive():
+                self.thread = threading.Thread(target=self._work, name="panel-feed", daemon=True)
+                self.thread.start()
+        self.wake.set()
+
+    def entry(self, provider):
+        """(model or None, built_at), or None before the first build."""
+        with self.lock:
+            return self.models.get(provider)
+
+    def get(self, provider, now, max_age):
+        """(model, built_at) if it was built within `max_age` seconds, else
+        PENDING, and a fresh one is on its way. A None model means: no panel
+        for this source (the native tooltip instead)."""
+        found = self.entry(provider)
+        if found is None or now - found[1] >= max_age:
+            self.request(provider)
+            return PENDING
+        return found
+
+    def stop(self) -> None:
+        self.stopped = True
+        self.wake.set()
+
+    def _work(self) -> None:
+        while not self.stopped:
+            self.wake.wait(1.0)
+            self.wake.clear()
+            with self.lock:
+                wanted, self.wanted = self.wanted, set()
+            for provider in wanted:
+                self._build(provider)
+
+    def _build(self, provider) -> None:
+        log = logging.getLogger(__name__)
+        started = time.monotonic()
+        try:
+            model = self.agents.panel(provider)
+        except Exception:
+            log.exception("agent panel model failed for %s", provider)
+            return
+        spent = time.monotonic() - started
+        if spent > 1.0:
+            log.info("agent panel model for %s took %.1fs", provider, spent)
+        with self.lock:
+            self.models[provider] = (model, time.monotonic())
+
+
 class HoverDetails:
     """Hover a tray icon for its agent panel; it stays while the pointer is on
     it. Without a panel (no `agents`, or a GDI failure) the native tooltip
     shows `text_for(provider)`."""
 
     PANEL_GRACE = 0.45          # Time to travel from the icon to the panel.
+    TRAY_GRACE = 0.12           # On another tray icon: just the Shell's re-layout flicker.
+    NEIGHBOUR_WAIT = 0.8        # Longest wait for another program's card over our spot.
     PANEL_REFRESH = 0.5
     PANEL_RETRY_SECONDS = 2.0
+    OPEN_AGE = 1.5              # newest model a panel may open (or switch) with
+    SLOW_TICK = 1.0             # a hover tick this long is logged
 
     def __init__(self, icons, text_for, stop_event, agents=None):
         self.icons, self.text_for, self.stop_event = icons, text_for, stop_event
         self.agents = agents     # object with panel(provider), merge(a, b), split(key)
+        self.feed = PanelFeed(agents) if agents is not None else None
         self.candidate = None
         self.entered_at = 0.0
         self.panel_seen = 0.0
@@ -624,8 +806,15 @@ class HoverDetails:
             popup.show(self.text_for(provider), anchor)
 
     def target_at(self, point):
+        rects = {key: icon_rect(icon) for key, icon in self.icons.items()}
+        # Two icons never share a slot: identical rectangles mean the Shell is
+        # answering with a container, so none of those icons is under the pointer.
+        found = [rect for rect in rects.values() if rect]
+        shared = {rect for rect in found if found.count(rect) > 1}
         for key, icon in self.icons.items():
-            rect = icon_rect(icon)
+            rect = rects[key]
+            if rect in shared:
+                rect = None
             if getattr(icon, "suppress_hover", False):
                 if not rect or not contains(rect, point.x, point.y):
                     icon.suppress_hover = False
@@ -647,25 +836,41 @@ class HoverDetails:
             # candidate the new icon stopped counting as hovered and the panel
             # closed while the pointer was still on it.
             self.candidate = provider
+        switching = False
         if provider and provider != panel.provider and not panel.scene.dragging:
-            model = self.agents.panel(provider)
-            if model is None:           # e.g. Claude without a subscription: tooltip only
+            found = self.feed.get(provider, now, self.OPEN_AGE)
+            if found is PENDING:        # built in a moment: keep this card meanwhile
+                switching = True
+            elif found[0] is None:      # e.g. Claude without a subscription: tooltip only
                 panel.close(now)
                 return
-            panel.open(provider, model, anchor, now)
-        over = panel.contains(point) or provider == panel.provider
+            else:
+                panel.open(provider, found[0], anchor, now)
+                self.panel_built = found[1]
+        over = panel.contains(point) or provider == panel.provider or switching
+        # Only this program's own icon or its card keeps it open. Elsewhere on
+        # the notification area (LumaCenter's icon, the overflow, the clock) it
+        # closes after TRAY_GRACE, which only rides out the Shell's re-layout
+        # flicker, so the neighbour's card takes over instead of stacking on
+        # this one. Off the tray the pointer may be travelling up to the panel.
         if over or panel.scene.dragging:
             self.panel_seen = now
-        elif now - self.panel_seen > self.PANEL_GRACE or (left or right) and not panel.contains(point, 40):
-            panel.close(now)
-        if (now - self.panel_built >= self.PANEL_REFRESH and panel.closing_at is None
-                and not panel.scene.press and not panel.scene.dragging):
-            model = self.agents.panel(panel.provider)
-            if model is None:
+        else:
+            grace = self.TRAY_GRACE if point and notification_area_at(point) else self.PANEL_GRACE
+            if now - self.panel_seen > grace or (left or right) and not panel.contains(point, 40):
                 panel.close(now)
-                return
-            panel.refresh(model, now)
-            self.panel_built = now
+        if panel.closing_at is None and not panel.scene.press and not panel.scene.dragging:
+            # Never built here: the feed's thread builds, this one only takes
+            # the newest model, so the window keeps pumping its messages.
+            found = self.feed.entry(panel.provider)
+            if found is None or time.monotonic() - found[1] >= self.PANEL_REFRESH:
+                self.feed.request(panel.provider)
+            if found is not None and found[1] > self.panel_built:
+                if found[0] is None:
+                    panel.close(now)
+                    return
+                panel.refresh(found[0], now)
+                self.panel_built = found[1]
         for event in panel.frame(point, left, right, now):
             if event[0] == "settings":
                 panel.hide()
@@ -683,9 +888,7 @@ class HoverDetails:
                 members = self.agents.split(event[1])
                 if members:
                     panel.scene.burst(event[1], members, now)
-            model = self.agents.panel(panel.provider)
-            if model is not None:
-                panel.refresh(model, now)
+            self.feed.request(panel.provider)
 
     FRAME_SECONDS = 1 / 60
 
@@ -736,6 +939,7 @@ class HoverDetails:
         retry_at = 0.0
         try:
             enable_thread_dpi_awareness()
+            disable_ghosting()
             if self.agents is not None:
                 try:
                     panel = AgentPanelWindow()
@@ -745,11 +949,15 @@ class HoverDetails:
             if panel is None:
                 tooltip = TrackingTooltip()
             deadline = time.monotonic()
+            busy_since = None
             while True:
+                if busy_since is not None and time.monotonic() - busy_since > self.SLOW_TICK:
+                    log.info("hover tick took %.1fs", time.monotonic() - busy_since)
                 period = self.FRAME_SECONDS if panel is not None and panel.active else 0.1
                 deadline = max(deadline + period, time.monotonic())
                 if self.pause(max(0.0, deadline - time.monotonic())):
                     break
+                busy_since = time.monotonic()
                 TrackingTooltip.pump()
                 requested = getattr(self.agents, "settings_requested", None)
                 if requested is not None and requested.is_set():
@@ -779,12 +987,18 @@ class HoverDetails:
                     else:
                         if provider != self.candidate:
                             self.candidate, self.entered_at = provider, now
+                            self.feed.request(provider)     # built while the pointer dwells
                         due = provider and now - self.entered_at >= self.dwell(provider)
-                        model = self.agents.panel(provider) if due else None
-                        if model is not None:
-                            panel.open(provider, model, anchor, now)
-                            self.panel_seen = self.panel_built = now
-                        elif due:
+                        # Let a neighbour's card (LumaCenter's) finish closing first,
+                        # as LumaCenter waits for ours; never longer than NEIGHBOUR_WAIT.
+                        if (due and now - self.entered_at < self.NEIGHBOUR_WAIT
+                                and neighbour_card_over(anchor)):
+                            due = False
+                        found = self.feed.get(provider, time.monotonic(), self.OPEN_AGE) if due else PENDING
+                        if found is not PENDING and found[0] is not None:
+                            panel.open(provider, found[0], anchor, now)
+                            self.panel_seen, self.panel_built = now, found[1]
+                        elif found is not PENDING:
                             # Sources without a quota panel keep the native tooltip.
                             tooltip = tooltip or TrackingTooltip()
                             tooltip.show(self.text_for(provider), anchor)
@@ -815,3 +1029,5 @@ class HoverDetails:
                 tooltip.close()
             if panel:
                 panel.destroy()
+            if self.feed is not None:
+                self.feed.stop()

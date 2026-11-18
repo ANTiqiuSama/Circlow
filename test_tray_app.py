@@ -4,7 +4,7 @@ import time
 import unittest
 
 import agent_panel
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import pystray
 from PIL import Image
@@ -361,6 +361,19 @@ class HoverTests(unittest.TestCase):
         with patch("hover_details.user.GetWindow", side_effect=[456, 0]), \
              patch("hover_details.user.IsWindowVisible", return_value=True), \
              patch("hover_details.user.GetWindowLongW", return_value=0x20):
+            self.assertFalse(is_window_covered(123, wintypes.RECT(1120, 800, 1640, 1024)))
+        # A neighbouring tray card (LumaCenter's) stays visible while it fades
+        # out; once it is see-through it must not keep this panel on top.
+        with patch("hover_details.user.GetWindow", side_effect=[456, 0]), \
+             patch("hover_details.user.IsWindowVisible", return_value=True), \
+             patch("hover_details.user.GetWindowLongW", return_value=0x80000), \
+             patch("hover_details.user.GetLayeredWindowAttributes", return_value=True) as layered, \
+             patch("hover_details.dwm") as compositor:
+            def faded(_window, _color, alpha, flags):
+                alpha._obj.value, flags._obj.value = 8, 2
+                return True
+            layered.side_effect = faded
+            compositor.DwmGetWindowAttribute.return_value = 0
             self.assertFalse(is_window_covered(123, wintypes.RECT(1120, 800, 1640, 1024)))
 
     def test_hover_details_include_data_beyond_shell_127_character_limit(self):
@@ -1397,6 +1410,81 @@ class AgentPanelTests(unittest.TestCase):
         hover.drive_panel(panel, point, None, None, False, False, 10.0 + hover.PANEL_GRACE + 0.1)
         panel.close.assert_called_once()
 
+    def _open_panel(self):
+        panel = Mock(provider="codex", closing_at=None)
+        panel.scene.dragging = None
+        panel.scene.press = None
+        panel.contains.return_value = False
+        panel.frame.return_value = []
+        hover = HoverDetails({}, Mock(), threading.Event(), agents=Mock())
+        hover.panel_seen = hover.panel_built = 10.0
+        return panel, hover
+
+    def test_another_tray_icon_hands_over_after_the_short_tray_grace(self):
+        # Pointer on LumaCenter's icon: our card must make way quickly instead
+        # of staying for the travel grace and stacking on LumaCenter's card.
+        panel, hover = self._open_panel()
+        point = wintypes.POINT(1725, 1052)
+        with patch("hover_details.notification_area_at", return_value=True):
+            hover.drive_panel(panel, point, None, None, False, False, 10.0 + hover.TRAY_GRACE - 0.05)
+            panel.close.assert_not_called()
+            hover.drive_panel(panel, point, None, None, False, False, 10.0 + hover.TRAY_GRACE + 0.02)
+        panel.close.assert_called_once()
+
+    def test_travelling_off_the_tray_keeps_the_panel_grace(self):
+        panel, hover = self._open_panel()
+        point = wintypes.POINT(1500, 1000)
+        with patch("hover_details.notification_area_at", return_value=False):
+            hover.drive_panel(panel, point, None, None, False, False, 10.0 + hover.TRAY_GRACE + 0.1)
+            panel.close.assert_not_called()
+            hover.drive_panel(panel, point, None, None, False, False, 10.0 + hover.PANEL_GRACE + 0.05)
+        panel.close.assert_called_once()
+
+    def test_overflow_window_rect_shared_by_every_icon_is_not_a_hit(self):
+        # Measured: with the overflow window open the Shell returned
+        # (1481, 852, 1681, 1040) for every icon, taskbar ones included.
+        icons = {key: Mock(suppress_hover=False, _version4=False) for key in ("codex", "grok")}
+        hover = HoverDetails(icons, Mock(), threading.Event())
+        overflow = (1481, 852, 1681, 1040)
+        with patch("hover_details.icon_rect", return_value=overflow):
+            self.assertEqual(hover.target_at(wintypes.POINT(1546, 871)), (None, None))
+        slots = {id(icons["codex"]): (1617, 1024, 1641, 1080), id(icons["grok"]): (1665, 1024, 1689, 1080)}
+        with patch("hover_details.icon_rect", side_effect=lambda icon: slots[id(icon)]):
+            self.assertEqual(hover.target_at(wintypes.POINT(1629, 1052)), ("codex", (1617, 1024, 1641, 1080)))
+
+    def test_only_a_single_slot_counts_as_an_icon_rect(self):
+        import hover_details
+        with patch("hover_details.monitor_scale", return_value=1.0):
+            self.assertTrue(hover_details.plausible_icon_rect((1617, 1024, 1641, 1080)))   # taskbar slot
+            self.assertTrue(hover_details.plausible_icon_rect((0, 500, 40, 524)))          # vertical taskbar
+            self.assertFalse(hover_details.plausible_icon_rect((1481, 852, 1681, 1040)))  # overflow window
+
+    def test_waits_for_a_neighbours_card_before_opening(self):
+        import hover_details
+        luma = 0x5150
+        def enum(callback, _):
+            callback(luma, 0)
+            return True
+        def pid(window, out):
+            out._obj.value = 1
+            return 1
+        def rect(window, out):
+            r = out._obj
+            r.left, r.top, r.right, r.bottom = 1365, 573, 1785, 1010
+            return True
+        with patch("hover_details.work_area", return_value=(1, (0, 0, 1920, 1024))), \
+             patch("hover_details.monitor_scale", return_value=1.0), \
+             patch("hover_details.user.EnumWindows", side_effect=enum), \
+             patch("hover_details.user.GetWindowLongW", return_value=0x80088), \
+             patch("hover_details.user.IsWindowVisible", return_value=True), \
+             patch("hover_details.user.GetWindowThreadProcessId", side_effect=pid), \
+             patch("hover_details.user.GetClassNameW", return_value=1), \
+             patch("hover_details.user.GetWindowRect", side_effect=rect), \
+             patch("hover_details._see_through", return_value=False) as faded:
+            self.assertTrue(hover_details.neighbour_card_over((1689, 1024, 1713, 1080)))
+            faded.return_value = True       # LumaCenter's card has faded out
+            self.assertFalse(hover_details.neighbour_card_over((1689, 1024, 1713, 1080)))
+
 
 class HoverRecoveryTests(unittest.TestCase):
     def run_hover(self, factory, seconds=3.0):
@@ -1416,6 +1504,7 @@ class HoverRecoveryTests(unittest.TestCase):
         icon = SimpleNamespace(_version4=True, hover_open=True, suppress_hover=False)
         agents = SimpleNamespace(panel=Mock(return_value=object()), settings_requested=threading.Event())
         hover = HoverDetails({'codex': icon}, lambda _: 'temporary tooltip', Stop(), agents)
+        hover.feed.inline = True                # models built on this thread, on the fake clock
         tooltip = Mock()
         with patch('hover_details.enable_thread_dpi_awareness'), \
                 patch('hover_details.AgentPanelWindow', side_effect=factory) as create, \
@@ -1466,6 +1555,80 @@ class HoverRecoveryTests(unittest.TestCase):
         self.assertLessEqual(create.call_count, 3)
         self.assertEqual(tips.call_count, 1)
 
+
+
+class PanelFeedTests(unittest.TestCase):
+    """Panel models are built off the hover thread: a stalled window thread is
+    ghosted by Windows (an opaque frozen copy: a black frame, old data)."""
+
+    def test_a_slow_model_never_blocks_the_caller(self):
+        import hover_details
+        release, model = threading.Event(), object()
+        agents = Mock()
+        agents.panel.side_effect = lambda provider: (release.wait(5), model)[1]
+        feed = hover_details.PanelFeed(agents)
+        started = time.monotonic()
+        self.assertIs(feed.get("codex", started, 1.5), hover_details.PENDING)
+        self.assertLess(time.monotonic() - started, 0.5)
+        release.set()
+        for _ in range(100):
+            found = feed.get("codex", time.monotonic(), 1.5)
+            if found is not hover_details.PENDING:
+                break
+            time.sleep(0.02)
+        self.assertIs(found[0], model)
+        feed.stop()
+
+    def test_an_old_model_does_not_open_the_panel(self):
+        import hover_details
+        feed = hover_details.PanelFeed(Mock(), inline=True)
+        feed.models["codex"] = ("old", time.monotonic() - 60)
+        feed.agents.panel.return_value = "fresh"
+        self.assertIs(feed.get("codex", time.monotonic(), 1.5), hover_details.PENDING)   # a minute old
+        self.assertEqual(feed.get("codex", time.monotonic(), 1.5)[0], "fresh")
+
+    def _hover(self):
+        callers = []
+        agents = Mock()
+        agents.panel.side_effect = lambda provider: (callers.append(threading.get_ident()), f"model {provider}")[1]
+        hover = HoverDetails({}, Mock(), threading.Event(), agents=agents)
+        panel = Mock(provider="codex", closing_at=None)
+        panel.scene = SimpleNamespace(dragging=None, press=None)
+        panel.contains.return_value = False
+        panel.frame.return_value = []
+        return hover, panel, callers
+
+    def test_the_hover_thread_only_takes_finished_models(self):
+        hover, panel, callers = self._hover()
+        now = time.monotonic()
+        hover.panel_seen = now
+        with patch("hover_details.notification_area_at", return_value=False):
+            hover.drive_panel(panel, wintypes.POINT(5, 5), "codex", (0, 0, 24, 24), False, False, now)
+            for _ in range(100):
+                if hover.feed.entry("codex"):
+                    break
+                time.sleep(0.02)
+            hover.drive_panel(panel, wintypes.POINT(5, 5), "codex", (0, 0, 24, 24), False, False, time.monotonic())
+        panel.refresh.assert_called_with("model codex", ANY)
+        self.assertTrue(callers)
+        self.assertNotIn(threading.get_ident(), callers)
+        hover.feed.stop()
+
+    def test_switching_icons_keeps_the_card_while_the_new_model_is_built(self):
+        hover, panel, _ = self._hover()
+        hover.feed.request = Mock()             # never finishes
+        hover.panel_seen = 10.0
+        with patch("hover_details.notification_area_at", return_value=True):
+            hover.drive_panel(panel, wintypes.POINT(5, 5), "grok", (0, 0, 24, 24), False, False,
+                              10.0 + hover.TRAY_GRACE + 0.1)
+        panel.close.assert_not_called()
+        panel.open.assert_not_called()
+
+    def test_ghosting_is_disabled_for_the_process(self):
+        import hover_details
+        with patch("hover_details.user.DisableProcessWindowsGhosting", create=True) as off:
+            self.assertTrue(hover_details.disable_ghosting())
+        off.assert_called_once_with()
 
 
 class PanelPacingTests(unittest.TestCase):
