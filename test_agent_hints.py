@@ -125,6 +125,28 @@ class AdvisorTests(unittest.TestCase):
             self.assertIn(wanted, agent_hints.SYSTEM_PROMPT)
 
 
+class BackgroundTests(unittest.TestCase):
+    def test_the_scan_loop_prepares_the_hint_before_any_hover(self):
+        import tray_app
+        tray = tray_app.QuotaTray.__new__(tray_app.QuotaTray)
+        asked = []
+
+        def opener(request, timeout):
+            asked.append(1)
+            return reply('{"kind":"idea","session":"s1","text":"结论只提升 0.84%，先证明不是随机种子波动"}')(request, timeout)
+
+        tray.hint_advisor = agent_hints.HintAdvisor({"url": URL, "key": "SECRET", "model": "m"}, opener)
+        tray.tps_monitor = SimpleNamespace(recent_work=[session("a", "working", 0, provider="codex")])
+        tray.refresh_hint()                                                 # what tps_loop does after each scan
+        settle(tray.hint_advisor)
+        self.assertEqual(len(asked), 1)
+        data = agent_hints.context(tray.tps_monitor.recent_work)
+        self.assertTrue(tray.hint_advisor.lookup(data))                     # the hover finds it ready
+        self.assertEqual(len(asked), 1)                                     # and asks nothing more
+        tray.hint_advisor = None
+        tray.refresh_hint()                                                 # no MiMo configured: nothing happens
+
+
 class WaitingTests(unittest.TestCase):
     """Who waits for the user, read locally, and how it reaches the bubbles."""
 
