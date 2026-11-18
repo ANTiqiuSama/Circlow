@@ -513,7 +513,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         running = [data["display_model"]] if data.get("display_tps") is not None and data.get("display_model") else []
         intel, intel_note = self.panel_intel(now, running)
         forecast, forecast_tone = self.headline_forecast(provider)
-        hint_data = agent_hints.context(agents, self.performance.get("software", []))
+        hint_data = agent_hints.context(getattr(getattr(self, "tps_monitor", None), "recent_work", None) or [])
         advisor = getattr(self, "hint_advisor", None)
         hint_now, hint_next = advisor.lookup(hint_data, getattr(self, "tps_monitor", None)) if advisor is not None else agent_hints.local_hint(hint_data)
         today_used = None
