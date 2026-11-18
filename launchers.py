@@ -7,7 +7,10 @@ tried on this machine, and each front end only knows how to carry out a way
 """
 from __future__ import annotations
 
+import logging
+import subprocess
 import sys
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,6 +69,20 @@ def ways(provider: str, platform: str = sys.platform) -> list[Way]:
         return out
     out.append(Way(kind, resolve() if kind in ("url", "aumid") else resolve))
     return out
+
+
+def open_mac(way: Way, run=subprocess.run, browse=webbrowser.open) -> bool:
+    """Carry out a macOS desktop-app or web-page way; False when it failed
+    or is of another kind (herdr, CLI: the caller's to handle)."""
+    if way.kind == "url":
+        browse(str(way.target))
+        return True
+    if way.kind == "mac-app":
+        opened = run(["open", "-b", way.target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        if opened.returncode != 0:
+            logging.getLogger("Circlow").warning("could not open %s (%s)", way.target, opened.returncode)
+        return opened.returncode == 0
+    return False
 
 
 def open_app_windows(aumid: str) -> int:

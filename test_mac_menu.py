@@ -243,3 +243,70 @@ if sys.stdin.readline().strip() == '/usage':
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the macOS fallbacks")
+class BubbleOpenMacTests(unittest.TestCase):
+    """A click on a task bubble with no direct link to its session (no herdr
+    pane, no codex:// or claude:// link): as on Windows, never a new agent."""
+
+    def tray(self, provider):
+        import tray_app
+        from types import SimpleNamespace
+        tray = tray_app.QuotaTray.__new__(tray_app.QuotaTray)
+        tray.clusters = {"k": SimpleNamespace(members=[{"key": "s1", "provider": provider, "waiting": "asked", "at": 1}])}
+        return tray, tray_app
+
+    def test_claude_and_grok_only_bring_herdr_forward(self):
+        tray, tray_app = self.tray("claude")
+        with patch.object(tray_app.session_links, "open_session", return_value=None), \
+                patch.object(tray_app.herdr_source, "raise_client") as raised, \
+                patch.object(tray_app.launchers, "open_mac") as opened, \
+                patch.dict(tray_app.PROVIDERS, {"claude": "A"}):
+            tray.open_session("k")
+        raised.assert_called_once()
+        opened.assert_not_called()
+
+    def test_codex_opens_its_desktop_app(self):
+        tray, tray_app = self.tray("codex")
+        with patch.object(tray_app.session_links, "open_session", return_value=None), \
+                patch.object(tray_app.herdr_source, "raise_client") as raised, \
+                patch.object(tray_app.launchers, "open_mac") as opened, \
+                patch.dict(tray_app.PROVIDERS, {"codex": "C"}):
+            tray.open_session("k")
+        raised.assert_not_called()
+        self.assertEqual(opened.call_args[0][0].target, "com.openai.codex")
+
+    def test_a_direct_link_needs_no_fallback(self):
+        tray, tray_app = self.tray("codex")
+        with patch.object(tray_app.session_links, "open_session", return_value="url"), \
+                patch.object(tray_app.launchers, "open_mac") as opened:
+            tray.open_session("k")
+        opened.assert_not_called()
+
+
+class OpenMacTests(unittest.TestCase):
+    def test_ways_are_carried_out_or_left_to_the_caller(self):
+        import launchers
+        run = Mock(return_value=Mock(returncode=0))
+        browse = Mock()
+        self.assertTrue(launchers.open_mac(launchers.Way("mac-app", "com.openai.codex"), run, browse))
+        self.assertEqual(run.call_args[0][0], ["open", "-b", "com.openai.codex"])
+        self.assertTrue(launchers.open_mac(launchers.Way("url", "https://example.com"), run, browse))
+        browse.assert_called_once_with("https://example.com")
+        run.return_value = Mock(returncode=1)
+        self.assertFalse(launchers.open_mac(launchers.Way("mac-app", "com.missing.app"), run, browse))
+        self.assertFalse(launchers.open_mac(launchers.Way("herdr", "claude"), run, browse))
+
+
+@unittest.skipUnless(sys.platform != "win32", "POSIX file modes")
+class SummaryFileModeTests(unittest.TestCase):
+    def test_the_model_config_is_readable_by_this_user_only(self):
+        import os
+        import agent_tasks
+        import settings_window
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(agent_tasks, "SUMMARY_CONFIG", Path(folder) / "agent_summary.json"):
+            settings_window.save_summary({"url": "https://token-plan-cn.xiaomimimo.com/v1", "key": "test-only-key",
+                                          "model": "mimo-v2.6-flash"}, True)
+            self.assertEqual(os.stat(agent_tasks.SUMMARY_CONFIG).st_mode & 0o777, 0o600)

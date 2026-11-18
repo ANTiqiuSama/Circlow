@@ -89,6 +89,8 @@ def save_summary(config: dict, enabled: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps({**values, "enabled": enabled}, ensure_ascii=False, indent=2), encoding="utf-8")
+    if os.name == "posix":
+        os.chmod(temporary, 0o600)          # it holds the API key: readable by this user only
     os.replace(temporary, path)
 
 

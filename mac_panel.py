@@ -282,6 +282,7 @@ class MacPanel:
     panel's settings gear and right-click."""
 
     PANEL_REFRESH = 0.5
+    SLOW_BUILD = 0.25            # seconds; a build this slow is logged (about 0.3 ms is usual)
     RETRY_SECONDS = 2.0
     FRAME_SECONDS = 1 / 60
     MOUSE_DOWN = (1 << 1) | (1 << 3) | (1 << 25)     # NSEventMask: left, right and other mouse down
@@ -453,7 +454,12 @@ class MacPanel:
     def drive(self, window: PanelWindow, point, left, right, now):
         if (now - self.panel_built >= self.PANEL_REFRESH
                 and not window.scene.press and not window.scene.dragging):
+            started = time.monotonic()
             model = self.tray.panel(window.provider)
+            took = time.monotonic() - started
+            if took >= self.SLOW_BUILD:
+                # Built on the main thread: a slow build stalls the panel and the menu bar.
+                log.warning("slow panel build for %s: %.2f s", window.provider, took)
             if model is None:
                 self.close("the source has no panel now")
                 return

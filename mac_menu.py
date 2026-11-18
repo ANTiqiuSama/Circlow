@@ -196,13 +196,9 @@ def open_source(key: str, state, popen=subprocess.Popen, run=subprocess.run) -> 
     desktop clients; Grok starts in a new Herdr workspace (Herdr in Ghostty).
     Returns the kind that was used, None when nothing could be opened."""
     for way in launchers.ways(key, "darwin"):
-        if way.kind == "url":
-            webbrowser.open(str(way.target))
-        elif way.kind == "mac-app":
-            opened = run(["open", "-b", way.target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-            if opened.returncode != 0:
-                log.warning("could not open %s (%s); trying the next way", way.target, opened.returncode)
-                continue
+        if way.kind in ("url", "mac-app"):
+            if not launchers.open_mac(way, run, webbrowser.open):
+                continue                     # e.g. the app is gone: try the next way
         elif way.kind == "herdr":
             state.open_in_herdr(key)
         elif not open_cli(key, popen):

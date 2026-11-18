@@ -554,11 +554,13 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         provider = str(member.get("provider") or "")
         way = session_links.open_session(member)
         log.info("bubble opened %s session via %s", provider, way or "its launcher")
-        if way is not None or sys.platform != "win32":
+        if way is not None or sys.platform not in ("win32", "darwin"):
             return
         first = next(iter(launchers.ways(provider)), None) if provider in PROVIDERS else None
         if provider in launchers.HERDR_AGENTS or first is None or first.kind in ("herdr", "cli"):
             herdr_source.raise_client()
+        elif sys.platform == "darwin":
+            launchers.open_mac(first)          # its desktop app or page, as its menu bar icon does
         else:
             self.open_provider(provider)
 
