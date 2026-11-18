@@ -3,6 +3,7 @@ import json
 import os
 import math
 import sqlite3
+import sys
 from contextlib import closing
 import tempfile
 import time
@@ -15,6 +16,8 @@ import agent_tasks
 import icon_art
 from agent_tasks import AgentGroups, AgentNotes, Cluster, Summarizer, clean, describe, tool_action
 from tps_sources import TpsMonitor
+
+WINDOWS_ONLY = unittest.skipUnless(sys.platform == "win32", "Windows tray and Win32 APIs; the Mac menu has its own launcher")
 
 
 def agent(key, provider="codex", live=True, title="", parent="", doing="", at=100.0):
@@ -868,11 +871,19 @@ class HerdrAndHelperTests(unittest.TestCase):
             return done(0, '{"result":{"type":"agent_started"}}')
 
         with patch.dict(os.environ, {"CIRCLOW_HERDR_SESSION": ""}), \
-                patch.object(herdr_source.shutil, "which", return_value=r"C:\WindowsApps\wt.exe"):
+                patch.object(herdr_source.shutil, "which", return_value=r"C:\WindowsApps\wt.exe"), \
+                patch.object(herdr_source, "ghostty_app", return_value="/Applications/Ghostty.app"):
             name = herdr_source.start_agent("grok", exe="herdr.exe", runner=run, popen=lambda *a, **k: opened.append(a[0]),
                                             window_open=lambda: False, sleep=lambda _s: None, cwd=r"C:\home")
         self.assertEqual(name, "grok-3")
-        self.assertEqual(opened, [[r"C:\WindowsApps\wt.exe", "-w", "new", "-d", str(Path.home()), "--title", "herdr", "herdr.exe"]])
+        home = str(Path.home())
+        if sys.platform == "darwin":                     # a new Ghostty window
+            window = ["open", "-na", "/Applications/Ghostty.app", "--args", f"--working-directory={home}", "-e", "herdr.exe"]
+        elif os.name == "nt":                            # a new Windows Terminal window
+            window = [r"C:\WindowsApps\wt.exe", "-w", "new", "-d", home, "--title", "herdr", "herdr.exe"]
+        else:
+            window = ["herdr.exe"]
+        self.assertEqual(opened, [window])
         self.assertIn(["workspace", "create", "--label", "grok", "--cwd", r"C:\home", "--focus"], calls)
         self.assertFalse(any(request[:2] == ["tab", "create"] for request in calls))   # a workspace, never a tab
         starts = [request for request in calls if request[:2] == ["agent", "start"]]
@@ -905,6 +916,10 @@ class HerdrAndHelperTests(unittest.TestCase):
         with self.assertRaises(herdr_source.AgentSlow):
             herdr_source.start_agent("grok", exe="herdr.exe", runner=slow, popen=lambda *a, **k: None,
                                      window_open=lambda: True, sleep=lambda _s: None)
+
+    @WINDOWS_ONLY
+    def test_a_slow_herdr_start_shows_no_error_box(self):
+        import herdr_source
         import tray_app
         tray = tray_app.QuotaTray.__new__(tray_app.QuotaTray)
         with patch.object(herdr_source, "start_agent", side_effect=herdr_source.AgentSlow("slow")),                 patch.object(tray_app.ctypes.windll.user32, "MessageBoxW") as box:
@@ -933,6 +948,7 @@ class HerdrAndHelperTests(unittest.TestCase):
             self.assertEqual(herdr_source.client_window(processes, windows), 81)
             self.assertIsNone(herdr_source.client_window(processes[:1], windows))     # no client open
 
+    @WINDOWS_ONLY
     def test_claude_and_grok_clicks_open_herdr_once_until_started(self):
         import herdr_source
         import tray_app
@@ -951,6 +967,23 @@ class HerdrAndHelperTests(unittest.TestCase):
             tray.open_in_herdr("claude")
         self.assertNotIn("claude", tray.herdr_opening)                                # finished: clicks work again
 
+    def test_each_system_lists_its_ways_to_open_a_source(self):
+        import herdr_source
+        import launchers
+        import providers
+        with patch.object(providers, "claude_desktop_aumid", return_value="Claude_pzs8sxrjxfjjc!Claude"), \
+                patch.object(herdr_source, "find_exe", return_value="herdr.exe"):
+            self.assertEqual([(w.kind, w.fallback) for w in launchers.ways("claude", "win32")],
+                             [("aumid", True), ("herdr", False), ("cli", False)])
+            self.assertEqual([w.kind for w in launchers.ways("grok", "win32")], ["herdr", "cli"])
+            self.assertEqual([w.kind for w in launchers.ways("codex", "win32")], ["aumid"])
+            self.assertEqual([(w.kind, w.target) for w in launchers.ways("mimo", "darwin")],
+                             [("url", "https://platform.xiaomimimo.com/console/plan-manage")])
+            self.assertEqual([w.kind for w in launchers.ways("gemini", "darwin")], ["mac-app"])
+        with patch.dict(os.environ, {"CIRCLOW_CLAUDE_APP": "X_y!Claude"}):
+            self.assertEqual(providers.claude_desktop_aumid(), "X_y!Claude")
+
+    @WINDOWS_ONLY
     def test_the_claude_icon_opens_the_claude_app_when_it_is_installed(self):
         import herdr_source
         import tray_app
@@ -960,14 +993,6 @@ class HerdrAndHelperTests(unittest.TestCase):
                 patch.object(herdr_source, "find_exe", return_value="herdr.exe"), \
                 patch.object(herdr_source, "raise_client") as raise_client, \
                 patch("ctypes.windll.shell32.ShellExecuteW", shell):
-            import launchers
-            self.assertEqual([(w.kind, w.fallback) for w in launchers.ways("claude", "win32")],
-                             [("aumid", True), ("herdr", False), ("cli", False)])
-            self.assertEqual([w.kind for w in launchers.ways("grok", "win32")], ["herdr", "cli"])
-            self.assertEqual([w.kind for w in launchers.ways("codex", "win32")], ["aumid"])
-            self.assertEqual([(w.kind, w.target) for w in launchers.ways("mimo", "darwin")],
-                             [("url", "https://platform.xiaomimimo.com/console/plan-manage")])
-            self.assertEqual([w.kind for w in launchers.ways("gemini", "darwin")], ["mac-app"])
             tray.open_provider("claude")
             self.assertEqual(shell.call_args.args[2], "shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude")
             raise_client.assert_not_called()                                   # no Herdr workspace started
@@ -976,9 +1001,6 @@ class HerdrAndHelperTests(unittest.TestCase):
                 thread.return_value = Mock()
                 tray.open_provider("claude")
             raise_client.assert_called_once()                                  # ...so Claude Code in Herdr instead
-        import os
-        with patch.dict(os.environ, {"CIRCLOW_CLAUDE_APP": "X_y!Claude"}):
-            self.assertEqual(tray_app.provider_registry.claude_desktop_aumid(), "X_y!Claude")
 
     @staticmethod
     def agent(key, **extra):
@@ -1046,6 +1068,7 @@ class HerdrAndHelperTests(unittest.TestCase):
         herdr.attach(native, 101.0)
         self.assertEqual(1, len(calls))                                      # rate limited
 
+    @WINDOWS_ONLY
     def test_discovered_herdr_is_called_by_its_on_disk_name(self):
         # shutil.which spells the PATHEXT extension in upper case ("herdr.EXE");
         # Herdr's managed launcher only runs when invoked as bin/herdr.exe.

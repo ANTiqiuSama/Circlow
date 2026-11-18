@@ -6,6 +6,12 @@ import unittest
 import agent_panel
 from unittest.mock import ANY, Mock, call, patch
 
+import sys
+if sys.platform != "win32":
+    # The Windows tray: pystray icons and Win32 hover windows. The Mac
+    # menu bar is covered by test_mac_menu and test_mac_panel.
+    raise unittest.SkipTest("Windows tray (pystray, Win32 hover windows)")
+
 import pystray
 from PIL import Image
 

@@ -404,8 +404,38 @@ def _numeral_face(text: str, draw):
 
 
 def _unit_face(draw):
-    """Corner unit at the hour letter's size, so m and d are not width-shrunk."""
+    """Corner unit at the hour letter's size; m and d start from it too."""
     return _fit("h", number_font, 96, 96, 132, draw)
+
+
+# m and d end UNIT_EDGE from the left, whole on the icon (they used to be
+# pushed past its right edge and lost their last stroke). Each may take at
+# most this much ink width and sits this far above h's centre, so the
+# wider m and d's lower bowl stay clear of the digits.
+UNIT_EDGE = CANVAS - 4
+UNIT_ROOM = {"m": (84, -16), "d": (60, -10)}
+
+
+def _ink_box(text: str, face) -> tuple[int, int, int, int]:
+    """Where text drawn at (0, 0) puts ink. textbbox ends at the advance,
+    which is not where the glyph's last stroke ends."""
+    pad = CANVAS
+    layer = Image.new("L", (pad * 3, pad * 3), 0)
+    ImageDraw.Draw(layer).text((pad, pad), text, font=face, fill=255)
+    left, top, right, bottom = layer.getbbox()
+    return left - pad, top - pad, right - pad, bottom - pad
+
+
+def _unit_glyph(unit: str, draw):
+    """(face, ink box) of m or d: h's size, smaller only as far as it must
+    be to fit its width in UNIT_ROOM."""
+    face = _unit_face(draw)
+    box = _ink_box(unit, face)
+    width = UNIT_ROOM[unit][0]
+    while box[2] - box[0] > width and face.size > 24:
+        face = number_font(face.size - 2)
+        box = _ink_box(unit, face)
+    return face, box
 
 
 def _on_digit(pixel) -> bool:
@@ -417,17 +447,18 @@ def _on_digit(pixel) -> bool:
 def _draw_unit(canvas: Image.Image, unit: str) -> None:
     """Top-right unit. h is the reference corner.
 
-    m is wider and d's bowl sits lower, so both shift further right and m
-    sits a little higher. Pixels that would paint over a red digit stay red.
+    m and d end at UNIT_EDGE, whole, a little higher than h and no wider
+    than UNIT_ROOM allows. Pixels that would paint over a red digit stay red.
     """
     draw = ImageDraw.Draw(canvas)
-    face = _unit_face(draw)
-    _left, top, right, bottom = draw.textbbox((0, 0), unit, font=face)
-    nudge_x, nudge_y = {"d": (24, 0), "m": (24, -12)}.get(unit, (0, 0))
-    origin = ((CANVAS - 6) - right + nudge_x, 50 - (top + bottom) / 2 + nudge_y)
     if unit == "h":
-        draw.text(origin, unit, font=face, fill=_ink(IVORY))
+        face = _unit_face(draw)
+        _left, top, right, bottom = draw.textbbox((0, 0), unit, font=face)
+        draw.text(((CANVAS - 6) - right, 50 - (top + bottom) / 2), unit, font=face, fill=_ink(IVORY))
         return
+    face, (_left, top, right, bottom) = _unit_glyph(unit, draw)
+    above = max(CANVAS - UNIT_EDGE - top, 50 + UNIT_ROOM[unit][1] - (top + bottom) / 2)   # never cut at the top
+    origin = (UNIT_EDGE - right, above)
     layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     ImageDraw.Draw(layer).text(origin, unit, font=face, fill=_ink(IVORY))
     src = layer.load()
