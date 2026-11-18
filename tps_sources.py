@@ -227,6 +227,7 @@ class TpsMonitor:
         self.codex_root = self.home / ".codex" if home else Path(os.environ.get("CODEX_HOME", self.home / ".codex"))
         self.grok_root = self.home / ".grok" if home else Path(os.environ.get("GROK_HOME", self.home / ".grok"))
         self.claude_root = self.home / ".claude" if home else providers.claude_home()
+        self.recent_work: list[dict[str, Any]] = []     # agent_tasks.AgentNotes.work, for the hover hint
         self.claude_pending: dict[str, dict[str, Any]] = {}
         self.claude_last_input: dict[str, float] = {}   # session -> last user / tool-result record
         self.claude_request_starts: dict[tuple[str, str], float] = {}
@@ -1198,6 +1199,11 @@ class TpsMonitor:
         except Exception:      # an optional extra must never hide the native agents
             log.debug("herdr attach failed", exc_info=True)
         self.health["herdr"] = {"status": self.herdr.status, "panes": len(self.herdr.rows)}
+        try:
+            # Built here, on the thread that feeds the notes; the hover hint reads this snapshot.
+            self.recent_work = self.notes.work(agents, self.context, now, provider_for)
+        except Exception:
+            log.debug("hint material failed", exc_info=True)
         return agents
 
     def snapshot(self, now: float) -> dict[str, Any]:

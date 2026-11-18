@@ -1,266 +1,226 @@
-"""Short, optional MiMo advice for the hover panel.
+"""The hover panel's one-line hint: what deserves the user's attention now.
 
-Only compact agent labels/actions, sampled history topics and detected AI
-client names leave the machine. No usage figures, transcripts, paths, cookies or credentials
-are placed in the prompt. Results stay in memory and refresh at a bounded pace.
+In order: a session waiting for the user (an approval, a question, a failure,
+finished work to look at), a working session that is stuck or drifting, and
+only then one concrete idea about a project's own content. Nothing at all
+when none of that holds.
+
+Who is waiting is read locally (herdr pane states, how each turn ended), so
+that line needs no model and is never invented. MiMo reads the sessions of
+the last WORK_SECONDS in full (the user's requests, the agent's last message,
+its steps and failures) and picks the one thing worth saying; it may answer
+"none". Secrets and e-mail addresses are removed before anything is sent;
+quota and usage figures never are.
 """
 from __future__ import annotations
 
 import json
 import logging
-import random
+import os
 import re
-import sqlite3
 import threading
 import time
 import urllib.request
-from contextlib import closing
-from pathlib import Path
 
 import agent_tasks
 
 log = logging.getLogger(__name__)
-MIN_REQUEST_GAP = 120
-RESULT_SECONDS = 600        # an idea stays this long before a new one is asked for
-KEEP_SECONDS = 3600         # while a new one is on its way, the last idea stays up to this old
+MIN_REQUEST_GAP = 90        # seconds between two MiMo requests
+REFRESH_SECONDS = 600       # while something works, look again this often even if nothing changed
+STALE_SECONDS = 1800        # a MiMo line is never shown older than this
 FAILURE_GAP = 300
+DONE_MINUTES = 20           # finished work counts as waiting for the user this long
+MAX_SESSIONS = 5
+HINT_MODEL = "mimo-v2.6-pro"
+TIMEOUT = 90
+
+NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "gemini": "Gemini", "mimo": "MiMo"}
+WAITING = {"blocked": "等你批准", "asked": "在问你", "failed": "出错停下", "done": "做完了，等你看"}
+KIND_MARK = {"stuck": "留意"}
 
 SYSTEM_PROMPT = (
-    "你是一位懂行的资深同事，看着一个人用多个 AI agent 工作，偶尔说一句有分量的话。"
-    "材料：tasks 是正在进行的任务；past_topics 是过去一个月的话题抽样，横跨好几个互不相干的领域，只用来了解背景。"
-    "先选定一件事：有 tasks 就选其中一个任务所属的项目，没有就选 past_topics 里出现最集中的一个主题。"
-    "tasks 的标题往往只是用户刚对 agent 说的一句话：不要复述或点评这句话本身，"
-    "要看出它属于哪个项目（可结合 past_topics 里的同类话题），对那个项目整体说话。"
-    "只围绕这一件事，给一条宏观、有启发的方向性建议：这件事真正的价值在哪、往哪个方向深挖最值、"
-    "有什么被忽略的关键问题，或者怎样让它的成果更有用。"
-    "必须像真正懂这个领域的人会说的话，自然、可信，读的人会点头。"
-    "严禁把不同领域的话题拼在一起：工具、编程环境、研究课题、作业、生活琐事彼此无关，"
-    "不要把一个项目的东西套到另一个项目上，也不要为了新奇硬造联系。"
-    "只输出 JSON：{\"idea\":\"一句建议，16 到 36 字\"}。"
-    "也不要：收尾、准备、整理、梳理、休息、节奏、专注、先做完再开新线、查看结果这类工作习惯提醒；"
-    "具体的操作或改动（某个文件、函数、命令、测试、修复，或“去改/加/检查某某”）；"
-    "用量、token、占比、消耗、额度、限额或剩余多少；与过去的比较。用中文，不要套话。"
+    "你坐在一个人旁边，他同时开着好几个 AI agent（编程、科研、文档），你只能在他的面板上写一行字。"
+    "材料 sessions 是最近 45 分钟内他用过的每个会话：state（working 正在跑；blocked 等他批准；asked 停下来在问他；"
+    "failed 出错或被中断；done 做完了），他提的要求（first 是最初的要求，asks 是最近几条），agent 最后对他说的话（reply），"
+    "最近的动作（steps），本轮的报错（errors，older_errors 是更早的报错条数），minutes 是距今分钟数。"
+    "按优先级只挑一件最值得他现在知道的事："
+    "1. wait：有会话在等他。blocked/asked 最优先，其次 failed，再其次刚 done 且 reply 里有要他决定、验收或补充的东西。"
+    "用一句话说清它要他做什么或决定什么（例如“问你要不要覆盖旧实验结果”“要你批准删除临时目录”“测试没过，等你决定是否回退”）。"
+    "2. stuck：正在跑的会话卡住或跑偏：同类报错反复出现、反复改同一处没有进展、做的事偏离了他的要求、要做有风险或不可逆的操作。"
+    "说清卡在哪，以及该换的方向。"
+    "3. idea：针对某个会话所做事情的内容本身，一条具体、有依据、懂行的建议：实验设计或结论证据的漏洞、被忽略的关键情况、"
+    "明显更好的方法。必须引用材料里的具体内容，读的人能立刻判断对不对。"
+    "没有真正值得说的就输出 none，宁缺毋滥。"
+    "他已经用 herdr 让多个 agent 互相同步和交接，也已经有可复用的文档和记忆："
+    "绝不要谈多 agent 的分配、协作、同步、交接，也不要谈沉淀、复用、知识库、文档规范或工作习惯（收尾、休息、专注、节奏）。"
+    "不要谈额度、token、用量或花费。不要编造材料里没有的事实，不确定就输出 none。"
+    "只输出 JSON：{\"kind\":\"wait|stuck|idea|none\",\"session\":\"会话 id\",\"name\":\"会话简称\",\"text\":\"给他看的一句话\"}。"
+    "name 是这个会话在做的事的简称，4 到 10 个字，让他一眼认出是哪件事（例如“VANE 论文故事”“Lumen 屏幕图标”），"
+    "不要用他原话的开头。text 用中文，12 到 30 个字，直接说事，不要重复 name，不要写分钟数（面板会自己加上）。"
 )
-FILLER = re.compile(r"收尾|准备|整理|梳理|休息|节奏|专注|新线|查看.{0,4}结果|稳一点|更稳|一步一步|循序渐进")
+# Advice about the user's way of working, which herdr and his notes already cover.
+META = re.compile(r"多\s*agent|多个\s*agent|分配|协作|同步|交接|沉淀|复用|可复用|知识库|规范|herdr|"
+                  r"收尾|休息|节奏|专注|梳理|整理一下|循序渐进|一步一步")
 USAGE_ADVICE = re.compile(
-    r"用量|占比|消耗|使用高峰|(?:今天|今日|本日|累计|总计)输出|输出(?:量|总量)|"
-    r"\d+(?:\.\d+)?\s*[%％]|\b\d+(?:\.\d+)?\s*[KMB]?\s*(?:tokens?|tok/s)\b", re.I)
+    r"用量|占比|消耗|额度|限额|使用高峰|(?:今天|今日|本日|累计|总计)输出|输出(?:量|总量)|"
+    r"剩余?\s*\d+(?:\.\d+)?\s*[%％]|\b\d+(?:\.\d+)?\s*[KMB]?\s*(?:tokens?|tok/s)\b", re.I)
+SECRET = re.compile(r"(?i)\b(?:api[_ -]?key|token|secret|password|passwd)\s*[:=]\s*\S+|\b(?:sk-|tp-|ghp_|gho_)[\w-]{12,}\b|"
+                    r"\b[A-Za-z0-9_+/]{40,}={0,2}")
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 
-def _label(value: object, length: int = 48) -> str:
-    text = re.sub(r"https?://\S+|(?:[A-Za-z]:)?(?:[\\/][\w.\-~ ]+)+", "", str(value or ""))
-    text = re.sub(r"[\w.+-]+@[\w.-]+|\b(?:\+?\d[\d -]{9,}\d)\b", "", text)
-    text = re.sub(r"(?i)\b(?:api[_ -]?key|token|secret)\s*[:=]\s*\S+|\b(?:sk-|tp-)[\w-]{12,}\b|\b[A-Za-z0-9_+/]{32,}\b", "[隐藏]", text)
-    return agent_tasks.shorten(re.sub(r"\s+", " ", text).strip(), length)
+def _scrub(value: object, length: int) -> str:
+    text = EMAIL.sub("[邮箱]", SECRET.sub("[隐藏]", str(value or "")))
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    return text if len(text) <= length else text[:length] + "…"
 
 
-def context(agents: list[dict], software: list[dict]) -> dict:
-    """Task labels and running clients, without usage statistics or quota."""
-    active = [agent for agent in agents if agent.get("live") and not agent.get("schedule")]
-    tasks = [{"provider": str(agent.get("provider") or ""),
-              "title": _label(agent.get("title") or agent.get("thread_title")),
-              "doing": _label(agent.get("doing"), 32)} for agent in active]
-    tasks = sorted(tasks, key=lambda item: (item["provider"], item["title"], item["doing"]))[:5]
-    clients = sorted({str(row.get("name")) for row in software if row.get("name") and row.get("processes", 0) > 0})[:8]
-    return {"tasks": tasks, "detected_clients": clients}
+def who(session: dict) -> str:
+    """"Claude·空气质量文献调研": the source and a short name for the session."""
+    name = agent_tasks.clean(str(session.get("title") or "")) or str(session.get("project") or "")
+    label = NAMES.get(str(session.get("provider") or ""), str(session.get("provider") or "agent").title())
+    return f"{label}·{agent_tasks.shorten(name, 9)}" if name else label
+
+
+def context(work: list[dict], software: list[dict] | None = None) -> dict:
+    """The sessions the hint looks at, from TpsMonitor.recent_work. Each gets
+    a short id ("s1") for MiMo to answer with."""
+    sessions = []
+    for index, item in enumerate(list(work or [])[:MAX_SESSIONS], 1):
+        sessions.append({
+            "id": f"s{index}", "key": item.get("key"), "provider": item.get("provider"), "who": who(item),
+            "state": item.get("state"), "project": item.get("project") or "", "title": _scrub(item.get("title"), 80),
+            "minutes": item.get("minutes"), "running_minutes": item.get("running_minutes"),
+            "first": _scrub(item.get("first"), 600),
+            "asks": [_scrub(text, 500) for text in item.get("asks") or []][-3:],
+            "reply": _scrub(item.get("reply"), 1400),
+            "steps": [_scrub(step, 80) for step in item.get("steps") or []][-8:],
+            "errors": [_scrub(text, 300) for text in item.get("errors") or []][-3:],
+            "older_errors": item.get("older_errors") or 0,
+        })
+    return {"sessions": sessions, "time": time.strftime("%H:%M")}
+
+
+def waiting(data: dict, finished: bool = True) -> dict | None:
+    """The session most clearly waiting for the user, read locally; with
+    `finished` False, only one that cannot go on without him."""
+    for session in data.get("sessions") or []:
+        state, minutes = session.get("state"), session.get("minutes")
+        if state in ("blocked", "asked", "failed") or (
+                finished and state == "done" and minutes is not None and minutes <= DONE_MINUTES):
+            return session
+    return None
+
+
+def _minutes(session: dict) -> str:
+    minutes = session.get("minutes")
+    return "" if minutes is None else " · 刚刚" if minutes < 1 else f" · {minutes} 分钟"
+
+
+def label(session: dict, names: dict | None = None) -> str:
+    name = (names or {}).get(session.get("key"))
+    return f"{NAMES.get(str(session.get('provider')), 'Agent')}·{name}" if name else session["who"]
+
+
+def local_line(data: dict, names: dict | None = None, finished: bool = True) -> str:
+    session = waiting(data, finished)
+    if session is None:
+        return ""
+    return f"{label(session, names)} {WAITING[session['state']]}{_minutes(session)}"
 
 
 def local_hint(data: dict) -> tuple[str, str]:
-    """Without MiMo there is no idea to show: the panel leaves the line empty
-    rather than fill it with stock advice ("收尾后再开新线"). The first field
-    is kept for callers and is always empty too: the bubbles above already
-    show what is going on."""
-    return "", ""
+    """Without MiMo: only who is waiting (or nothing). The first field is
+    kept for callers and is always empty."""
+    return "", local_line(data)
 
 
 def _signature(data: dict) -> str:
-    # Tool actions change every few seconds. Keep one suggestion per set of tasks,
-    # then ask MiMo again after
-    # its short cache expires.
-    stable = {"tasks": [{"provider": task["provider"], "title": task["title"]} for task in data["tasks"]],
-              "detected_clients": data.get("detected_clients", [])}
-    return json.dumps(stable, ensure_ascii=False, sort_keys=True)
+    # What changes the answer: which sessions, their state, a new request, a
+    # new failure, a finished turn. Not the steps of a working agent (those
+    # move every second; REFRESH_SECONDS covers them).
+    return json.dumps([(s.get("key"), s.get("state"), len(s.get("asks") or []), (s.get("asks") or [""])[-1][:80],
+                        len(s.get("errors") or []), s.get("reply", "")[-80:] if s.get("state") != "working" else "")
+                       for s in data.get("sessions") or []], ensure_ascii=False)
 
 
-def history_topics(monitor, now: float | None = None, limit: int = 18) -> list[dict]:
-    """Sample task-level history across clients; never send raw conversations."""
-    now = time.time() if now is None else now
-    candidates: list[dict] = []
-
-    def offer(provider: str, value: object) -> None:
-        title = agent_tasks.clean(str(value or ""))
-        title = _label(title, 56)
-        if title and len(title) >= 4:
-            candidates.append({"provider": provider, "topic": title})
-
-    if monitor is not None:
-        try:
-            notes = list(monitor.notes.notes.values())
-            contexts = dict(monitor.context)
-        except (AttributeError, RuntimeError):
-            notes, contexts = [], {}
-        for note in notes:
-            if note.active_at < now - 30 * 86400 or note.schedule_id:
-                continue
-            info = contexts.get(note.key) or {}
-            provider = str(info.get("provider") or info.get("source") or "agent").lower()
-            provider = ("codex" if provider in ("openai", "gpt", "codex") else
-                        "gemini" if "antigravity" in provider or "gemini" in provider else
-                        "claude" if "claude" in provider else provider)
-            offer(provider, note.title or note.first or note.prompt)
-            if note.prompt and note.prompt != note.first:
-                offer(provider, note.prompt)
-
-        # Codex keeps older thread titles in a local index. Read only short
-        # title/first-request prefixes; the SQLite connection is read-only.
-        database = Path(monitor.codex_root) / "state_5.sqlite"
-        try:
-            with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=.5)) as db:
-                names = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
-                if "title" in names or "first_user_message" in names:
-                    title = ("coalesce(nullif(title,''),first_user_message)" if {"title", "first_user_message"} <= names
-                             else "title" if "title" in names else "first_user_message")
-                    for (topic,) in db.execute(f"SELECT substr({title},1,180) FROM threads ORDER BY updated_at DESC LIMIT 160"):
-                        offer("codex", topic)
-        except (OSError, sqlite3.Error, AttributeError):
-            pass
-
-    # Claude session summaries or first user requests extend beyond the live
-    # reader's two-day memory. Read a bounded prefix of recent files only.
-    paths = []
-    if monitor is not None:
-        root = Path(monitor.claude_root) / "projects"
-        try:
-            paths = sorted((path for folder in root.iterdir() if folder.is_dir()
-                            for path in folder.glob("*.jsonl") if path.stat().st_mtime >= now - 30 * 86400),
-                           key=lambda path: path.stat().st_mtime, reverse=True)[:80]
-        except OSError:
-            pass
-    for path in paths:
-        try:
-            with path.open("r", encoding="utf-8") as stream:
-                for _ in range(160):
-                    line = stream.readline(65536)
-                    if not line:
-                        break
-                    if len(line) == 65536 and not line.endswith("\n"):
-                        break
-                    record = json.loads(line)
-                    if record.get("type") == "summary" and record.get("summary"):
-                        offer("claude", record["summary"])
-                        break
-                    if record.get("type") == "user" and not record.get("isMeta"):
-                        content = (record.get("message") or {}).get("content")
-                        text = content if isinstance(content, str) else " ".join(
-                            str(item.get("text") or "") for item in content or []
-                            if isinstance(item, dict) and item.get("type") == "text")
-                        if agent_tasks.clean(text):
-                            offer("claude", text[:300])
-                            break
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
-
-    if monitor is not None:
-        try:
-            grok_paths = sorted((path for path in (Path(monitor.grok_root) / "sessions").glob("*/*/updates.jsonl")
-                                 if path.stat().st_mtime >= now - 30 * 86400),
-                                key=lambda path: path.stat().st_mtime, reverse=True)[:60]
-        except OSError:
-            grok_paths = []
-        for path in grok_paths:
-            try:
-                fragments = []
-                with path.open("r", encoding="utf-8") as stream:
-                    for _ in range(120):
-                        line = stream.readline(65536)
-                        if not line or len(line) == 65536 and not line.endswith("\n"):
-                            break
-                        record = json.loads(line)
-                        update = (record.get("params") or {}).get("update") or {}
-                        if update.get("sessionUpdate") == "user_message_chunk":
-                            content = update.get("content") or {}
-                            fragments.append(str(content.get("text") or "") if isinstance(content, dict) else "")
-                            if sum(map(len, fragments)) >= 300:
-                                break
-                        elif fragments:
-                            break
-                offer("grok", "".join(fragments)[:300])
-            except (OSError, ValueError, TypeError, AttributeError):
-                continue
-
-    unique = {}
-    for item in candidates:
-        unique.setdefault((item["provider"], item["topic"]), item)
-    groups: dict[str, list[dict]] = {}
-    for item in unique.values():
-        groups.setdefault(item["provider"], []).append(item)
-    rng = random.SystemRandom()
-    chosen = [item for group in groups.values() for item in rng.sample(group, min(3, len(group)))]
-    remaining = [item for item in unique.values() if item not in chosen]
-    chosen += rng.sample(remaining, min(max(0, limit - len(chosen)), len(remaining)))
-    rng.shuffle(chosen)
-    return chosen[:limit]
+def _material(data: dict) -> dict:
+    sessions = [{key: value for key, value in session.items() if key not in ("key", "who") and value not in ("", [], None)}
+                for session in data.get("sessions") or []]
+    return {"time": data.get("time"), "sessions": sessions}
 
 
 class HintAdvisor:
     def __init__(self, config: dict | None, opener=None):
         self.config = config if config and agent_tasks.is_mimo_url(config.get("url", "")) else None
+        self.model = os.environ.get("CIRCLOW_HINT_MODEL") or HINT_MODEL
         self.opener = opener or urllib.request.urlopen
         self.lock = threading.Lock()
         self.signature = ""
-        self.result: tuple[str, str] | None = None
+        self.result: tuple[str, str, str, str] | None = None     # (kind, session key, text, short name)
         self.result_at = 0.0
         self.last_request_at = 0.0
         self.failed_until = 0.0
         self.pending = False
+        self.names: dict[str, str] = {}      # session key -> MiMo's short name for it
 
     def lookup(self, data: dict, monitor=None) -> tuple[str, str]:
-        """("", idea): MiMo's latest idea, kept RESULT_SECONDS before another
-        is asked for (sooner when the set of tasks changes), and shown until
-        the next arrives (up to KEEP_SECONDS) so the line never flickers."""
+        """("", line). MiMo's pick while it still describes the sessions as
+        they are; otherwise who is waiting, read locally; otherwise nothing."""
+        if not data.get("sessions"):
+            return "", ""
         if self.config is None:
             return local_hint(data)
         signature = _signature(data)
         now = time.time()
+        working = any(s.get("state") == "working" for s in data["sessions"])
         with self.lock:
-            fresh = self.result and now - self.result_at < RESULT_SECONDS
-            if not (fresh and signature == self.signature) and (
-                    not self.pending and now >= self.failed_until and now - self.last_request_at >= MIN_REQUEST_GAP):
+            current = self.result is not None and signature == self.signature and now - self.result_at < STALE_SECONDS
+            due = not current or working and now - self.result_at >= REFRESH_SECONDS
+            if due and not self.pending and now >= self.failed_until and now - self.last_request_at >= MIN_REQUEST_GAP:
                 self.pending = True
                 self.last_request_at = now
-                threading.Thread(target=self._fetch, args=(signature, data, monitor), name="mimo-hint", daemon=True).start()
-            if self.result and now - self.result_at < KEEP_SECONDS:
-                return self.result
-        return local_hint(data)
+                threading.Thread(target=self._fetch, args=(signature, data), name="mimo-hint", daemon=True).start()
+            result = self.result if current else None
+            names = dict(self.names)
+        if result is None:
+            return "", local_line(data, names)
+        # MiMo saw this state. "none" still leaves a session that cannot go on
+        # without the user; it only overrules "finished, have a look".
+        return "", self.render(result, data, names) or local_line(data, names, finished=False)
 
-    def _fetch(self, signature: str, data: dict, monitor=None) -> None:
+    @staticmethod
+    def render(result, data: dict, names: dict | None = None) -> str:
+        kind, key, text, _name = result
+        session = next((s for s in data.get("sessions") or [] if s.get("key") == key), None)
+        if kind == "none" or session is None:
+            return ""
+        who = label(session, names)
+        if kind == "wait":
+            return f"{who}：{text}{_minutes(session)}"
+        mark = KIND_MARK.get(kind)
+        return f"{mark} {who}：{text}" if mark else f"{who}：{text}"
+
+    def _fetch(self, signature: str, data: dict) -> None:
         try:
-            # Do not forward legacy callers' usage fields to the model either.
-            material = {"tasks": data["tasks"], "detected_clients": data.get("detected_clients", []),
-                        "past_topics": history_topics(monitor)}
-            payload = {"model": self.config["model"], "temperature": 0.6,
-                       "max_completion_tokens": 200, "thinking": {"type": "disabled"},
+            payload = {"model": self.model, "temperature": 0.3, "max_completion_tokens": 4000,
+                       "thinking": {"type": "enabled"},
                        "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                                    {"role": "user", "content": json.dumps(material, ensure_ascii=False)}]}
+                                    {"role": "user", "content": json.dumps(_material(data), ensure_ascii=False)}]}
             headers = {"Content-Type": "application/json", "api-key": self.config["key"]}
             request = urllib.request.Request(self.config["url"],
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
-            with self.opener(request, timeout=10) as response:
+            with self.opener(request, timeout=TIMEOUT) as response:
                 reply = json.loads(response.read().decode("utf-8"))
             content = ((reply.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-            # Parse only the user-visible field; no raw model response is logged.
-            match = re.search(r"\{.*\}", content, flags=re.S)
-            values = json.loads(match.group(0)) if match else {}
-            idea = _label(values.get("idea") or values.get("next"), 64).strip("。；！ ")
-            if len(idea) < 8:
-                raise ValueError("MiMo advice lacked an idea")
-            if USAGE_ADVICE.search(idea):
-                raise ValueError("MiMo returned usage advice")
-            if FILLER.search(idea):
-                raise ValueError("MiMo returned stock advice")
-            result = ("", idea)
+            result = self.parse(content, data)
             with self.lock:
                 self.signature, self.result, self.result_at = signature, result, time.time()
+                if result[3]:
+                    self.names[result[1]] = result[3]
+                    if len(self.names) > 64:
+                        self.names.pop(next(iter(self.names)))
+            log.info("MiMo hint: %s", result[0])          # the kind only; never the text or the material
         except Exception as error:
             log.info("MiMo hint unavailable: %s", type(error).__name__)
             with self.lock:
@@ -268,3 +228,27 @@ class HintAdvisor:
         finally:
             with self.lock:
                 self.pending = False
+
+    @staticmethod
+    def parse(content: str, data: dict) -> tuple[str, str, str, str]:
+        """(kind, session key, text, name); ("none", "", "", "") for anything that does
+        not hold up: an unknown session, a "wait" for a session that is not
+        waiting, workflow or usage advice, an empty or overlong line."""
+        match = re.search(r"\{.*\}", content, flags=re.S)
+        values = json.loads(match.group(0)) if match else {}
+        kind = str(values.get("kind") or "none").strip().lower()
+        sessions = {s["id"]: s for s in data.get("sessions") or []}
+        session = sessions.get(str(values.get("session") or "").strip())
+        text = re.sub(r"\s+", " ", str(values.get("text") or "")).strip().strip("。；！ ")
+        name = re.sub(r"\s+", " ", str(values.get("name") or "")).strip().strip("。；！“”\"' ")
+        name = agent_tasks.shorten(name, 10) if 2 <= len(name) <= 16 else ""
+        none = ("none", "", "", "")
+        if kind not in ("wait", "stuck", "idea") or session is None:
+            return none
+        if kind == "wait" and session.get("state") == "working":
+            return none
+        if kind == "stuck" and session.get("state") != "working":
+            kind = "wait" if session.get("state") in ("failed", "blocked", "asked") else "idea"
+        if not 4 <= len(text) <= 40 or META.search(text) or USAGE_ADVICE.search(text):
+            return none
+        return kind, session["key"], text, name

@@ -17,7 +17,7 @@ import threading
 import time
 import urllib.request
 from urllib.parse import urlsplit
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,16 @@ GROUPS_PATH = DATA_DIR / "agent_groups.json"
 SUMMARY_CONFIG = DATA_DIR / "agent_summary.json"
 LIVE_SECONDS = 45          # A sub-agent without its own activity flag counts as working this long.
 RECENT_SECONDS = 180       # Finished agents linger as dim bubbles so the field does not flicker.
+WORK_SECONDS = 45 * 60     # Sessions the hover hint looks at: working, or touched this recently.
+KEEP_ASKS, KEEP_STEPS, KEEP_ERRORS = 4, 10, 4
+REPLY_CHARS, ASK_CHARS, ERROR_CHARS = 1600, 600, 300
+# A failed tool call, read from the start of its output only: the body of a
+# file that merely mentions "error" or "失败" must not count.
+TOOL_ERROR = re.compile(r"(?im)traceback \(most recent|^\s*(?:\w+)?(?:error|exception)\b.{0,3}:|exit[ _]code\"?:? *[1-9]|"
+                        r"^script failed|command not found|is not recognized as|permission denied|no such file|"
+                        r"拒绝访问|找不到(?:路径|文件|命令)")
+QUESTION = re.compile(r"[?？]\s*(?:\*\*)?\s*$|要不要|是否需要|需要我|你希望|你想要?|请确认|确认一下|可以吗|行吗|选哪|还是说|"
+                      r"which (?:one|option)|should i|do you want|would you like|let me know", re.I)
 GROUP_KEEP_SECONDS = 7 * 86400
 log = logging.getLogger(__name__)
 
@@ -80,6 +90,17 @@ def clean(text: str) -> str:
 def trivial(text: str) -> bool:
     text = (text or "").strip().lower().rstrip("。.!！?？~")
     return len(text) < 2 or text in TRIVIAL
+
+
+def _named_request(note) -> str:
+    """A name for a session without a client title: its latest request that
+    says something ("继续任务", "一起提交" do not), else the first one."""
+    for _, text in reversed(note.asks):
+        cleaned = clean(re.sub(r"^(?:继续(?:任务|做|吧)?|接着(?:做)?|好的?|可以)[\s，,、。]*(?:并且|然后|同时|再)?[\s，,、]*",
+                               "", str(text).strip()))
+        if len(cleaned) >= 6 and not trivial(cleaned) and not re.match(r"^(?:一起|提交|合入)", cleaned):
+            return cleaned
+    return note.first or note.prompt
 
 
 def _basename(value: str) -> str:
@@ -230,6 +251,15 @@ class Note:
     first: str = ""          # first substantive request: what a scheduled run is started with
     started: float = 0.0
     origin: str = ""         # launcher markers (originator, entrypoint, thread source)
+    # What the hover hint reads to understand the session (agent_hints):
+    asks: list = field(default_factory=list)      # (moment, text) of the user's last requests
+    reply: str = ""          # the agent's latest message to the user
+    reply_at: float = 0.0
+    reply_buffer: str = ""   # Grok streams its reply in chunks
+    steps: list = field(default_factory=list)     # (moment, action) of the latest tool calls
+    errors: list = field(default_factory=list)    # (moment, text) of the latest failed tool calls
+    ended_at: float = 0.0    # the last turn finished (0 while one runs)
+    end_kind: str = ""       # "done", "error" or "aborted"
 
 
 class AgentNotes:
@@ -257,6 +287,8 @@ class AgentNotes:
                 note.first, note.started = cleaned, moment or note.started
             note.prompt, note.request = cleaned, re.sub(r"\s+", " ", str(text)).strip()[:600]
             note.action, note.action_at = "", moment or note.action_at
+            note.asks = (note.asks + [(moment or note.active_at, str(text).strip()[:ASK_CHARS])])[-KEEP_ASKS:]
+            note.ended_at, note.end_kind, note.reply_buffer = 0.0, "", ""
         if moment:
             self.touch(key, moment)
 
@@ -264,8 +296,32 @@ class AgentNotes:
         note = self.note(key)
         if action and (moment or 0) >= note.action_at:
             note.action, note.action_at = action, moment or note.action_at
+            if action != "思考中" and (not note.steps or note.steps[-1][1] != action):
+                note.steps = (note.steps + [(moment or note.action_at, action)])[-KEEP_STEPS:]
         if moment:
             self.touch(key, moment)
+
+    def said(self, key: str, text: str, moment: float | None):
+        """The agent's message to the user (the last one is what it ended on)."""
+        text = str(text or "").strip()
+        if text:
+            note = self.note(key)
+            note.reply, note.reply_at = text[-REPLY_CHARS:], moment or note.reply_at
+        if moment:
+            self.touch(key, moment)
+
+    def failed(self, key: str, text: str, moment: float | None):
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if text:
+            note = self.note(key)
+            note.errors = (note.errors + [(moment or note.active_at, text[:ERROR_CHARS])])[-KEEP_ERRORS:]
+
+    def ended(self, key: str, kind: str, moment: float | None):
+        note = self.note(key)
+        if note.reply_buffer:
+            self.said(key, note.reply_buffer, moment)
+            note.reply_buffer = ""
+        note.ended_at, note.end_kind, note.working = moment or note.active_at or time.time(), kind, False
 
     def touch(self, key: str, moment: float):
         note = self.note(key)
@@ -290,6 +346,15 @@ class AgentNotes:
             self.note(key).working = event == "task_started"
             if event == "task_started":
                 self.note(key).schedule_id = self.note(key).turn_origin = ""
+                self.note(key).ended_at, self.note(key).end_kind = 0.0, ""
+            elif event == "task_complete":
+                self.said(key, payload.get("last_agent_message") or "", moment)
+                self.ended(key, "done", moment)
+            elif event == "error":
+                self.failed(key, payload.get("message") or "error", moment)
+                self.ended(key, "error", moment)
+            else:
+                self.ended(key, "aborted", moment)
             if moment:
                 self.touch(key, moment)
         if kind == "session_meta":
@@ -318,8 +383,20 @@ class AgentNotes:
                 self.act(key, tool_action("local_shell", (payload.get("action") or {})), moment)
             elif item == "web_search_call":
                 self.act(key, "查资料", moment)
-            elif item == "message" and payload.get("role") == "assistant" and moment:
-                self.touch(key, moment)
+            elif item in ("function_call_output", "custom_tool_call_output"):
+                output = payload.get("output")
+                if isinstance(output, list):
+                    output = "\n".join(str(part.get("text") or "") for part in output if isinstance(part, dict))
+                elif isinstance(output, dict):
+                    output = json.dumps(output, ensure_ascii=False)
+                head = str(output or "")[:600]
+                if TOOL_ERROR.search(head):
+                    self.failed(key, head, moment)
+            elif item == "message" and payload.get("role") == "assistant":
+                content = payload.get("content") or []
+                text = content if isinstance(content, str) else "\n".join(
+                    str(c.get("text") or "") for c in content if isinstance(c, dict))
+                self.said(key, text, moment)
 
     def claude(self, key: str, record: dict, parent: str = ""):
         moment = _moment(record.get("timestamp"))
@@ -333,6 +410,16 @@ class AgentNotes:
         if record.get("type") == "user":
             if record.get("isMeta"):
                 return
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error"):
+                        body = block.get("content")
+                        body = body if isinstance(body, str) else " ".join(
+                            str(part.get("text") or "") for part in body or [] if isinstance(part, dict))
+                        self.failed(key, body or "tool error", moment)
+            if isinstance(content, str) and content.startswith("[Request interrupted"):
+                self.ended(key, "aborted", moment)
+                return
             if isinstance(content, str):
                 self.ask(key, content, moment)
             elif isinstance(content, list):
@@ -344,6 +431,11 @@ class AgentNotes:
                     self.touch(key, moment)
             return
         steps = [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+        text = "\n".join(str(block.get("text") or "") for block in steps if block.get("type") == "text")
+        if text.strip():
+            self.said(key, text, moment)
+        if (record.get("message") or {}).get("stop_reason") == "end_turn":
+            self.ended(key, "done", moment)
         tools = [block for block in steps if block.get("type") == "tool_use"]
         if tools:
             self.act(key, tool_action(tools[-1].get("name"), tools[-1].get("input")), moment)
@@ -365,6 +457,18 @@ class AgentNotes:
         if note.buffer:
             self.ask(key, note.buffer, moment)
             note.buffer = ""
+        if kind == "agent_message_chunk":
+            content = update.get("content") or {}
+            if len(note.reply_buffer) < 20_000:
+                note.reply_buffer += str(content.get("text") or "") if isinstance(content, dict) else ""
+            if moment:
+                self.touch(key, moment)
+            return
+        if note.reply_buffer:
+            self.said(key, note.reply_buffer, moment)
+            note.reply_buffer = ""
+        if kind == "tool_call_update" and str(update.get("status") or "") == "failed":
+            self.failed(key, str(update.get("title") or "tool failed"), moment)
         if kind in ("tool_call", "tool_call_update") and (update.get("title") or update.get("kind")):
             action = GROK_KINDS.get(str(update.get("kind") or ""), "") or tool_action(str(update.get("title") or ""))
             self.act(key, action, moment)
@@ -431,6 +535,59 @@ class AgentNotes:
             })
         result.sort(key=lambda item: (not item["live"], -item["at"]))
         return result
+
+    def work(self, agents: list[dict], context: dict, now: float, provider_of=lambda model: "other",
+             window: float = WORK_SECONDS) -> list[dict]:
+        """What the hover hint reads: every session the user drove (not a
+        sub-agent or scheduled run) that is working or was touched within
+        `window`, with its state, the user's requests, the agent's last
+        message, its latest steps and failures. `agents` is the exported list
+        (live flags and herdr pane states)."""
+        shown = {agent["key"]: agent for agent in agents}
+        home = Path.home().name.lower()
+        result = []
+        for key, note in list(self.notes.items()):
+            agent = shown.get(key) or {}
+            if note.parent or note.schedule_id or not note.asks:
+                continue
+            herdr = str(agent.get("herdr_status") or "")
+            working = herdr == "working" or bool(agent.get("live")) and herdr != "blocked" and not note.ended_at
+            if not (working or herdr == "blocked" or note.active_at >= now - window):
+                continue
+            last_ask = note.asks[-1][0] or 0
+            if herdr == "blocked":
+                state = "blocked"
+            elif working:
+                state = "working"
+            elif note.end_kind in ("error", "aborted"):
+                state = "failed"
+            elif note.reply and note.reply_at >= last_ask and QUESTION.search(note.reply[-300:]):
+                state = "asked"
+            else:
+                state = "done"
+            info = context.get(key) or {}
+            provider = str(agent.get("provider") or "") or provider_of(str(info.get("model") or ""))
+            if provider == "other" and str(info.get("source") or "") == "Claude Code":
+                provider = "claude"
+            folder = _basename(note.cwd) if note.cwd else str(agent.get("folder") or "")
+            if folder.lower() in (home, "system32", "administrator", "users", ""):
+                folder = ""
+            since = note.ended_at or note.active_at
+            result.append({
+                "key": key, "provider": provider, "state": state, "project": folder,
+                "title": note.title if len(note.title) >= 6 and not re.match(r"^(?:继续|一起|提交)", note.title)
+                else _named_request(note), "first": note.first,
+                "asks": [text for _, text in note.asks], "reply": note.reply,
+                "steps": [action for _, action in note.steps],
+                "errors": [text for moment, text in note.errors if moment >= last_ask - 1],
+                "older_errors": len([1 for moment, _ in note.errors if moment < last_ask - 1]),
+                "minutes": max(0, round((now - since) / 60)) if since else None,
+                "running_minutes": max(0, round((now - last_ask) / 60)) if working and last_ask else None,
+                "at": note.active_at,
+            })
+        order = {"blocked": 0, "asked": 1, "failed": 2, "working": 3, "done": 4}
+        result.sort(key=lambda item: (order[item["state"]], -item["at"]))
+        return result[:8]
 
 
 # ----- scheduled tasks ----------------------------------------------------------
