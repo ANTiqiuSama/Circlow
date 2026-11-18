@@ -478,6 +478,9 @@ class Herdr:
         self.linked.setdefault(pane, set()).add(agent["key"])
         agent["pane"] = pane
         agent["herdr_status"] = status
+        title = str(row.get("title") or row.get("terminal_title_stripped") or "").strip()
+        if title and not re.search(r"[\\/]|\.exe\b", title, re.I):      # a shell path is no name
+            agent["herdr_title"] = title
         if status == "blocked":
             agent["live"], agent["doing"] = True, STATUS_TEXT["blocked"]
         elif status == "working" and not agent.get("live"):

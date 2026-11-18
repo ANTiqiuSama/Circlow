@@ -880,6 +880,16 @@ class HoverDetails:
                 else:
                     self.agents.open_settings()
                 return
+            elif event[0] == "open":
+                # A click on a bubble: its session opens where the user can
+                # answer it. The card makes way at once; the opening (a herdr
+                # call, a URL) runs off this thread.
+                panel.hide()
+                self.candidate = None
+                opener = getattr(self.agents, "open_session", None)
+                if opener is not None:
+                    threading.Thread(target=opener, args=(event[1],), name="open-session", daemon=True).start()
+                return
             elif event[0] == "merge":
                 merged = self.agents.merge(event[1], event[2])
                 if merged:

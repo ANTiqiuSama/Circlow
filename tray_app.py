@@ -49,6 +49,7 @@ from quota_sources import (
     save_cached_snapshots,
 )
 import herdr_source
+import session_links
 import launchers
 import sync_hub
 from local_sync import LocalSync, PERFORMANCE_SAVE_SECONDS  # noqa: F401
@@ -430,7 +431,8 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         now = time.time()
         if not has_panel(provider, self.snapshots.get(provider)):
             return None
-        agents = [agent for agent in self.agents if not agent.get("schedule")]
+        work = getattr(getattr(self, "tps_monitor", None), "recent_work", None) or []
+        agents = agent_tasks.with_waiting([agent for agent in self.agents if not agent.get("schedule")], work)
         clusters = self.agent_groups.compose(agents)
         working = sum(1 for agent in agents if agent["live"] and agent["provider"] == provider)
         self.clusters = {cluster.key: cluster for cluster in clusters}
@@ -442,9 +444,17 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
             # Fixed colour per group: following whichever member is live made it flicker.
             lead = provider if provider in kinds else kinds[0]
             members = tuple((provider_letter(m["provider"]), m["live"]) for m in cluster.members) if len(cluster.members) > 1 else ()
+            waiting = agent_tasks.waiting_of(cluster)
+            if waiting:
+                # A session waiting for the user: its state and how long, and on
+                # hover what it asks (the agent's own words) instead of the action.
+                first = min((m for m in cluster.members if m.get("waiting")), key=agent_tasks.wait_rank)
+                minutes = first.get("wait_minutes")
+                doing = agent_tasks.WAIT_TEXT[waiting] + ("" if minutes is None else " · 刚刚" if minutes < 1 else f" · {minutes}分")
+                detail = first.get("wait_detail") or detail
             bubbles.append(agent_panel.BubbleModel(cluster.key, agent_tasks.shorten(title, 16), doing, provider_letter(lead),
                                                    cluster.live, detail, members, busy, provider in kinds,
-                                                   tuple(m["key"] for m in cluster.members)))
+                                                   tuple(m["key"] for m in cluster.members), waiting))
         # Same order for every icon so the panel keeps its size and layout when switching.
         snapshot = self.snapshots.get(provider)
         quota: list[tuple] = []
@@ -513,9 +523,10 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         running = [data["display_model"]] if data.get("display_tps") is not None and data.get("display_model") else []
         intel, intel_note = self.panel_intel(now, running)
         forecast, forecast_tone = self.headline_forecast(provider)
-        hint_data = agent_hints.context(getattr(getattr(self, "tps_monitor", None), "recent_work", None) or [])
+        hint_data = agent_hints.context(work)
         advisor = getattr(self, "hint_advisor", None)
-        hint_now, hint_next = advisor.lookup(hint_data, getattr(self, "tps_monitor", None)) if advisor is not None else agent_hints.local_hint(hint_data)
+        rows = advisor.lookup(hint_data) if advisor is not None else agent_hints.local_hint(hint_data)
+        hints = tuple((kind, provider_letter(source) if source else "M", text) for kind, source, text in rows)
         today_used = None
         if provider == "mimo":
             today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
@@ -527,8 +538,29 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                                       tone, banner, forecast, forecast_tone, today_used,
                                       self.burn_chart(provider, now), alert, intel, intel_note,
                                       quota_tones=tuple(tones), quota_figures=tuple(figures), column_iq=column_iq,
-                                      hint_now=hint_now, hint_next=hint_next,
+                                      hints=hints,
                                       local_tps=self.local_tps(provider, data))
+
+    def open_session(self, key: str) -> None:
+        """A click on a bubble: open its session where the user can answer
+        (the most pressing member of a group): its herdr pane, its thread in
+        the Codex app, its session in the Claude desktop app. Sources with no
+        such link open as their icon does; a CLI agent outside herdr can only
+        bring herdr forward, never start a new agent."""
+        cluster = self.clusters.get(key)
+        if cluster is None or not cluster.members:
+            return
+        member = min(cluster.members, key=agent_tasks.wait_rank)
+        provider = str(member.get("provider") or "")
+        way = session_links.open_session(member)
+        log.info("bubble opened %s session via %s", provider, way or "its launcher")
+        if way is not None or sys.platform != "win32":
+            return
+        first = next(iter(launchers.ways(provider)), None) if provider in PROVIDERS else None
+        if provider in launchers.HERDR_AGENTS or first is None or first.kind in ("herdr", "cli"):
+            herdr_source.raise_client()
+        else:
+            self.open_provider(provider)
 
     def merge(self, first: str, second: str) -> str | None:
         a, b = self.clusters.get(first), self.clusters.get(second)

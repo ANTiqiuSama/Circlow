@@ -46,6 +46,7 @@ class BubbleModel:
     busy: bool = False                           # an optional summary is being made
     focus: bool = True                           # belongs to the hovered provider
     keys: tuple[str, ...] = ()                   # member agent ids, for continuity across regrouping
+    waiting: str = ""                            # waits for the user: "blocked" | "asked" | "failed" | "done"
 
     @property
     def radius(self) -> float:
@@ -118,8 +119,10 @@ class PanelModel:
     quota_tones: tuple[str, ...] = ()            # per column: "" | "active" (pool in use) | "paid" | "blocked"
     quota_figures: tuple = ()                    # per column: (number, unit) shown instead of the %, e.g. Codex credits
     column_iq: tuple = ()                       # spare header slot, Grok only: (label, figure, caption, unit)
-    hint_now: str = ""                          # MiMo or local summary of current agent work
-    hint_next: str = ""                         # one optional next action
+    hint_now: str = ""                          # unused; kept for callers
+    hint_next: str = ""                         # a single hint line (older callers); `hints` wins
+    hints: tuple = ()                           # hint rows: (kind, letter, text); kind "wait" | "stuck" | "idea"
+    hint_space: float | None = None             # the rows' height, when rebuilt from a cached header
     local_tps: float | None = None              # with multi-device sync: this device's own TPS, under the shared figure
 
     def figure_of(self, slot: int) -> tuple[str, str] | None:
@@ -136,7 +139,7 @@ class PanelModel:
                 tuple((item[0], item[2] if len(item) > 2 else "", self.tone_of(slot)) for slot, item in enumerate(self.quota[:3])),
                 (self.banner, self.banner_alert, self.intel, self.intel_note),
                 (self.forecast, self.forecast_tone), self.provider == "mimo", chart_extra_for(self),
-                self.column_iq, self.tps_label)
+                self.column_iq, self.tps_label, hint_height(self))
 
     @property
     def tps_label(self) -> str:
@@ -154,9 +157,10 @@ CHART = 80 + CHART_AXIS     # Burn chart under the task field.
 CHART_TOP = 16              # Field bottom to chart sprite; the two plates keep an 8 px gap.
 CHART_H = 64 + CHART_AXIS   # Chart sprite: label row, plot and clock row.
 CHART_LABEL = 15            # Label row inside the sprite.
-HINT_H = 48                 # One short paragraph, up to two lines, above the forecast.
 HINT_FONT, HINT_LINE = 13, 24   # px: LumaCenter's tray-panel notes beside it (size, row)
 HINT_TEXT_X = 22                # text after the 12 px mark, as LumaCenter lays its rows out
+HINT_GAP = 4                    # between two hint items
+HINT_ITEM_LINES = 2             # one item wraps to at most this many lines
 GEAR_RADIUS = 7.5
 GEAR_HIT = 17.0
 
@@ -191,8 +195,46 @@ def chart_extra_for(model: PanelModel) -> float:
     return max(model.chart_padding, chart_extra(model.burn))
 
 
+def hint_items(model) -> tuple:
+    """(kind, letter, text) per hint row; the single `hint_next` of older callers as one idea."""
+    if model.hints:
+        return tuple(item for item in model.hints if str(item[2]).strip())
+    idea = model.hint_next.strip("。；！ ")
+    return (("idea", "M", idea),) if idea else ()
+
+
+@lru_cache(maxsize=64)
+def _hint_lines(text: str, scale: float) -> tuple[str, ...]:
+    """One item's lines at `scale`: wrapped to the text column, at most
+    HINT_ITEM_LINES, the last cut with an ellipsis."""
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    face = ui_font(round(HINT_FONT * scale))
+    limit = round((WIDTH - 2 * PAD - HINT_TEXT_X) * scale)
+    lines = _wrap(probe, text, face, limit) or [text]
+    for index in range(1, len(lines)):
+        # No line starts with closing punctuation: it stays at the end of the line before.
+        while lines[index] and lines[index][0] in "，。、；：！？）》」』·,.;:!?) ":
+            lines[index - 1] += lines[index][0].strip()
+            lines[index] = lines[index][1:]
+    lines = [line for line in lines if line] or [text]
+    if len(lines) > HINT_ITEM_LINES:
+        lines = lines[:HINT_ITEM_LINES - 1] + [forecast_text("".join(lines[HINT_ITEM_LINES - 1:]), limit, face, probe)]
+    return tuple(lines)
+
+
+def hint_height(model) -> float:
+    """The rows' height: nothing at all without a hint, so no empty band."""
+    if model.hint_space is not None:
+        return model.hint_space
+    items = hint_items(model)
+    if not items:
+        return 0.0
+    lines = sum(len(_hint_lines(text, 1.0)) for _, _, text in items)
+    return lines * HINT_LINE + (len(items) - 1) * HINT_GAP + 8
+
+
 def footer_middle(model, field_h: float) -> float:
-    return field_top(model) + field_h + CHART + chart_extra_for(model) + HINT_H + 24
+    return field_top(model) + field_h + CHART + chart_extra_for(model) + hint_height(model) + 24
 
 
 def gear_center(model, field_h: float) -> tuple[float, float]:
@@ -249,7 +291,7 @@ def field_height(bubbles) -> float:
 
 
 def panel_height(model: PanelModel, field: float) -> float:
-    return field_top(model) + field + CHART + chart_extra_for(model) + HINT_H + FOOTER + 8
+    return field_top(model) + field + CHART + chart_extra_for(model) + hint_height(model) + FOOTER + 8
 
 
 # ----- motion helpers ------------------------------------------------------------
@@ -593,6 +635,8 @@ class Scene:
         if not left and self.left:
             if self.dragging and self.target:
                 events.append(("merge", self.dragging, self.target))
+            elif self.press and not self.dragging and under == self.press[0]:
+                events.append(("open", under))        # a click: open the session to answer it
             self.dragging = self.target = self.press = None
         if right and not self.right and under and len(self.bodies[under].model.members) > 1:
             events.append(("split", under))
@@ -648,7 +692,8 @@ class Scene:
         if model is None:
             return False
         return (model.status_tone == "live" or not model.bubbles
-                or any(b.model.live or b.model.members or b.model.busy for b in self.bodies.values()))
+                or any(b.model.live or b.model.members or b.model.busy or b.model.waiting in PULSING
+                       for b in self.bodies.values()))
 
     # ----- drawing ---------------------------------------------------------
     def render(self, scale: float) -> Image.Image:
@@ -699,7 +744,16 @@ class Scene:
             if r <= 0.5:
                 continue
             m = body.model
-            if m.live and key != self.dragging:
+            if m.waiting and key != self.dragging and r > 4:
+                grown = min(1.0, max(0.0, body.scale.value))
+                breath = 0.8 + 0.2 * math.sin(self.time * 3.2 + body.phase) if m.waiting in PULSING else 0.75
+                blit(frame, faded(wait_glow(round((r + 6) * scale), m.waiting), grown * breath), x, y)
+                if m.waiting in PULSING:
+                    for lag in (0.0, 0.5):           # two rings, half a beat apart
+                        p = ((self.time + body.phase) / 1.6 + lag) % 1.0
+                        blit(frame, faded(wait_ring(round(r * (1 + 0.55 * ease_out_cubic(p)) * scale), max(1, round(2.4 * scale)),
+                                                    m.waiting), grown * 0.95 * (1 - p) ** 1.6), x, y)
+            elif m.live and key != self.dragging:
                 period = 2.4
                 p = ((self.time + body.phase) % period) / period
                 blit(frame, faded(ring(round(r * (1 + 0.32 * ease_out_cubic(p)) * scale), max(1, round(1.4 * scale)), m.letter),
@@ -709,6 +763,9 @@ class Scene:
             resting = body.scale.settled and body.hover.settled and body.glow.settled and body.lift.settled
             self._bubble(frame, m, x, y, r, scale, min(1.0, max(0.0, body.scale.value)), label=key != self.dragging,
                          expanded=body.hover.value > 0.5, crisp=resting)
+            if m.waiting and r > 4:                  # a solid ring in the state's colour, over the glass rim
+                blit(frame, faded(wait_ring(round((r + 2.5) * scale), max(1, round(2.2 * scale)), m.waiting),
+                                  min(1.0, max(0.0, body.scale.value))), x, y)
             if m.members:
                 count = min(6, len(m.members))
                 for index, (letter, live) in enumerate(m.members[:count]):
@@ -716,6 +773,10 @@ class Scene:
                     pulse = 1 + (0.25 * math.sin(self.time * 4 + index) if live else 0)
                     blit(frame, faded(dot(round(3.4 * scale * pulse), letter), 1.0 if live else 0.5),
                          x + math.cos(angle) * (r + 1) * scale, y + math.sin(angle) * (r + 1) * scale)
+            if m.waiting and r > 4:
+                badge = wait_badge(m.waiting, scale)
+                blit(frame, faded(badge, min(1.0, max(0.0, body.scale.value))),
+                     x + r * 0.74 * scale, y - r * 0.74 * scale)
             if m.busy:
                 spinner = arc(round((r + 3) * scale), m.letter)
                 blit(frame, spinner.rotate(-self.time * 300 % 360, resample=Image.BICUBIC), x, y)
@@ -812,24 +873,27 @@ class Scene:
             frame.alpha_composite(sprite.crop((0, label, width, sprite.height)), (left, top + label))
 
     def _hint(self, frame, model, field_h, scale, at):
-        """MiMo's one idea, beside its spark: up to two lines, the second cut
-        with an ellipsis. Nothing at all without one: no stand-in advice, and
-        no "what is going on" line (the bubbles above already show that)."""
-        idea = model.hint_next.strip("。；！ ")
-        if not idea:
+        """The hint rows, each beside its mark: a dot in the source's colour
+        for a session waiting for the user, the MiMo spark for a stuck or idea
+        line. Each item wraps to two lines at most; the band is exactly as tall
+        as its rows (hint_height), and absent without any."""
+        items = hint_items(model)
+        if not items:
             return
         draw = ImageDraw.Draw(frame)
         text_font = ui_font(round(HINT_FONT * scale))
-        top = chart_top(model, field_h) + CHART_H + chart_extra_for(model) + 15
-        limit = at(WIDTH - PAD) - at(PAD + HINT_TEXT_X)
-        lines = _wrap(draw, idea, text_font, limit) or [idea]
-        if len(lines) > 2:
-            lines = [lines[0], forecast_text("".join(lines[1:]), limit, text_font, draw)]
-        mark = hint_mark("next", accent("M"), scale)
-        frame.alpha_composite(mark, (round(at(PAD + 2)), round(at(top) - mark.height / 2)))
-        for index, line in enumerate(lines[:2]):
-            draw.text((at(PAD + HINT_TEXT_X), at(top + index * HINT_LINE)), line, font=text_font,
-                      fill=TEXT if index == 0 else SECONDARY_TEXT, anchor="lm")
+        y = chart_top(model, field_h) + CHART_H + chart_extra_for(model) + 15
+        for kind, letter, text in items:
+            lines, room = _hint_lines(text, scale), len(_hint_lines(text, 1.0))
+            if len(lines) > room:           # wrapped differently at this scale: keep the reserved rows
+                limit = at(WIDTH - PAD) - at(PAD + HINT_TEXT_X)
+                lines = lines[:room - 1] + (forecast_text("".join(lines[room - 1:]), limit, text_font, draw),)
+            mark = hint_mark("now" if kind == "wait" else "next", accent(letter if kind == "wait" else "M"), scale)
+            frame.alpha_composite(mark, (round(at(PAD + 2)), round(at(y) - mark.height / 2)))
+            for index, line in enumerate(lines):
+                draw.text((at(PAD + HINT_TEXT_X), at(y + index * HINT_LINE)), line, font=text_font,
+                          fill=TEXT if index == 0 else SECONDARY_TEXT, anchor="lm")
+            y += len(_hint_lines(text, 1.0)) * HINT_LINE + HINT_GAP
 
     def _bubble(self, frame, m: BubbleModel, x, y, r, scale, alpha, label=True, expanded=False, crisp=False):
         layout = round(m.radius * scale)
@@ -850,7 +914,8 @@ class Scene:
         text_alpha = min(1.0, max(0.0, (alpha - 0.6) / 0.35))
         if label and text_alpha > 0.02:
             text = m.detail if expanded and m.detail and m.detail != m.title else m.doing
-            tag = caption(text, m.letter if m.live else "", round(m.radius * 2 + CAPTION_SPARE), expanded, scale)
+            tint = WAIT_LETTER.get(m.waiting) or (m.letter if m.live else "")
+            tag = caption(text, tint, round(m.radius * 2 + CAPTION_SPARE), expanded, scale)
             blit(frame, faded(tag, text_alpha * (1 if m.focus or expanded else 0.75)), x, y + (r + 4) * scale + tag.height / 2)
 
 
@@ -963,9 +1028,12 @@ def bubble(title: str, letter: str, live: bool, focus: bool, radius: int, scale:
 
 @lru_cache(maxsize=128)
 def caption(text: str, letter: str, max_width: int, expanded: bool, scale: float) -> Image.Image:
-    face = ui_font(max(6, round(10.5 * scale)))
+    wait = letter.startswith("wait:") and not expanded
+    face = ui_font(max(6, round(10.5 * scale)), "bold" if wait else "regular")
     probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     limit = max_width * scale if not expanded else max(max_width, 120) * scale
+    if wait:
+        limit -= 2 * round(5 * scale) + 4      # the pill stays within the bubble's slot
     lines = _wrap(probe, text, face, limit)
     keep = 2 if expanded else 1
     if len(lines) > keep:
@@ -975,7 +1043,8 @@ def caption(text: str, letter: str, max_width: int, expanded: bool, scale: float
         lines[-1] += "…"
     top, bottom = face.getbbox("国Ag")[1::2]
     step = round((bottom - top) * 1.35)
-    width = max(2, round(max(probe.textlength(line, font=face) for line in lines)) + 4 + (round(10 * scale) if letter else 0))
+    dot = bool(letter) and not wait            # a waiting pill is coloured itself: no dot
+    width = max(2, round(max(probe.textlength(line, font=face) for line in lines)) + 4 + (round(10 * scale) if dot else 0))
     image = Image.new("RGBA", (width, step * len(lines) + 2), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     if expanded:
@@ -986,15 +1055,25 @@ def caption(text: str, letter: str, max_width: int, expanded: bool, scale: float
         plate.alpha_composite(image, (round(6 * scale), round(3 * scale)))
         image, draw = plate, ImageDraw.Draw(plate)
         offset = (round(6 * scale), round(3 * scale))
+    elif wait:
+        # Waiting: the line sits on a pill of its state's colour.
+        color = wait_color(letter[5:])
+        plate = Image.new("RGBA", (width + 2 * round(5 * scale), image.height + 2 * round(2 * scale)), (0, 0, 0, 0))
+        ImageDraw.Draw(plate).rounded_rectangle((0, 0, plate.width - 1, plate.height - 1), radius=round(plate.height / 2),
+                                                fill=_with_alpha(color, 52), outline=_with_alpha(color, 150),
+                                                width=max(1, round(scale)))
+        image, draw = plate, ImageDraw.Draw(plate)
+        offset = (round(5 * scale), round(2 * scale))
     else:
         offset = (0, 0)
     x = 2 + offset[0]
-    if letter:
+    if dot:
         d = round(5 * scale)
-        draw.ellipse((x, offset[1] + step / 2 - d / 2, x + d, offset[1] + step / 2 + d / 2), fill=accent(letter))
+        draw.ellipse((x, offset[1] + step / 2 - d / 2, x + d, offset[1] + step / 2 + d / 2), fill=wait_color(letter[5:]) if letter.startswith("wait:") else accent(letter))
         x += round(10 * scale)
     for index, line in enumerate(lines):
-        draw.text((x, offset[1] + step * index + step / 2), line, font=face, fill=TEXT if expanded else SECONDARY_TEXT, anchor="lm")
+        ink = wait_color(letter[5:]) if wait else TEXT if expanded else SECONDARY_TEXT
+        draw.text((x, offset[1] + step * index + step / 2), line, font=face, fill=ink, anchor="lm")
     return image
 
 
@@ -1005,6 +1084,70 @@ def ring(radius: int, stroke: int, letter: str) -> Image.Image:
     inset = SUPERSAMPLE * 1
     ImageDraw.Draw(image).ellipse((inset, inset, big - inset - 1, big - inset - 1), outline=accent(letter), width=stroke * SUPERSAMPLE)
     return image.resize((big // SUPERSAMPLE, big // SUPERSAMPLE), Image.LANCZOS)
+
+
+# A session waiting for the user: amber for an approval, blue for a question,
+# red for a failure, green for finished work to look at. The first three pulse.
+WAIT_COLORS = {"blocked": (236, 172, 74, 255), "asked": (120, 172, 240, 255),
+               "failed": (226, 92, 92, 255), "done": (120, 200, 150, 255)}
+WAIT_LETTER = {state: f"wait:{state}" for state in WAIT_COLORS}      # caption dot colour keys
+PULSING = ("blocked", "asked", "failed")
+
+
+def wait_color(state: str) -> tuple[int, int, int, int]:
+    return WAIT_COLORS.get(state, TEXT)
+
+
+def wait_ring(radius: int, stroke: int, state: str) -> Image.Image:
+    big = (radius + stroke + 1) * 2 * SUPERSAMPLE
+    image = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    inset = SUPERSAMPLE * 1
+    ImageDraw.Draw(image).ellipse((inset, inset, big - inset - 1, big - inset - 1), outline=wait_color(state),
+                                  width=stroke * SUPERSAMPLE)
+    return image.resize((big // SUPERSAMPLE, big // SUPERSAMPLE), Image.LANCZOS)
+
+
+@lru_cache(maxsize=32)
+def wait_glow(radius: int, state: str) -> Image.Image:
+    """A soft disc of the state's colour behind a waiting bubble."""
+    pad = max(6, radius // 2)
+    size = 2 * (radius + pad)
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ImageDraw.Draw(image).ellipse((pad, pad, size - pad, size - pad), fill=_with_alpha(wait_color(state), 110))
+    return image.filter(ImageFilter.GaussianBlur(max(3, radius // 4)))
+
+
+@lru_cache(maxsize=16)
+def wait_badge(state: str, scale: float) -> Image.Image:
+    """The badge on a waiting bubble's shoulder: a filled disc in the state's
+    colour, ringed by the panel surface, with "!" (approve), "?" (question),
+    a cross (failed) or a tick (done) drawn as strokes."""
+    size = max(10, round(22 * scale))
+    k = SUPERSAMPLE
+    big = size * k
+    image = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((0, 0, big - 1, big - 1), fill=tuple(SURFACE[:3]) + (255,))
+    edge = round(2.0 * scale * k)
+    draw.ellipse((edge, edge, big - 1 - edge, big - 1 - edge), fill=wait_color(state))
+    ink = (24, 23, 21, 255)
+    c, w = big / 2, max(k, round(2.3 * scale * k))
+    unit = big / 19
+    if state == "blocked":
+        draw.line((c, c - 4.2 * unit, c, c + 1.2 * unit), fill=ink, width=w)
+        draw.ellipse((c - w * 0.6, c + 3.0 * unit, c + w * 0.6, c + 3.0 * unit + w * 1.2), fill=ink)
+    elif state == "asked":
+        draw.arc((c - 3.0 * unit, c - 5.0 * unit, c + 3.0 * unit, c + 0.6 * unit), 200, 90, fill=ink, width=w)
+        draw.line((c, c + 0.4 * unit, c, c + 1.6 * unit), fill=ink, width=w)
+        draw.ellipse((c - w * 0.6, c + 3.0 * unit, c + w * 0.6, c + 3.0 * unit + w * 1.2), fill=ink)
+    elif state == "failed":
+        d = 3.2 * unit
+        draw.line((c - d, c - d, c + d, c + d), fill=ink, width=w)
+        draw.line((c - d, c + d, c + d, c - d), fill=ink, width=w)
+    else:
+        draw.line((c - 3.6 * unit, c + 0.2 * unit, c - 1.0 * unit, c + 2.8 * unit, c + 3.8 * unit, c - 2.6 * unit),
+                  fill=ink, width=w, joint="curve")
+    return image.resize((size, size), Image.LANCZOS)
 
 
 @lru_cache(maxsize=64)
@@ -1689,11 +1832,11 @@ def background(header: tuple, field_px: int, scale: float) -> Image.Image:
 
 
 def _header_model(header: tuple) -> PanelModel:
-    letter, title, status, tone, meters, (banner, alert, intel, note), forecast, daily, chart_padding, _iq, show_tps = header
+    letter, title, status, tone, meters, (banner, alert, intel, note), forecast, daily, chart_padding, _iq, show_tps, hints = header
     return PanelModel("mimo" if daily else "" if show_tps else "gemini", letter, title, status, tuple((label, None, reset) for label, reset, _ in meters), None, (),
                       tone, banner, forecast[0], forecast[1], banner_alert=alert,
                       intel=intel, intel_note=note, chart_padding=chart_padding,
-                      quota_tones=tuple(column_tone for _, _, column_tone in meters))
+                      quota_tones=tuple(column_tone for _, _, column_tone in meters), hint_space=hints)
 
 
 @lru_cache(maxsize=8)
@@ -1780,7 +1923,7 @@ def _banner(draw, px, s, banner: str, alert: str, intel: tuple, note: str, lette
 @lru_cache(maxsize=12)
 def _background(header: tuple, field_h: int, scale: float) -> Image.Image:
     model = _header_model(header)
-    letter, title, status, tone, meters, (banner, alert, intel, note), _, daily, _padding, column_iq, show_tps = header
+    letter, title, status, tone, meters, (banner, alert, intel, note), _, daily, _padding, column_iq, show_tps, _hints = header
     top = field_top(model)
     height = panel_height(model, field_h)
     s = scale
