@@ -311,6 +311,19 @@ def outlook(windows: Iterable[tuple], now: float) -> tuple[str, str]:
     return text, tone
 
 
+# Claude's windows have fixed lengths, so a reading whose reset is further
+# off than that, or already past, cannot be of the live window (a /usage
+# still showing a window that just ended, read as the same hour tomorrow).
+CLAUDE_WINDOW_MINUTES = {"claude": 300, "claude:secondary": 10080}
+
+
+def _claude_window_possible(name: str, at: float, resets_at: int | None) -> bool:
+    minutes = CLAUDE_WINDOW_MINUTES.get(name)
+    if minutes is None or resets_at is None:
+        return True
+    return at - RESET_TOLERANCE <= resets_at <= at + minutes * 60 + RESET_TOLERANCE
+
+
 class QuotaHistory:
     """Small persisted series keyed by "provider" and "provider:secondary"."""
 
@@ -333,11 +346,14 @@ class QuotaHistory:
 
     @staticmethod
     def _without_false_claude_recoveries(name: str, readings: list[Sample]) -> list[Sample]:
-        """Repair old saved spikes without erasing real new reset windows."""
+        """Repair old saved spikes (false recoveries, readings of no live
+        window) without erasing real new reset windows."""
         if name not in ("claude", "claude:secondary"):
             return readings
         clean: list[Sample] = []
         for item in sorted(readings, key=lambda row: row.at):
+            if not _claude_window_possible(name, item.at, item.resets_at):
+                continue
             if clean and same_window(clean[-1].resets_at, item.resets_at) and \
                     clean[-1].used - item.used >= CLAUDE_DROP_TOLERANCE and item.used > 5:
                 continue
@@ -363,6 +379,8 @@ class QuotaHistory:
             if series and abs(series[-1].at - at) < 1:
                 return False  # Same reading (e.g. stale value carried forward).
             sample = Sample(float(at), float(used), resets_at)
+            if not _claude_window_possible(name, sample.at, resets_at):
+                return False
             if name in ("claude", "claude:secondary") and series and \
                     same_window(series[-1].resets_at, resets_at) and \
                     series[-1].used - sample.used >= CLAUDE_DROP_TOLERANCE and sample.used > 5:

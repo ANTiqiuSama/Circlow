@@ -93,6 +93,20 @@ class UsageParsingTests(unittest.TestCase):
         self.assertEqual(parse_claude_reset("Thu, Oct 23, 3pm (UTC)", NOW), stamp(2026, 10, 23, 15))
         self.assertEqual(parse_claude_reset("Jan 2, 1pm (UTC)", NOW), stamp(2027, 1, 2, 13))
         self.assertIsNone(parse_claude_reset("soon", NOW))
+        later = datetime(2026, 10, 16, 17, 5, tzinfo=timezone.utc)
+        session = 5 * 3600 + 600
+        self.assertEqual(parse_claude_reset("5pm (UTC)", later, session), stamp(2026, 10, 16, 17))   # just reset
+        self.assertEqual(parse_claude_reset("5pm (UTC)", later), stamp(2026, 10, 17, 17))
+        self.assertEqual(parse_claude_reset("12am (UTC)", datetime(2026, 10, 16, 22, 0, tzinfo=timezone.utc), session),
+                         stamp(2026, 10, 17, 0))
+
+    def test_usage_still_showing_an_ended_session_reads_as_a_fresh_one(self):
+        just_after = datetime(2026, 10, 16, 9, 5, tzinfo=timezone.utc)  # 17:05 in Shanghai, the session reset at 17:00
+        with patch.object(cli_usage, "datetime", wraps=datetime) as fake:
+            fake.now.side_effect = lambda tz=None: just_after
+            result = parse_claude_usage(USAGE)
+        self.assertEqual((result["used_percent"], result["remaining_percent"], result["resets_at"]), (0.0, 100.0, None))
+        self.assertEqual(result["secondary_used_percent"], 7)                     # the week goes on
 
     def test_percent_left_and_missing_week(self):
         result = parse_claude_usage("Current session\n 60% left\n")
@@ -104,8 +118,11 @@ class UsageParsingTests(unittest.TestCase):
             parse_claude_usage("Total cost: $0.12\nUsage by model: ...")
 
     def test_snapshot_carries_both_windows(self):
+        with patch.object(cli_usage, "datetime", wraps=datetime) as fake:
+            fake.now.side_effect = lambda tz=None: NOW
+            usage = parse_claude_usage(USAGE)
         with patch.object(providers, "find_claude", return_value=Path("claude.exe")), \
-                patch.object(claude_quota, "read_usage", return_value=parse_claude_usage(USAGE)):
+                patch.object(claude_quota, "read_usage", return_value=usage):
             snapshot = quota_sources.get_claude_quota()
         self.assertIsNone(snapshot.error)
         self.assertEqual((snapshot.remaining_percent, snapshot.secondary_remaining_percent, snapshot.display_remaining), (81, 93, 81))
@@ -167,8 +184,9 @@ class ReaderIsolationTests(unittest.TestCase):
             self.assertEqual(list((Path(folder) / "Circlow/work").iterdir()), [])
 
     def test_worker_transfers_only_parsed_quota_numbers(self):
-        with tempfile.TemporaryDirectory() as folder, \
+        with tempfile.TemporaryDirectory() as folder, patch.object(cli_usage, "datetime", wraps=datetime) as fake, \
                 patch.object(claude_quota, "run_temporary_usage", return_value=USAGE + "\nprivate@example.test"):
+            fake.now.side_effect = lambda tz=None: NOW
             destination = Path(folder) / "result.json"
             self.assertEqual(claude_quota.worker("claude.exe", str(destination)), 0)
             raw = destination.read_text(encoding="utf-8")
