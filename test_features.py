@@ -125,9 +125,9 @@ class ForecastTests(unittest.TestCase):
     def test_claude_history_repairs_false_peak_with_unchanged_reset(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "history.json"
-            reset = 2_000_000
-            path.write_text('{"series":{"claude":[[1000,80,2000000],[1060,30,2000000],'
-                            '[1120,30,2000000],[1180,81,2000000],[1240,0,2018000]]}}', encoding="utf-8")
+            reset = 1200
+            path.write_text('{"series":{"claude":[[1000,80,1200],[1060,30,1200],'
+                            '[1120,30,1200],[1180,81,1200],[1240,0,19200]]}}', encoding="utf-8")
             history = QuotaHistory(path)
             self.assertEqual([row.used for row in history.samples("claude")], [80, 81, 0])
             fresh = QuotaHistory(Path(folder) / "fresh.json")

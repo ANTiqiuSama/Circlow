@@ -935,6 +935,29 @@ class AgentPanelTests(unittest.TestCase):
         loaded.save()
         self.assertEqual(len(json.loads(path.read_text(encoding="utf-8"))["series"]["grok"]), 3)
 
+    def test_claude_reading_of_no_live_window_never_reaches_the_curve(self):
+        import json
+        from pathlib import Path
+        from forecast import QuotaHistory, history_curve
+        hour, old_reset = 3600, 1_800_018_000
+        new_reset = old_reset + 5 * hour
+        # /usage a few minutes after a reset still showed the ended window,
+        # and its "Resets 5pm" was read as 5pm tomorrow.
+        readings = [[old_reset - 600, 36.0, old_reset], [old_reset + 2, 0.0, None],
+                    [old_reset + 351, 38.0, old_reset + 86400], [old_reset + 539, 0.0, new_reset],
+                    [old_reset + 900, 2.0, new_reset]]
+        path = Path(self.folder.name) / 'no-live-window.json'
+        path.write_text(json.dumps({"series": {"claude": readings}}), encoding="utf-8")
+        history = QuotaHistory(path)
+        self.assertNotIn(old_reset + 351, [s.at for s in history.samples("claude")])   # repaired on load
+        points, _ = history_curve(history.samples("claude"), old_reset - hour, old_reset + hour, 300)
+        after = [left for at, left in points if at > old_reset]
+        self.assertGreaterEqual(min(after), 98.0)                                         # no dip after the reset
+        self.assertFalse(history.add("claude", old_reset + 1000, 40.0, old_reset + 86400 + 1000))
+        self.assertFalse(history.add("claude", old_reset + 1000, 40.0, old_reset - hour))   # an ended window
+        self.assertTrue(history.add("claude", old_reset + 1000, 3.0, new_reset))
+        self.assertTrue(history.add("claude:secondary", old_reset + 1000, 30.0, old_reset + 6 * 86400))
+
     def test_idle_sources_are_faint_context_on_one_legend_row(self):
         series = [agent_panel.BurnSeries('Claude Code · 5 小时', 0, ((0, 60.0), (600, 40.0)), 2.0, None, 'A'),
                   agent_panel.BurnSeries('Codex · 5 小时', 0, ((0, 100.0), (600, 100.0)), None, None, 'C', idle=True),
@@ -961,8 +984,8 @@ class AgentPanelTests(unittest.TestCase):
         history = QuotaHistory(Path(self.folder.name) / 'folded.json')
         start = 1_000_000.0
         for index in range(5000):                       # a reading every 5 s for ~7 h, mostly unchanged
-            history.add('claude', start + index * 5, 10 + index // 500, 9_999_999)
-        samples = history.samples('claude')
+            history.add('grok', start + index * 5, 10 + index // 500, 9_999_999)
+        samples = history.samples('grok')
         self.assertLess(len(samples), 40)                                  # two per level, not 5000
         self.assertLess(len(samples), KEEP_SAMPLES)
         self.assertEqual((samples[0].at, samples[-1].at), (start, start + 4999 * 5))   # the whole span is kept

@@ -474,8 +474,12 @@ def _zone(name: str | None):
         return None
 
 
-def parse_claude_reset(value: str, now: datetime | None = None) -> int | None:
-    """'5pm (Asia/Shanghai)', 'Oct 23, 3:30pm (UTC)', '15:00' -> epoch seconds."""
+def parse_claude_reset(value: str, now: datetime | None = None, within: float | None = None) -> int | None:
+    """'5pm (Asia/Shanghai)', 'Oct 23, 3:30pm (UTC)', '15:00' -> epoch seconds.
+
+    A bare time already past means tomorrow, unless that is further off than
+    `within` seconds (a window's length): then it is the reset that just
+    happened, and the past moment is returned."""
     value = value.strip()
     zone_match = re.search(r"\(([A-Za-z]+(?:/[A-Za-z0-9_+\-]+)*)\)", value)
     zone = _zone(zone_match.group(1)) if zone_match else None
@@ -505,7 +509,8 @@ def parse_claude_reset(value: str, now: datetime | None = None) -> int | None:
             moment = moment.replace(year=moment.year + 1)
     else:
         moment = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if moment <= current - timedelta(minutes=1):
+        if moment <= current - timedelta(minutes=1) and (
+                within is None or moment + timedelta(days=1) - current <= timedelta(seconds=within)):
             moment += timedelta(days=1)
     return int(moment.timestamp())
 
@@ -528,14 +533,23 @@ def _claude_sections(text: str) -> dict[str, str]:
     return sections
 
 
-def _claude_window(body: str) -> tuple[float | None, int | None]:
+def _claude_window(body: str, now: datetime | None = None, minutes: int | None = None) -> tuple[float | None, int | None]:
+    """(used %, reset) of one /usage section. A section whose reset has
+    already passed still shows the window that ended (/usage trails the
+    account for a few minutes after a reset): that window is over, so the
+    reading is a fresh one, unused with no reset yet, as the status line
+    reports it too."""
     percent = CLAUDE_PERCENT_RE.search(body)
     used = None
     if percent:
         value = max(0.0, min(100.0, float(percent.group(1))))
         used = value if percent.group(2).lower() == "used" else 100.0 - value
-    reset = CLAUDE_RESET_RE.search(body)
-    return used, (parse_claude_reset(reset.group(1)) if reset else None)
+    match = CLAUDE_RESET_RE.search(body)
+    now = now or datetime.now(timezone.utc)
+    reset = parse_claude_reset(match.group(1), now, minutes * 60 + 600 if minutes else None) if match else None
+    if used is not None and reset is not None and reset <= now.timestamp():
+        return 0.0, None
+    return used, reset
 
 
 def claude_usage_complete(text: str) -> bool:
@@ -545,8 +559,9 @@ def claude_usage_complete(text: str) -> bool:
 
 def parse_claude_usage(text: str) -> dict[str, Any]:
     sections = _claude_sections(text)
-    session_used, session_reset = _claude_window(sections.get("session", ""))
-    week_used, week_reset = _claude_window(sections.get("week", ""))
+    now = datetime.now(timezone.utc)
+    session_used, session_reset = _claude_window(sections.get("session", ""), now, 300)
+    week_used, week_reset = _claude_window(sections.get("week", ""), now)
     if session_used is None and week_used is None:
         raise ValueError("Claude /usage 未找到订阅额度（API Key 计费账号没有 5 小时/每周额度）")
     result: dict[str, Any] = {
