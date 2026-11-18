@@ -26,6 +26,8 @@ from typing import Any
 import psutil
 
 import providers
+import herdr_source
+import session_links
 from herdr_source import Herdr
 from agent_tasks import AgentNotes, RECUR_SPREAD, clean as clean_request, read_schedules, tool_action
 
@@ -1201,7 +1203,18 @@ class TpsMonitor:
         self.health["herdr"] = {"status": self.herdr.status, "panes": len(self.herdr.rows)}
         try:
             # Built here, on the thread that feeds the notes; the hover hint reads this snapshot.
-            self.recent_work = self.notes.work(agents, self.context, now, provider_for)
+            panes = {}
+            for row in self.herdr.rows:
+                title = str(row.get("title") or row.get("terminal_title_stripped") or "").strip()
+                title = "" if re.search(r"[\\/]|\.exe\b", title, re.I) else title
+                for session in herdr_source.session_ids(row):
+                    panes[session] = (str(row.get("agent_status") or ""), str(row.get("pane_id") or ""), title)
+
+            def seen(key: str):
+                entry = session_links.DESKTOP.lookup(key)
+                return entry[1] if entry else None
+
+            self.recent_work = self.notes.work(agents, self.context, now, provider_for, panes=panes, seen=seen)
         except Exception:
             log.debug("hint material failed", exc_info=True)
         return agents

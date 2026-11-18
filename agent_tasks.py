@@ -26,6 +26,8 @@ GROUPS_PATH = DATA_DIR / "agent_groups.json"
 SUMMARY_CONFIG = DATA_DIR / "agent_summary.json"
 LIVE_SECONDS = 45          # A sub-agent without its own activity flag counts as working this long.
 RECENT_SECONDS = 180       # Finished agents linger as dim bubbles so the field does not flicker.
+DONE_WAIT_SECONDS = 20 * 60  # finished work without a "seen" signal waits for the user this long
+WAIT_TEXT = {"blocked": "待批准", "asked": "在问你", "failed": "出错了", "done": "已完成"}
 WORK_SECONDS = 45 * 60     # Sessions the hover hint looks at: working, or touched this recently.
 KEEP_ASKS, KEEP_STEPS, KEEP_ERRORS = 4, 10, 4
 REPLY_CHARS, ASK_CHARS, ERROR_CHARS = 1600, 600, 300
@@ -101,6 +103,20 @@ def _named_request(note) -> str:
         if len(cleaned) >= 6 and not trivial(cleaned) and not re.match(r"^(?:一起|提交|合入)", cleaned):
             return cleaned
     return note.first or note.prompt
+
+
+def _last_sentence(text: str, question: bool = False) -> str:
+    """The agent's closing sentence, as it wrote it (markdown stripped): with
+    `question`, the last one that asks something."""
+    text = re.sub(r"```.*?```", " ", str(text or ""), flags=re.S)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"[*_`#>]+", "", text)
+    parts = [part.strip(" -•\t") for part in re.split(r"(?<=[。！？!?])|\n+", text)]
+    parts = [part for part in parts if len(part) >= 4]
+    if question:
+        asking = [part for part in parts if QUESTION.search(part)]
+        parts = asking or parts
+    return re.sub(r"\s+", " ", parts[-1]).strip()[:120] if parts else ""
 
 
 def _basename(value: str) -> str:
@@ -537,24 +553,31 @@ class AgentNotes:
         return result
 
     def work(self, agents: list[dict], context: dict, now: float, provider_of=lambda model: "other",
-             window: float = WORK_SECONDS) -> list[dict]:
-        """What the hover hint reads: every session the user drove (not a
-        sub-agent or scheduled run) that is working or was touched within
-        `window`, with its state, the user's requests, the agent's last
-        message, its latest steps and failures. `agents` is the exported list
-        (live flags and herdr pane states)."""
+             window: float = WORK_SECONDS, panes: dict | None = None, seen=None) -> list[dict]:
+        """Every session the user drove (not a sub-agent or scheduled run)
+        that is working, waiting for him, or was touched within `window`: its
+        state, whether it waits for him (`waiting`), the user's requests, the
+        agent's last message, its latest steps and failures. `agents` is the
+        exported list (live flags, herdr tags); `panes` maps a session id to
+        its herdr pane (status, pane id, title) and `seen(key)` says whether
+        the user looked at it since its last turn (True / False / None)."""
         shown = {agent["key"]: agent for agent in agents}
+        panes = panes or {}
         home = Path.home().name.lower()
         result = []
         for key, note in list(self.notes.items()):
             agent = shown.get(key) or {}
-            if note.parent or note.schedule_id or not note.asks:
+            if note.parent or note.schedule_id:
                 continue
-            herdr = str(agent.get("herdr_status") or "")
+            pane_status, pane, pane_title = panes.get(key) or ("", "", "")
+            if not (note.asks or note.title or agent.get("herdr_title") or pane_title):
+                continue        # nothing from the user: the tray's own reads, a CLI opened and closed
+            herdr = str(agent.get("herdr_status") or pane_status or "")
+            pane = str(agent.get("pane") or pane or "")
             working = herdr == "working" or bool(agent.get("live")) and herdr != "blocked" and not note.ended_at
-            if not (working or herdr == "blocked" or note.active_at >= now - window):
+            if not (working or herdr in ("blocked", "done") or note.active_at >= now - window):
                 continue
-            last_ask = note.asks[-1][0] or 0
+            last_ask = note.asks[-1][0] or 0 if note.asks else 0
             if herdr == "blocked":
                 state = "blocked"
             elif working:
@@ -573,21 +596,41 @@ class AgentNotes:
             if folder.lower() in (home, "system32", "administrator", "users", ""):
                 folder = ""
             since = note.ended_at or note.active_at
+            errors = [text for moment, text in note.errors if moment >= last_ask - 1]
+            if state == "blocked":
+                detail = note.action or _last_sentence(note.reply)
+            elif state == "failed":
+                detail = errors[-1] if errors else "被中断" if note.end_kind == "aborted" else ""
+            else:
+                detail = _last_sentence(note.reply, question=state == "asked")
+            named = note.title if len(note.title) >= 6 and not re.match(r"^(?:继续|一起|提交)", note.title) else ""
+            looked = seen(key) if seen else None
+            if state == "blocked":
+                waiting = "blocked"
+            elif state == "working" or herdr == "idle" or looked:
+                waiting = ""              # running, or the user has seen it since it stopped
+            elif state in ("asked", "failed"):
+                waiting = state
+            elif herdr == "done" or looked is False or since and now - since <= DONE_WAIT_SECONDS:
+                waiting = "done"
+            else:
+                waiting = ""
             result.append({
-                "key": key, "provider": provider, "state": state, "project": folder,
-                "title": note.title if len(note.title) >= 6 and not re.match(r"^(?:继续|一起|提交)", note.title)
-                else _named_request(note), "first": note.first,
+                "key": key, "provider": provider, "state": state, "waiting": waiting, "pane": pane,
+                "project": folder, "origin": note.origin,
+                "title": named or str(agent.get("herdr_title") or pane_title or "") or _named_request(note),
+                "detail": detail, "first": note.first,
                 "asks": [text for _, text in note.asks], "reply": note.reply,
                 "steps": [action for _, action in note.steps],
-                "errors": [text for moment, text in note.errors if moment >= last_ask - 1],
+                "errors": errors,
                 "older_errors": len([1 for moment, _ in note.errors if moment < last_ask - 1]),
                 "minutes": max(0, round((now - since) / 60)) if since else None,
                 "running_minutes": max(0, round((now - last_ask) / 60)) if working and last_ask else None,
                 "at": note.active_at,
             })
         order = {"blocked": 0, "asked": 1, "failed": 2, "working": 3, "done": 4}
-        result.sort(key=lambda item: (order[item["state"]], -item["at"]))
-        return result[:8]
+        result.sort(key=lambda item: (not item["waiting"], order[item["state"]], -item["at"]))
+        return result[:10]
 
 
 # ----- scheduled tasks ----------------------------------------------------------
@@ -1046,6 +1089,49 @@ class Summarizer:
             if len(self.results) > 400:
                 for stale in list(self.results)[:200]:
                     self.results.pop(stale, None)
+
+
+WAIT_ORDER = {"blocked": 0, "asked": 1, "failed": 2, "done": 3}
+
+
+def wait_rank(agent: dict) -> tuple:
+    """Most pressing first: waiting by kind, then the latest."""
+    return WAIT_ORDER.get(str(agent.get("waiting") or ""), 9), -(agent.get("at") or 0)
+
+
+def with_waiting(agents: list[dict], work: list[dict]) -> list[dict]:
+    """The exported agents plus every session waiting for the user (from
+    AgentNotes.work), so it keeps a bubble until he answers or looks: an agent
+    already there is tagged, a finished one past RECENT_SECONDS comes back."""
+    result = [dict(agent) for agent in agents]
+    by_key = {agent["key"]: agent for agent in result}
+    for agent in result:
+        if agent.get("herdr_status") == "blocked" and not agent.get("waiting"):
+            agent["waiting"] = "blocked"
+    for item in work:
+        state = item.get("waiting")
+        if not state:
+            continue
+        extra = {"waiting": state, "wait_detail": item.get("detail") or "", "wait_minutes": item.get("minutes")}
+        if item.get("pane"):
+            extra["pane"] = item["pane"]
+        if item["key"] in by_key:
+            by_key[item["key"]].update(extra)
+            continue
+        title = item.get("title") or ""
+        agent = {"key": item["key"], "provider": item.get("provider") or "other", "source": "", "model": "",
+                 "title": title, "thread_title": title, "request": title, "doing": "", "live": False,
+                 "at": item.get("at") or 0, "parent": "", "role": "", "folder": item.get("project") or "",
+                 "tps": None, "schedule": "", "origin": item.get("origin") or "", **extra}
+        result.append(agent)
+        by_key[agent["key"]] = agent
+    return result
+
+
+def waiting_of(cluster: Cluster) -> str:
+    """The most pressing wait among a bubble's members, or ""."""
+    states = [str(m.get("waiting")) for m in cluster.members if m.get("waiting")]
+    return min(states, key=lambda state: WAIT_ORDER.get(state, 9)) if states else ""
 
 
 def describe(cluster: Cluster, summary: dict | None = None) -> tuple[str, str, str]:

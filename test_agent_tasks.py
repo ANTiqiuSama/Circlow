@@ -524,7 +524,7 @@ class SceneTests(unittest.TestCase):
         moment = self.settle(scene)
         a = scene.bodies["a"]
         events = scene.step(moment + 0.02, (a.x, a.y), True, False) + scene.step(moment + 0.04, (a.x, a.y), False, False)
-        self.assertEqual(events, [])
+        self.assertEqual(events, [("open", "a")])                         # a click opens the session, never merges
         home = (a.x, a.y)
         scene.step(moment + 0.06, home, True, False)
         events = []
@@ -1171,17 +1171,17 @@ class GrokIqColumnTests(unittest.TestCase):
         from PIL import Image, ImageChops, ImageDraw
         grok = agent_panel.PanelModel("grok", "X", "Grok", "空闲", (("每周", 75, ""),), 12, (),
                                       column_iq=("智商", "82", "Grok 4.7/Fable 5.1", "%"))
-        self.assertEqual(grok.header[-2], ("智商", "82", "Grok 4.7/Fable 5.1", "%"))
-        self.assertTrue(grok.header[-1])
+        self.assertEqual(grok.header[-3], ("智商", "82", "Grok 4.7/Fable 5.1", "%"))
+        self.assertTrue(grok.header[-2])
         codex = agent_panel.PanelModel("codex", "C", "Codex", "空闲", (("5小时", 40, ""), ("每周", 80, "")), 3, ())
         gemini = agent_panel.PanelModel("gemini", "G", "Gemini", "空闲",
                                         (("Argon", 30), ("Claude/GPT", 40), ("Gemini", 50)), None, ())
         mimo = agent_panel.PanelModel("mimo", "M", "MiMo", "空闲", (("套餐额度", 90, ""),), 4, (), today_used=10)
-        self.assertEqual(codex.header[-2], ())
-        self.assertTrue(codex.header[-1])
-        self.assertEqual(gemini.header[-2], ())
-        self.assertFalse(gemini.header[-1])
-        self.assertEqual(mimo.header[-2], ())
+        self.assertEqual(codex.header[-3], ())
+        self.assertTrue(codex.header[-2])
+        self.assertEqual(gemini.header[-3], ())
+        self.assertFalse(gemini.header[-2])
+        self.assertEqual(mimo.header[-3], ())
         spare = agent_panel.spare_slot(1, True)
         columns = agent_panel.meter_columns(1)
         self.assertIsNotNone(spare)

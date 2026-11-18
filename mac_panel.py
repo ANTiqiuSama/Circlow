@@ -16,6 +16,7 @@ conversions below only flip y and subtract the shadow margin.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 import agent_panel
@@ -463,6 +464,12 @@ class MacPanel:
                 provider = window.provider
                 self.close("settings opened")
                 self.on_settings(provider, event[1] if len(event) > 1 else None)
+                return
+            if event[0] == "open":
+                self.close("session opened")
+                opener = getattr(self.tray, "open_session", None)
+                if opener is not None:
+                    threading.Thread(target=opener, args=(event[1],), name="open-session", daemon=True).start()
                 return
             if event[0] == "merge":
                 merged = self.tray.merge(event[1], event[2])
