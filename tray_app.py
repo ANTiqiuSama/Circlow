@@ -841,6 +841,19 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
             return True
         return self.tps_monitor.stirred(now)
 
+    def refresh_hint(self) -> None:
+        """Keep MiMo's hint ready in the background: every scan hands the
+        advisor the current sessions, and it asks MiMo when they changed (or
+        every REFRESH_SECONDS while one works). Hovering then shows the line
+        at once instead of starting a request that takes 10 to 40 seconds."""
+        advisor = getattr(self, "hint_advisor", None)
+        if advisor is None:
+            return
+        try:
+            advisor.lookup(agent_hints.context(getattr(self.tps_monitor, "recent_work", None) or []))
+        except Exception:
+            log.debug("background hint refresh failed", exc_info=True)
+
     def tps_loop(self) -> None:
         last_wall = time.time()
         failures = 0
@@ -865,6 +878,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                     self.performance = self.with_other_devices(local, now)   # before local_performance: it compares the two
                     self.local_performance = local
                     self.agents = self.tps_monitor.agents(now)
+                    self.refresh_hint()
                     self.save_performance_if_changed(local, now)
                     self.scanned_at = now
                 elif getattr(self, "live", None) is not None:
