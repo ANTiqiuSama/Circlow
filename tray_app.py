@@ -847,7 +847,9 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         """Keep MiMo's hint ready in the background: every scan hands the
         advisor the current sessions, and it asks MiMo when they changed (or
         every REFRESH_SECONDS while one works). Hovering then shows the line
-        at once instead of starting a request that takes 10 to 40 seconds."""
+        at once instead of starting a request that takes 10 to 40 seconds.
+        tps_loop calls it on mains power only: on battery the hint is asked
+        for only while a panel is open."""
         advisor = getattr(self, "hint_advisor", None)
         if advisor is None:
             return
@@ -869,7 +871,8 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                     self.wake.set()
                 last_wall = now
                 power = getattr(self, "power", None)
-                if power is not None and self.scheduler.set_battery(power.battery(now), now):
+                battery = power is not None and power.battery(now)
+                if power is not None and self.scheduler.set_battery(battery, now):
                     self.wake.set()
                 saving = self.saving(now)
                 scan = self.scan_due(now, saving)
@@ -880,7 +883,8 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                     self.performance = self.with_other_devices(local, now)   # before local_performance: it compares the two
                     self.local_performance = local
                     self.agents = self.tps_monitor.agents(now)
-                    self.refresh_hint()
+                    if not battery:
+                        self.refresh_hint()      # on battery only an open panel asks MiMo
                     self.save_performance_if_changed(local, now)
                     self.scanned_at = now
                 elif getattr(self, "live", None) is not None:

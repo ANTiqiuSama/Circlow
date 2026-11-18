@@ -7,9 +7,12 @@ A click on a task bubble goes to the session itself, not just its app:
 * a Codex thread (desktop app or CLI, they share the thread store):
   `codex://threads/<thread id>`;
 * a Claude Code session of the Claude desktop app:
-  `claude://code/needs-input?session=local_…`, the desktop's own id, read
+  `claude://code/continue?session=local_…`, the desktop's own id, read
   from its session index (claude-code-sessions/*/*/local_*.json, which maps
-  the CLI transcript id to it);
+  the CLI transcript id to it). Not `code/needs-input?session=…`: the
+  desktop looks that id up only among the sessions it marks as waiting and
+  otherwise opens another waiting one, or a new session when none waits;
+  `continue` opens the session itself, whatever its state;
 * anything else: the source's usual way of opening (the caller's fallback).
 
 The desktop index also says whether the user has looked at a session since
@@ -104,7 +107,7 @@ def link_for(member: dict, desktop: DesktopIndex = DESKTOP) -> str | None:
     if provider == "claude" and key:
         entry = desktop.lookup(key)
         if entry:
-            return f"claude://code/needs-input?session={entry[0]}"
+            return f"claude://code/continue?session={entry[0]}"
     return None
 
 

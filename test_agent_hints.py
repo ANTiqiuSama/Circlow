@@ -231,7 +231,7 @@ class OpenTests(unittest.TestCase):
                                                     desktop=index), "url")
         self.assertEqual(session_links.open_session({"key": "cli-1", "provider": "claude"}, start_url=urls.append,
                                                     desktop=index), "url")
-        self.assertEqual(urls, ["codex://threads/019a-thread", "claude://code/needs-input?session=local_2f79"])
+        self.assertEqual(urls, ["codex://threads/019a-thread", "claude://code/continue?session=local_2f79"])
         self.assertIsNone(session_links.open_session({"key": "cli-2", "provider": "claude"}, start_url=urls.append,
                                                      desktop=index))      # a CLI session outside herdr: no link
 

@@ -184,7 +184,7 @@ $env:CODEX_QUOTA_PROVIDERS = 'codex,grok,gemini'
 | 操作或状态 | 行为 |
 | --- | --- |
 | 鼠标在图标上短暂停留 | 打开任务气泡面板（额度、TPS、agent 气泡与消耗预测；定时任务不显示在面板中） |
-| 单击气泡（按下松开、不拖动） | 打开它的会话，在那里回复：herdr 窗格（聚焦该窗格并把 herdr 窗口切到前台）；Codex 打开 `codex://threads/<线程>`（macOS 由 ChatGPT.app 接管）；Claude 桌面版会话打开 `claude://code/needs-input?session=local_…`。都没有时：Claude Code、Grok 只把 herdr 切到前台，其他来源打开自己的应用；从不新开一个 agent |
+| 单击气泡（按下松开、不拖动） | 打开它的会话，在那里回复：herdr 窗格（聚焦该窗格并把 herdr 窗口切到前台）；Codex 打开 `codex://threads/<线程>`（macOS 由 ChatGPT.app 接管）；Claude 桌面版会话打开 `claude://code/continue?session=local_…`（不用 `needs-input`：Claude 桌面版只在它标为“等你”的会话里找这个 id，找不到就打开别的会话或新建一个）。都没有时：Claude Code、Grok 只把 herdr 切到前台，其他来源打开自己的应用；从不新开一个 agent |
 | 拖动气泡叠到另一个气泡上松开 | 标记为同一任务，合并为大气泡并重新识别 |
 | 右键合并后的大气泡 | 拆回独立气泡 |
 | 移开鼠标 | 关闭详情，图标恢复最新数值 |
@@ -404,7 +404,7 @@ $env:CODEX_QUOTA_SUMMARY_MODEL = 'small-model-name'
 ```
 
 也可以在设置 → 任务的“任务命名”中配置并测试（改动自动保存），或写入 `%LOCALAPPDATA%\Circlow\agent_summary.json`（macOS：`~/Library/Application Support/Circlow/agent_summary.json`，保存时设为只有本用户可读）：`{"url": "...", "key": "...", "model": "...", "enabled": true}`；设置 `enabled: false` 保留配置并停用。环境变量优先于文件。启用后，每个气泡在其请求变化时才发起一次后台请求（结果按输入缓存，失败后 5 分钟内不再请求），合并的大气泡会请求一个总任务名和每个成员的分工；识别期间气泡外圈显示旋转弧线。发送的内容仅为每个成员最近一次请求的前 400 字、项目文件夹名和当前动作。
-当该配置指向小米 MiMo 时，所有来源图标的任务面板共用同一条提示（`agent_hints.py`，固定用 `mimo-v2.6-pro` 并开启思考，可用 `CIRCLOW_HINT_MODEL` 改）：MiMo 读最近 45 分钟内用过的会话（最多 6 个）：每个会话的状态（working / blocked / asked / failed / done）、最初和最近几条要求、agent 最后一段回复、最近的动作和本轮报错，只写一行“卡住或跑偏”或“一条具体建议”，没有就什么都不写。发送前去掉密钥和邮箱，不发送用量或额度；回复提到未知会话、对没在跑的会话说卡住、谈工作方式或用量、过长时丢弃。两次请求至少间隔 90 秒，有会话在跑时每 10 分钟重看一次，会话状态变了就不再显示旧的那条，一条最长显示 30 分钟，失败后 5 分钟退避；日志只记提示的类别，不记内容。
+当该配置指向小米 MiMo 时，所有来源图标的任务面板共用同一条提示（`agent_hints.py`，固定用 `mimo-v2.6-pro` 并开启思考，可用 `CIRCLOW_HINT_MODEL` 改）：MiMo 读最近 45 分钟内用过的会话（最多 6 个）：每个会话的状态（working / blocked / asked / failed / done）、最初和最近几条要求、agent 最后一段回复、最近的动作和本轮报错，只写一行“卡住或跑偏”或“一条具体建议”，没有就什么都不写。发送前去掉密钥和邮箱，不发送用量或额度；回复提到未知会话、对没在跑的会话说卡住、谈工作方式或用量、过长时丢弃。接通电源时在后台准备（每次扫描本机记录后交给 MiMo 判断是否该更新），打开面板就能看到；使用电池时只在面板打开期间请求。两次请求至少间隔 90 秒，有会话在跑时每 10 分钟重看一次，会话状态变了就不再显示旧的那条，一条最长显示 30 分钟，失败后 5 分钟退避；日志只记提示的类别，不记内容。
 
 ## 配置
 
