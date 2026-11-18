@@ -84,6 +84,50 @@ class ClaudeStatusTests(unittest.TestCase):
             value = quota_sources.get_claude_quota()
         self.assertEqual((value.remaining_percent, value.resets_at, value.secondary_remaining_percent), (100.0, None, 90))
 
+    def test_an_ended_window_in_the_last_usage_check_does_not_outvote_the_fresh_one(self):
+        # 16:05, five minutes after a 16:00 reset: the status line has rolled
+        # over, but the /usage check from 15:55 still holds the ended
+        # window's 29 % used. That is not "further along": the fresh window
+        # shows at once, not the old 71 % until the next /usage check.
+        now = time.time()
+        report = {'updated_at': now, 'observed_at': now - 5, 'rate_limits': {
+            'five_hour': {'used_percentage': 0.0, 'resets_at': None, 'idle': True},
+            'seven_day': {'used_percentage': 48, 'resets_at': int(now + 86400)}}}
+        ended = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 29, 71, int(now - 300), now - 600, False, None,
+                                            10080, 48, 52, int(now + 86400))
+        quota_sources._CLAUDE_PROBE.update(snapshot=ended, at=now - 600)
+        with patch.object(claude_status, 'latest', return_value=report), \
+                patch.object(quota_sources.cli_quota, 'read_usage') as cli:
+            value = quota_sources.get_claude_quota()
+        cli.assert_not_called()
+        self.assertEqual((value.remaining_percent, value.resets_at, value.secondary_remaining_percent), (100.0, None, 52))
+        self.assertEqual((ended.remaining_percent, ended.resets_at), (71, int(now - 300)))   # the cached check is untouched
+
+    def test_a_status_line_record_of_an_ended_window_is_taken_as_the_fresh_one(self):
+        import forecast
+        import tray_app
+        now = time.time()
+        record = {'updated_at': now - 400, 'rate_limits': {
+            'five_hour': {'used_percentage': 29, 'resets_at': int(now - 300)},
+            'seven_day': {'used_percentage': 48, 'resets_at': int(now + 86400)}}}
+        shown = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 29, 71, int(now - 300), now - 400, False, None,
+                                            10080, 48, 52, int(now + 86400))
+        native = quota_sources.native_claude_quota(record)
+        self.assertEqual((native.remaining_percent, native.resets_at, native.secondary_resets_at),
+                         (100.0, None, int(now + 86400)))
+        self.assertIsNot(quota_sources.claude_newer(native, shown), shown)      # taken, not dismissed as older
+        fresh = quota_sources.keep_last_good(native, shown)
+        self.assertFalse(fresh.held)
+        self.assertEqual(len(tray_app.reset_changes(shown, fresh, now)), 1)     # the reset is announced now
+        with tempfile.TemporaryDirectory() as tmp:
+            history = forecast.QuotaHistory(Path(tmp) / 'history.json')
+            self.assertTrue(history.record(fresh))                              # the chart steps up at the reset
+            self.assertEqual(history.series['claude'][-1].used, 0.0)
+        failed = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, None, None, None, now, False, 'exited')
+        carried = quota_sources.keep_last_good(failed, shown)                   # a failed read carries figures over...
+        self.assertTrue(carried.stale)
+        self.assertEqual((carried.remaining_percent, carried.resets_at), (100.0, None))   # ...of the window that is on now
+
     def test_native_quota_avoids_cli_and_uses_real_update_time(self):
         now = time.time()
         report = {'updated_at': now, 'rate_limits': {

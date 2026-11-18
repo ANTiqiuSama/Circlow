@@ -122,8 +122,9 @@ class UsageParsingTests(unittest.TestCase):
             fake.now.side_effect = lambda tz=None: NOW
             usage = parse_claude_usage(USAGE)
         with patch.object(providers, "find_claude", return_value=Path("claude.exe")), \
-                patch.object(claude_quota, "read_usage", return_value=usage):
-            snapshot = quota_sources.get_claude_quota()
+                patch.object(claude_quota, "read_usage", return_value=usage), \
+                patch.object(quota_sources.time, "time", return_value=NOW.timestamp()):   # read at NOW too:
+            snapshot = quota_sources.get_claude_quota()                                   # its resets lie ahead
         self.assertIsNone(snapshot.error)
         self.assertEqual((snapshot.remaining_percent, snapshot.secondary_remaining_percent, snapshot.display_remaining), (81, 93, 81))
 
