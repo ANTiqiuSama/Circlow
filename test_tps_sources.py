@@ -1,5 +1,7 @@
 import json
+import os
 import sqlite3
+import tempfile
 import time
 import unittest
 import uuid
@@ -504,6 +506,26 @@ class ClaudeStreamTests(unittest.TestCase):
         self.assertIn("含 1 个子代理", data["display_basis"])
         self.observe("b2", "agent-x", n - 5, 300, 10, turn_end=True)    # the sub-agent finished
         self.assertEqual(self.monitor.snapshot(n)["providers"]["claude"]["display_tps"], 175.0)
+
+    def test_a_sub_agent_marked_finished_stops_adding_up(self):
+        # A sub-agent stopped mid-run writes no end_turn reply (its file ends
+        # on a tool result); Claude Code's meta file beside it says finished.
+        n = self.now
+        folder = Path(tempfile.mkdtemp()) / "subagents"
+        folder.mkdir()
+        record = folder / "agent-x.jsonl"
+        record.write_text("", encoding="utf-8")
+        meta = folder / "agent-x.meta.json"
+        self.monitor.claude_streams[("s", "agent-x")] = record
+        self.observe("a1", "", n - 10, 900, 10)                  # the session: 90 tok/s
+        self.observe("b1", "agent-x", n - 20, 600, 10)           # its sub-agent: 60 tok/s, last reply tool_use
+        self.assertEqual(self.monitor.snapshot(n)["providers"]["claude"]["display_tps"], 150.0)
+        meta.write_text(json.dumps({"agentType": "general-purpose", "finished": False}), encoding="utf-8")
+        self.assertEqual(self.monitor.snapshot(n)["providers"]["claude"]["display_tps"], 150.0)
+        meta.write_text(json.dumps({"agentType": "general-purpose", "finished": True}), encoding="utf-8")
+        self.assertEqual(self.monitor.snapshot(n)["providers"]["claude"]["display_tps"], 90.0)   # the session alone
+        os.utime(meta, (n - 60, n - 60))                         # finished before its last reply: resumed since
+        self.assertEqual(self.monitor.snapshot(n)["providers"]["claude"]["display_tps"], 150.0)
 
     def test_one_stream_is_not_averaged_with_another(self):
         n = self.now

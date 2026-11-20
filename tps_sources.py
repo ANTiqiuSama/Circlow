@@ -239,6 +239,7 @@ class TpsMonitor:
         self.claude_pending: dict[str, dict[str, Any]] = {}
         self.claude_last_input: dict[str, float] = {}   # stream -> last user / tool-result record
         self.claude_request_starts: dict[tuple[str, str], float] = {}
+        self.claude_streams: dict[tuple[str, str], Path] = {}   # (session, sub-agent) -> its record file
         self.claude_desktop_last_use = 0.0
         self.home_override = home is not None
         self.mimocode_paths: list[Path] | None = None
@@ -1156,6 +1157,8 @@ class TpsMonitor:
                 source = self.context.get(session, {}).get("source")
                 if source == "Claude Code":
                     agent = path.stem if path.parent.name == "subagents" else session
+                    if agent != session:
+                        self.claude_streams[(session, agent)] = path
                     for record in reader.read():
                         self.notes.claude(agent, record, session if agent != session else "")
                         self._claude_record(record, session, now, agent)
@@ -1233,6 +1236,23 @@ class TpsMonitor:
             log.debug("hint material failed", exc_info=True)
         return agents
 
+    def stream_finished(self, event: Observation) -> bool:
+        """A Claude Code sub-agent that has ended although its last reply did
+        not end a turn: stopped mid-run, its file closes on a tool result.
+        Claude Code marks it in the agent's meta file ("finished": true,
+        beside subagents/agent-*.jsonl), written at or after that reply; a
+        resumed sub-agent replies again after it and counts again."""
+        path = self.claude_streams.get((event.session, event.stream)) if event.stream else None
+        if path is None:
+            return False
+        meta = path.with_name(path.stem + ".meta.json")
+        try:
+            if meta.stat().st_mtime < event.ended_at - 1:
+                return False
+            return json.loads(meta.read_text(encoding="utf-8")).get("finished") is True
+        except (OSError, ValueError, AttributeError):
+            return False
+
     def snapshot(self, now: float) -> dict[str, Any]:
         # The installed Codex bridge emits a second copy of agy's usage. Only
         # compare its known isolated agy channel, one-to-one, with exact output
@@ -1285,7 +1305,8 @@ class TpsMonitor:
                 stream = (e.source, e.session, e.stream)
                 if stream not in newest or e.ended_at > newest[stream].ended_at:
                     newest[stream] = e
-            running = [e for e in newest.values() if not e.turn_end and now - e.ended_at <= CONCURRENT_SECONDS]
+            running = [e for e in newest.values() if not e.turn_end and now - e.ended_at <= CONCURRENT_SECONDS
+                       and not self.stream_finished(e)]
             if len(running) > 1:
                 rates = [stream_rate(samples, e)[0] for e in running]
                 generation = round(sum(rate for rate in rates if rate is not None), 1)
