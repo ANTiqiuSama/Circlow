@@ -229,7 +229,8 @@ class SplitRingTests(unittest.TestCase):
         draw = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
         hour = icon_art._unit_face(draw)
         self.assertEqual(hour.size, icon_art._fit("h", icon_art.number_font, 96, 96, 132, draw).size)
-        self.assertGreater(hour.size, icon_art._fit("m", icon_art.number_font, 96, 96, 132, draw).size)
+        # m is the widest letter: never a larger size than h (equal with Windows' font, smaller with the Mac's).
+        self.assertGreaterEqual(hour.size, icon_art._fit("m", icon_art.number_font, 96, 96, 132, draw).size)
 
         def ivory_cols(unit, amount=1):
             image = icon_art.waiting_icon(amount, "C", unit=unit)
