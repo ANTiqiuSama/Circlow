@@ -404,6 +404,17 @@ def _lock_instance():
     return handle
 
 
+def clean_leftovers(folder: Path | None = None) -> int:
+    """Orphaned "<file>.<pid>.tmp" files in the data folder (tray_app.
+    clean_stale_temporaries). The Mac runs the same Claude status-line
+    receiver, so Claude Code ending it mid-write leaves them here too."""
+    import tray_app
+    removed = tray_app.clean_stale_temporaries(folder)
+    if removed:
+        log.info("removed %d orphaned temporary files", removed)
+    return removed
+
+
 def run_mac() -> int:
     if sys.platform != "darwin":
         raise RuntimeError("macOS 菜单栏入口只能在 macOS 运行")
@@ -420,6 +431,7 @@ def run_mac() -> int:
     import icon_art
 
     settings_mac.take_commands(settings_mac.MENU)      # requests left over from an earlier run
+    threading.Thread(target=clean_leftovers, name="runtime-cleanup", daemon=True).start()
     # Black-and-white template icons, drawn by the system in the bar's own
     # label colour (icon_art.set_mono); CIRCLOW_MENU_ICONS=color keeps the
     # Windows tray's coloured discs. Set before the tray draws its first icon.

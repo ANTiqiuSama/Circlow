@@ -299,6 +299,25 @@ class OpenMacTests(unittest.TestCase):
         self.assertFalse(launchers.open_mac(launchers.Way("herdr", "claude"), run, browse))
 
 
+class LeftoverTests(unittest.TestCase):
+    def test_start_up_removes_old_orphans_of_the_status_line_receiver(self):
+        import os
+        import tray_app
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            names = ("claude-status.json.123.tmp", "claude-status.json.456.tmp", "claude-status.json")
+            for name in names:
+                (root / name).write_text("{}", encoding="utf-8")
+            old = time.time() - 2 * tray_app.TEMPORARY_MIN_AGE
+            for name in names[1:]:
+                os.utime(root / name, (old, old))
+            # The receiver's own folder by default: the one it writes claude-status.json to.
+            with patch("claude_status.data_dir", return_value=root):
+                self.assertEqual(mac_menu.clean_leftovers(), 1)
+            self.assertEqual(sorted(path.name for path in root.iterdir()),
+                             ["claude-status.json", "claude-status.json.123.tmp"])
+
+
 @unittest.skipUnless(sys.platform != "win32", "POSIX file modes")
 class SummaryFileModeTests(unittest.TestCase):
     def test_the_model_config_is_readable_by_this_user_only(self):
