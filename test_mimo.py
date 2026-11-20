@@ -166,6 +166,56 @@ class StorageTests(unittest.TestCase):
             path.write_bytes(b"not a marker")                                       # a Windows file copied over
             self.assertEqual(mimo_usage.load_session(path)["cookies"], {})
 
+    def test_a_packaged_mac_build_reaches_the_keychain_through_its_helper(self):
+        # The helper's "Always Allow" survives updates; the app's own does not.
+        from types import SimpleNamespace
+        helper = self.dir / "MacOS" / mimo_usage.KEYCHAIN_HELPER
+        helper.parent.mkdir()
+        helper.write_bytes(b"")
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args[1:], kwargs["input"]))
+            replies = {"get": (0, b'{"cookies": {}}'), "set": (0, b""), "delete": (0, b"")}
+            code, out = replies[args[1]] if args[3] == "session" else (2, b"")
+            return SimpleNamespace(returncode=code, stdout=out, stderr=b"")
+        direct = patch.dict(sys.modules, {"Security": None})          # the app itself never touches the keychain
+        with patch.object(mimo_usage.sys, "frozen", True, create=True), \
+                patch.object(mimo_usage.sys, "executable", str(helper.with_name("Circlow"))), \
+                patch.object(mimo_usage.subprocess, "run", side_effect=run), direct:
+            self.assertEqual(mimo_usage._keychain_load("session"), b'{"cookies": {}}')
+            self.assertIsNone(mimo_usage._keychain_load("other"))                              # no such item
+            mimo_usage._keychain_store("session", b"data")
+            mimo_usage._keychain_delete("session")
+        self.assertEqual(calls[2], (["set", mimo_usage.KEYCHAIN_SERVICE, "session", mimo_usage.KEYCHAIN_LABEL], b"data"))
+        self.assertEqual(calls[3][0], ["delete", mimo_usage.KEYCHAIN_SERVICE, "session"])
+
+    def test_without_a_usable_helper_the_app_reads_the_keychain_itself(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        helper = self.dir / "MacOS" / mimo_usage.KEYCHAIN_HELPER
+        helper.parent.mkdir()
+        helper.write_bytes(b"")
+        security = MagicMock()
+        security.SecItemCopyMatching.return_value = (0, b"direct")
+        unusable = SimpleNamespace(returncode=mimo_usage.HELPER_NOT_USABLE, stdout=b"", stderr=b"")   # ad hoc (CI) build
+        with patch.object(mimo_usage.sys, "frozen", True, create=True), \
+                patch.object(mimo_usage.sys, "executable", str(helper.with_name("Circlow"))), \
+                patch.object(mimo_usage.subprocess, "run", return_value=unusable), \
+                patch.dict(sys.modules, {"Security": security}):
+            self.assertEqual(mimo_usage._keychain_load("session"), b"direct")
+        with patch.dict(sys.modules, {"Security": security}), \
+                patch.object(mimo_usage.subprocess, "run") as run:                             # from source: no helper
+            self.assertEqual(mimo_usage._keychain_load("session"), b"direct")
+        run.assert_not_called()
+        refused = SimpleNamespace(returncode=1, stdout=b"", stderr=b"read: OSStatus -128")
+        with patch.object(mimo_usage.sys, "frozen", True, create=True), \
+                patch.object(mimo_usage.sys, "executable", str(helper.with_name("Circlow"))), \
+                patch.object(mimo_usage.subprocess, "run", return_value=refused):
+            self.assertIsNone(mimo_usage._keychain_load("session"))                            # denied: no session
+            with self.assertRaisesRegex(OSError, "-128"):
+                mimo_usage._keychain_store("session", b"data")
+
     def test_browser_lookup_covers_macos_chromium_browsers(self):
         with patch.object(mimo_usage.sys, "platform", "darwin"), patch.dict(os.environ, {"CIRCLOW_MIMO_BROWSER": ""}), \
                 patch.object(mimo_usage.os.path, "isfile", lambda path: path.endswith("Google Chrome")):

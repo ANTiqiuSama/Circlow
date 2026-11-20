@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import socket
@@ -37,6 +38,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+log = logging.getLogger("Circlow")
 
 PLATFORM = os.environ.get("CIRCLOW_MIMO_PLATFORM", "https://platform.xiaomimimo.com")
 CONSOLE_URL = PLATFORM + "/console/plan-manage"
@@ -135,10 +138,48 @@ def _protect(data: bytes, decrypt: bool = False) -> bytes:
 
 KEYCHAIN_SERVICE = "com.antiqiusama.circlow.mimo"
 KEYCHAIN_MARKER = b"circlow:keychain\n"
+KEYCHAIN_LABEL = "环流 · 小米 MiMo 控制台会话"
+# The app's keychain helper (mac_keychain_helper.c, beside the executable in
+# Circlow.app). macOS remembers "Always Allow" per code hash for apps signed
+# without an Apple Team ID, and every update changes the app's hash; the
+# helper's stays, so it is asked once, not after every update.
+KEYCHAIN_HELPER = "circlow-keychain"
+HELPER_NOT_FOUND, HELPER_NOT_USABLE = 2, 3
+HELPER_TIMEOUT = 180                 # the first read waits for the user to answer the keychain prompt
 
 
 def _keychain_account(path: Path) -> str:
     return "session" if path == COOKIE_PATH else f"session:{path}"
+
+
+def _keychain_helper() -> Path | None:
+    """The helper of a packaged Mac build; None when running from source."""
+    if not getattr(sys, "frozen", False):
+        return None
+    helper = Path(sys.executable).with_name(KEYCHAIN_HELPER)
+    return helper if helper.is_file() else None
+
+
+def _helper_call(verb: str, account: str, data: bytes | None = None, *extra: str) -> bytes | None:
+    """Run the helper: its stdout, None for no such item. Raises LookupError
+    when the helper cannot serve this build (unsigned or ad hoc: use the
+    keychain directly) and OSError when the keychain refused."""
+    helper = _keychain_helper()
+    if helper is None:
+        raise LookupError("no keychain helper")
+    try:
+        done = subprocess.run([str(helper), verb, KEYCHAIN_SERVICE, account, *extra], input=data or b"",
+                              capture_output=True, timeout=HELPER_TIMEOUT, close_fds=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise OSError(f"钥匙串助手未能运行：{error}") from error
+    if done.returncode == 0:
+        return done.stdout
+    if done.returncode == HELPER_NOT_FOUND:
+        return None
+    if done.returncode == HELPER_NOT_USABLE:
+        raise LookupError("keychain helper not usable for this build")
+    detail = (done.stderr or b"").decode("utf-8", "replace").strip()
+    raise OSError(f"钥匙串操作失败（{detail or done.returncode}）")
 
 
 def _keychain_query(account: str) -> dict:
@@ -148,6 +189,11 @@ def _keychain_query(account: str) -> dict:
 
 
 def _keychain_store(account: str, data: bytes) -> None:
+    try:
+        _helper_call("set", account, data, KEYCHAIN_LABEL)
+        return
+    except LookupError:
+        pass
     import Security
     from Foundation import NSData
     value = NSData.dataWithBytes_length_(data, len(data))
@@ -155,12 +201,19 @@ def _keychain_store(account: str, data: bytes) -> None:
     status = Security.SecItemUpdate(query, {Security.kSecValueData: value})
     if status == Security.errSecItemNotFound:
         status = Security.SecItemAdd({**query, Security.kSecValueData: value,
-                                      Security.kSecAttrLabel: "环流 · 小米 MiMo 控制台会话"}, None)[0]
+                                      Security.kSecAttrLabel: KEYCHAIN_LABEL}, None)[0]
     if status != 0:
         raise OSError(f"无法写入钥匙串（{status}）")
 
 
 def _keychain_load(account: str) -> bytes | None:
+    try:
+        return _helper_call("get", account)
+    except LookupError:
+        pass
+    except OSError:
+        log.warning("keychain helper could not read the MiMo session", exc_info=True)
+        return None
     import Security
     status, result = Security.SecItemCopyMatching(
         {**_keychain_query(account), Security.kSecReturnData: True, Security.kSecMatchLimit: Security.kSecMatchLimitOne}, None)
@@ -168,6 +221,11 @@ def _keychain_load(account: str) -> bytes | None:
 
 
 def _keychain_delete(account: str) -> None:
+    try:
+        _helper_call("delete", account)
+        return
+    except LookupError:
+        pass
     import Security
     Security.SecItemDelete(_keychain_query(account))
 

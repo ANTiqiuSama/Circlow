@@ -31,12 +31,22 @@ xcrun vtool -set-build-version macos "${minos:-11.0}" 26.0 -replace -output "$ex
 /usr/libexec/PlistBuddy -c 'Add :LSUIElement bool true' "$bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName 环流' "$bundle/Contents/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string 环流' "$bundle/Contents/Info.plist"
+# The MiMo session's keychain helper (mac_keychain_helper.c). The keychain
+# remembers "Always Allow" by code hash for apps without an Apple Team ID, and
+# the app's hash changes with every build; the helper's does not (same
+# source, compiler, flags and output name, signed without a timestamp), so
+# its one "Always Allow" survives updates.
+mkdir -p work/keychain-helper
+clang -O2 -Wall -Wextra -Wno-deprecated-declarations -mmacosx-version-min="${minos:-11.0}" \
+  -framework Security -framework CoreFoundation -o work/keychain-helper/circlow-keychain mac_keychain_helper.c
+cp work/keychain-helper/circlow-keychain "$bundle/Contents/MacOS/circlow-keychain"
 # Sign with the "Circlow Development" identity when the login keychain has
 # one (macos-signing-identity.sh creates it), or with the identity named in
 # CIRCLOW_CODESIGN_IDENTITY, so every local build keeps the same signature:
-# the keychain's "always allow" for the MiMo session and the system's
-# permissions then survive a rebuild. Ad hoc otherwise (CI), whose
-# signature is a hash of the binary and changes with every build.
+# the system's permissions then survive a rebuild, and the keychain helper
+# serves the app only when both carry this signature. Ad hoc otherwise (CI),
+# whose signature is a hash of the binary and changes with every build; the
+# app then reads the keychain itself.
 identity="${CIRCLOW_CODESIGN_IDENTITY:-}"
 if [[ -z "$identity" ]] && security find-identity -v -p codesigning 2>/dev/null | grep -q '"Circlow Development"'; then
   identity="Circlow Development"
