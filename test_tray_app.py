@@ -239,6 +239,23 @@ class HoverTests(unittest.TestCase):
         self.assertEqual(tray_app.clean_runtime_leftovers(root, keep=None, now=time.time()), 1)   # mine, once released
         self.assertTrue(young.exists())
 
+    def test_orphaned_receiver_temporaries_are_removed_once_old(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        root = Path(tempfile.mkdtemp())
+        names = ("claude-status.json.123.tmp", "claude-status.json.456.tmp", "claude-status.json",
+                 "state.json.quota-tray.tmp", "notes.json.abc.tmp")
+        for name in names:
+            (root / name).write_text("{}", encoding="utf-8")
+        old = time.time() - 2 * tray_app.TEMPORARY_MIN_AGE
+        for name in names[1:]:
+            os.utime(root / name, (old, old))
+        self.assertEqual(tray_app.clean_stale_temporaries(root, now=time.time()), 1)
+        # A fresh one may still be in the middle of its rename; other files are never touched.
+        self.assertEqual(sorted(path.name for path in root.iterdir()),
+                         ["claude-status.json", "claude-status.json.123.tmp", "notes.json.abc.tmp", "state.json.quota-tray.tmp"])
+
     def test_a_picture_the_shell_refused_is_sent_again(self):
         icon = HoverIcon("hover-resend-test", Image.new("RGBA", (16, 16)))
         icon._hwnd = 123
@@ -308,6 +325,52 @@ class HoverTests(unittest.TestCase):
         icons["grok"].hover_open = False      # Shell POPUPCLOSE a few seconds later
         with patch("hover_details.icon_rect", side_effect=lambda icon: rect if icon is icons["grok"] else None):
             self.assertEqual(("grok", rect), hover.target_at(wintypes.POINT(20, 30)))
+
+    def test_sliding_to_another_icon_while_the_panel_is_open_needs_no_shell_popup(self):
+        icons = {"codex": SimpleNamespace(_version4=True, hover_open=True, icon_id=0),
+                 "grok": SimpleNamespace(_version4=True, hover_open=False, icon_id=1)}
+        hover = HoverDetails(icons, lambda _: "", threading.Event())
+        hover.candidate = "codex"
+        rects = {0: (10, 10, 34, 66), 1: (34, 10, 58, 66)}
+        with patch("hover_details.icon_rect", side_effect=lambda icon: rects[icon.icon_id]), \
+                patch("hover_details.tray_visibility", return_value={}):
+            self.assertEqual(hover.target_at(wintypes.POINT(40, 30)), (None, None))    # nothing open: wait for the Shell
+            hover.engaged = True
+            self.assertEqual(hover.target_at(wintypes.POINT(40, 30)), ("grok", rects[1]))
+        hover._taskbar = (float("-inf"), {})
+        with patch("hover_details.icon_rect", side_effect=lambda icon: rects[icon.icon_id]), \
+                patch("hover_details.tray_visibility", return_value={0: True, 1: False}):
+            # In the overflow an icon's rectangle can be the ^ button's: never by rectangle alone.
+            self.assertEqual(hover.target_at(wintypes.POINT(40, 30)), (None, None))
+
+    def test_icon_on_the_taskbar_opens_after_a_short_dwell_without_the_shell_delay(self):
+        icon = SimpleNamespace(_version4=True, hover_open=False, icon_id=0)
+        hover = HoverDetails({"codex": icon}, lambda _: "", threading.Event())
+        rect = (10, 10, 34, 66)
+        with patch("hover_details.icon_rect", return_value=rect), \
+                patch("hover_details.tray_visibility", return_value={0: True}):
+            self.assertEqual(hover.target_at(wintypes.POINT(20, 30)), ("codex", rect))
+        self.assertEqual(hover.dwell("codex"), hover.FAST_DWELL)
+        icon.hover_open = True
+        self.assertEqual(hover.dwell("codex"), 0.0)
+
+    def test_still_pointer_sees_the_shell_popup_at_once(self):
+        icon = SimpleNamespace(_version4=True, hover_open=False, icon_id=0)
+        hover = HoverDetails({"codex": icon}, lambda _: "", threading.Event())
+        rect = (10, 10, 34, 66)
+
+        def cursor(point):
+            point._obj.x, point._obj.y = 20, 30
+            return True
+        with patch("hover_details.user.GetCursorPos", side_effect=cursor), \
+                patch("hover_details.user.GetAsyncKeyState", return_value=0), \
+                patch("hover_details.notification_area_at", return_value=True), \
+                patch("hover_details.icon_rect", return_value=rect), \
+                patch("hover_details.tray_visibility", return_value={}):
+            self.assertIsNone(hover.pointer()[1])
+            icon.hover_open = True                       # POPUPOPEN, the pointer has not moved
+            self.assertEqual(hover.pointer()[1], "codex")
+        self.assertTrue(hover.on_tray)
 
     def test_shell_popup_close_during_refresh_does_not_close_our_hover(self):
         icon = SimpleNamespace(_version4=True, hover_open=False)

@@ -550,6 +550,11 @@ class SettingsWindow:
         widget = self.label(parent, text, size, color, **kw)
         widget.raw, widget.wrapped_at = text, None
         widget.measure = self.measure_for(widget.cget("font"))
+        # A fixed requested width (the wrap floor), so the text never props its
+        # container up. Requesting the wrapped text's own width made every
+        # wrap narrow the column by S(8), which re-wrapped it again: ~70 full
+        # relayouts per paragraph (8,000 <Configure> events, 6 s) on first open.
+        widget.configure(width=max(1, round(self.S(160) / max(1, widget.measure("0")))))
 
         def wrap(event):
             width = max(self.S(160), event.width - self.S(8))

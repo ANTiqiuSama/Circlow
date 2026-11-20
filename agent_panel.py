@@ -330,11 +330,18 @@ class Spring:
             force = self.stiffness * (self.target - self.value) - self.damping * self.velocity
             self.velocity += force * h
             self.value += self.velocity * h
+        if self.settled:
+            # Snap once at rest: the panel stops redrawing at 60 fps here.
+            self.value, self.velocity = self.target, 0.0
         return self.value
 
     @property
     def settled(self) -> bool:
-        return abs(self.target - self.value) < 0.002 and abs(self.velocity) < 0.01
+        # Relative to the target as well: a large figure (MiMo's 1.5 billion
+        # tokens today) never came within 0.002 of it, so the panel kept
+        # drawing every frame for seconds after it looked still.
+        size = abs(self.target)
+        return abs(self.target - self.value) < max(0.002, size * 1e-4) and abs(self.velocity) < max(0.01, size * 5e-4)
 
 
 class Follow:

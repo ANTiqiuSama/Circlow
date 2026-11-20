@@ -177,6 +177,29 @@ class TpsTests(unittest.TestCase):
         self.assertEqual(data["generation_tps"], 25.0)          # 50 tokens / 2 s
         self.assertIn("含首字延迟", data["display_basis"])
 
+    def test_antigravity_day_old_database_is_not_stat_ed_each_second(self):
+        import os
+        from pathlib import Path
+        from unittest import mock
+        path = self.make_agy_db(step_type=15)
+        old = self.now - 3 * 86400
+        os.utime(path, (old, old))
+        self.monitor._antigravity(self.now)                      # the first pass looks at everything
+        self.assertIn(str(path), self.monitor.antigravity_cold)
+        real_stat, calls = Path.stat, []
+
+        def counted(self_, *args, **kwargs):
+            calls.append(self_)
+            return real_stat(self_, *args, **kwargs)
+        with mock.patch.object(Path, "stat", counted):
+            self.monitor._antigravity(self.now + 1)
+            self.assertNotIn(path, calls)                        # skipped on its listed times alone
+            os.utime(path, (self.now, self.now))                 # written again: read at once
+            with mock.patch("tps_sources.read_antigravity_db", return_value=([], [])) as read:
+                self.monitor._antigravity(self.now + 2)
+            read.assert_called_once()
+        self.assertNotIn(str(path), self.monitor.antigravity_cold)
+
     def test_antigravity_other_step_types_do_not_give_tps(self):
         self.make_agy_db(step_type=7)
         self.monitor._antigravity(self.now)

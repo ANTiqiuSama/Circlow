@@ -122,11 +122,19 @@ def tray_visibility(executable: str | None = None) -> dict[int, bool]:
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\NotifyIconSettings") as root:
-            for index in itertools.count():
-                try:
-                    name = winreg.EnumKey(root, index)
-                except OSError:
-                    break
+            # The key holds an entry for every program that ever showed a tray
+            # icon (~180 here): enumerating them all every 2 s took ~8 ms. Our
+            # entries are remembered and only re-read; the full walk runs when
+            # the key gains or loses entries, or once a minute.
+            subkeys, _values, written = winreg.QueryInfoKey(root)
+            now = time.monotonic()
+            cached = _VISIBILITY_KEYS.get(wanted)
+            if cached is not None and cached[0] == (subkeys, written) and 0 <= now - cached[1] < 60:
+                names = cached[2]
+            else:
+                names = None
+            found = []
+            for name in (names if names is not None else _enumerate(winreg, root)):
                 try:
                     with winreg.OpenKey(root, name) as key:
                         path = str(winreg.QueryValueEx(key, "ExecutablePath")[0])
@@ -138,11 +146,27 @@ def tray_visibility(executable: str | None = None) -> dict[int, bool]:
                         except OSError:
                             promoted = False          # never promoted: Windows keeps it in the overflow
                         result[uid] = promoted
+                        found.append(name)
                 except (OSError, TypeError, ValueError):
                     continue
+            if names is None:
+                _VISIBILITY_KEYS[wanted] = ((subkeys, written), now, tuple(found))
+            elif len(found) != len(names):
+                _VISIBILITY_KEYS.pop(wanted, None)     # an entry went away: walk the key next time
     except (ImportError, OSError):
         return {}
     return result
+
+
+_VISIBILITY_KEYS: dict[str, tuple] = {}    # executable -> ((subkeys, written), monotonic, our entry names)
+
+
+def _enumerate(winreg, root):
+    for index in itertools.count():
+        try:
+            yield winreg.EnumKey(root, index)
+        except OSError:
+            return
 
 
 class NotifyIconIdentifier(ctypes.Structure):
@@ -389,9 +413,14 @@ def enable_thread_dpi_awareness() -> bool:
         return False
 
 
+_SHCORE = []        # loaded once: every icon-rectangle check asks for the monitor's DPI
+
+
 def monitor_scale(monitor) -> float:
     try:
-        shcore = ctypes.WinDLL("shcore")
+        if not _SHCORE:
+            _SHCORE.append(ctypes.WinDLL("shcore"))
+        shcore = _SHCORE[0]
         x, y = wintypes.UINT(), wintypes.UINT()
         if shcore.GetDpiForMonitor(wintypes.HANDLE(monitor), 0, ctypes.byref(x), ctypes.byref(y)) == 0 and x.value:
             return x.value / 96
@@ -713,7 +742,7 @@ class PanelFeed:
         self.inline = inline        # build on the caller's thread (tests)
         self.lock = threading.Lock()
         self.models = {}            # provider -> (model or None, monotonic time built)
-        self.wanted = set()
+        self.wanted: dict = {}      # providers to build, in the order asked for
         self.wake = threading.Event()
         self.thread = None
         self.stopped = False
@@ -724,8 +753,19 @@ class PanelFeed:
         if self.inline:
             self._build(provider)
             return
+        self.request_many([provider])
+
+    def request_many(self, providers) -> None:
+        providers = [provider for provider in providers if provider]
+        if not providers:
+            return
+        if self.inline:
+            for provider in dict.fromkeys(providers):
+                self._build(provider)
+            return
         with self.lock:
-            self.wanted.add(provider)
+            for provider in providers:
+                self.wanted.setdefault(provider)
             if self.thread is None or not self.thread.is_alive():
                 self.thread = threading.Thread(target=self._work, name="panel-feed", daemon=True)
                 self.thread.start()
@@ -755,7 +795,7 @@ class PanelFeed:
             self.wake.wait(1.0)
             self.wake.clear()
             with self.lock:
-                wanted, self.wanted = self.wanted, set()
+                wanted, self.wanted = self.wanted, {}
             for provider in wanted:
                 self._build(provider)
 
@@ -784,7 +824,12 @@ class HoverDetails:
     NEIGHBOUR_WAIT = 0.8        # Longest wait for another program's card over our spot.
     PANEL_REFRESH = 0.5
     PANEL_RETRY_SECONDS = 2.0
-    OPEN_AGE = 1.5              # newest model a panel may open (or switch) with
+    OPEN_AGE = 1.5              # newest model a panel may open with after a quiet spell
+    WARM_AGE = 15.0             # an open panel switches at once to a model this old; a fresh one follows
+    WARM_EVERY = 5.0            # while on one of our icons or panel, every source's model is rebuilt this often
+    FAST_DWELL = 0.18           # resting on an icon on the taskbar opens without the Shell's ~0.4 s hover delay
+    TRAY_TICK = 1 / 30          # tick while the pointer is on the notification area (0.1 s elsewhere)
+    TASKBAR_RECHECK = 5.0       # how long tray_visibility's answer is reused
     SLOW_TICK = 1.0             # a hover tick this long is logged
 
     def __init__(self, icons, text_for, stop_event, agents=None):
@@ -795,6 +840,10 @@ class HoverDetails:
         self.entered_at = 0.0
         self.panel_seen = 0.0
         self.panel_built = 0.0
+        self.engaged = False        # our panel is open: any of our icons switches it, Shell popup or not
+        self.on_tray = False        # the pointer was on the notification area last tick
+        self.warmed_at = float("-inf")
+        self._taskbar = (float("-inf"), {})
 
     def update(self, popup, provider, anchor, now, dwell=0.4):
         if provider != self.candidate:
@@ -804,6 +853,22 @@ class HoverDetails:
             popup.hide()
         elif now - self.entered_at >= dwell:
             popup.show(self.text_for(provider), anchor)
+
+    def on_taskbar(self, icon) -> bool | None:
+        """True when Windows records this icon as shown on the taskbar itself,
+        False when it keeps it in the overflow (where its rectangle can be the
+        ^ button's), None when unknown (Windows 10, a source run)."""
+        now = time.monotonic()
+        checked, shown = self._taskbar
+        if not 0 <= now - checked < self.TASKBAR_RECHECK:
+            shown = tray_visibility()
+            self._taskbar = (now, shown)
+        return shown.get(getattr(icon, "icon_id", -1))
+
+    def without_popup(self, icon) -> bool:
+        """An icon the Shell has not sent POPUPOPEN for may still be hovered."""
+        place = self.on_taskbar(icon)
+        return place is True or (self.engaged and place is not False)
 
     def target_at(self, point):
         rects = {key: icon_rect(icon) for key, icon in self.icons.items()}
@@ -821,8 +886,13 @@ class HoverDetails:
                 continue
             # A Shell refresh can send POPUPCLOSE while the mouse is still on
             # the icon. Once opened, keep our popup until the pointer leaves.
-            if (getattr(icon, "_version4", False) and not icon.hover_open
-                    and self.candidate != key):
+            # Without the Shell's POPUPOPEN an icon still counts when our panel
+            # is already open (sliding across the icons: waiting for each
+            # icon's POPUPOPEN closed the card in the gap and reopened it), or
+            # when Windows keeps the icon on the taskbar (opened after
+            # FAST_DWELL instead of the Shell's hover delay).
+            if (getattr(icon, "_version4", False) and not icon.hover_open and self.candidate != key
+                    and not self.without_popup(icon)):
                 continue
             if rect and contains(rect, point.x, point.y):
                 return key, rect
@@ -838,7 +908,7 @@ class HoverDetails:
             self.candidate = provider
         switching = False
         if provider and provider != panel.provider and not panel.scene.dragging:
-            found = self.feed.get(provider, now, self.OPEN_AGE)
+            found = self.feed.get(provider, now, self.WARM_AGE)
             if found is PENDING:        # built in a moment: keep this card meanwhile
                 switching = True
             elif found[0] is None:      # e.g. Claude without a subscription: tooltip only
@@ -921,13 +991,18 @@ class HoverDetails:
         point = wintypes.POINT()
         have_point = bool(user.GetCursorPos(ctypes.byref(point)))
         left, right = (bool(user.GetAsyncKeyState(key) & 0x8000) for key in (1, 2))
-        key = (have_point, point.x, point.y, left, right)
+        # The Shell's popup state and whether our panel is open are part of
+        # the answer: a still pointer used to keep "no icon here" for up to a
+        # second after the Shell's POPUPOPEN arrived, delaying the panel.
+        key = (have_point, point.x, point.y, left, right, self.engaged,
+               tuple(bool(getattr(icon, "hover_open", False)) for icon in self.icons.values()))
         now = time.monotonic()
         held = getattr(self, "_pointer_held", None)
         if held is not None and held[0] == key and now - held[1] < self.POINTER_REUSE:
             return held[2]
         provider = anchor = None
-        if have_point and notification_area_at(point) and not (left or right):
+        self.on_tray = have_point and notification_area_at(point)
+        if self.on_tray and not (left or right):
             provider, anchor = self.target_at(point)
         elif have_point:
             for icon in self.icons.values():     # target_at clears this itself on the tray
@@ -940,8 +1015,14 @@ class HoverDetails:
         return result
 
     def dwell(self, provider) -> float:
-        # Shell v4 already waited for its own hover delay before POPUPOPEN.
-        return 0.0 if provider and getattr(self.icons[provider], "_version4", False) else 0.4
+        # Shell v4 already waited for its own hover delay before POPUPOPEN;
+        # an icon on the taskbar found by its rectangle alone waits FAST_DWELL.
+        if not provider:
+            return 0.4
+        icon = self.icons[provider]
+        if not getattr(icon, "_version4", False):
+            return 0.4
+        return 0.0 if getattr(icon, "hover_open", False) else self.FAST_DWELL
 
     def run(self):
         log = logging.getLogger(__name__)
@@ -963,7 +1044,8 @@ class HoverDetails:
             while True:
                 if busy_since is not None and time.monotonic() - busy_since > self.SLOW_TICK:
                     log.info("hover tick took %.1fs", time.monotonic() - busy_since)
-                period = self.FRAME_SECONDS if panel is not None and panel.active else 0.1
+                period = (self.FRAME_SECONDS if panel is not None and panel.active
+                          else self.TRAY_TICK if self.on_tray else 0.1)
                 deadline = max(deadline + period, time.monotonic())
                 if self.pause(max(0.0, deadline - time.monotonic())):
                     break
@@ -976,8 +1058,14 @@ class HoverDetails:
                     for popup in (panel, tooltip):
                         if popup:
                             popup.hide()
+                self.engaged = panel is not None and panel.active and panel.closing_at is None
                 point, provider, anchor, left, right = self.pointer()
                 now = time.monotonic()
+                if self.feed is not None and (provider or self.engaged) and now - self.warmed_at >= self.WARM_EVERY:
+                    # Every source's panel ready before the pointer gets to its icon:
+                    # opening or sliding over to it then never waits for a build.
+                    self.warmed_at = now
+                    self.feed.request_many([provider, *self.icons] if provider else list(self.icons))
                 if panel is None and self.agents is not None and provider and now >= retry_at:
                     try:
                         panel = AgentPanelWindow()

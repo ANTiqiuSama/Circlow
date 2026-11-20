@@ -269,6 +269,9 @@ class TpsMonitor:
         self.last_discovery = 0.0
         self.last_log_id = 0
         self.database_versions: dict[Path, tuple[int, int]] = {}
+        self.antigravity_cold: dict[str, tuple[int, int]] = {}    # day-old database path -> its listed (db, WAL) times
+        self.antigravity_swept = float("-inf")                    # last real stat of every database
+        self.codex_stale: dict[str, tuple[Any, float]] = {}       # rollout -> (thread updated_at, checked at)
         self.health: dict[str, dict[str, Any]] = {}
         self.legacy_totals: dict[str, int] = {}
         # Latest Codex rate-limit figures written into session records after
@@ -365,12 +368,28 @@ class TpsMonitor:
         if state.is_file():
             try:
                 with closing(readonly_db(state)) as db:
-                    rows = db.execute("SELECT id,rollout_path,model,model_provider FROM threads ORDER BY updated_at DESC LIMIT 512").fetchall()
-                for session, filename, model, provider in rows:
+                    rows = db.execute("SELECT id,rollout_path,model,model_provider,updated_at FROM threads "
+                                      "ORDER BY updated_at DESC LIMIT 512").fetchall()
+                for session, filename, model, provider, updated in rows:
                     # Registering all 512 threads used to parse ~1.5 MB of
                     # each history on the first poll; only recent ones matter.
-                    if filename and (Path(filename) in self.readers or self._recent(Path(filename), now)):
-                        self._register(Path(filename), session, "Codex", model or "", provider or "")
+                    if not filename:
+                        continue
+                    path = Path(filename)
+                    if path not in self.readers:
+                        # A day-old rollout is stat-ed again only when its thread
+                        # moved or SLOW_DISCOVERY_SECONDS passed, not 512 files every 2 s.
+                        stale = self.codex_stale.get(filename)
+                        if stale is not None and stale[0] == updated and 0 <= now - stale[1] < SLOW_DISCOVERY_SECONDS:
+                            continue
+                        if not self._recent(path, now):
+                            self.codex_stale[filename] = (updated, now)
+                            continue
+                        self.codex_stale.pop(filename, None)
+                    self._register(path, session, "Codex", model or "", provider or "")
+                if len(self.codex_stale) > 2 * len(rows) + 64:
+                    current = {row[1] for row in rows}
+                    self.codex_stale = {name: seen for name, seen in self.codex_stale.items() if name in current}
                 self._codex_titles(state, now)
                 self.health["Codex"] = {"status": "已接入", "sessions": len(rows)}
             except (OSError, sqlite3.Error) as error:
@@ -1017,18 +1036,48 @@ class TpsMonitor:
         return roots
 
     def _antigravity(self, now: float):
+        # Hundreds of old conversations sit in these folders. Stat-ing each
+        # database and its WAL every second (~1,400 calls) was most of this
+        # loop's idle cost. One directory listing a second carries every
+        # entry's timestamps; a database untouched for a day is skipped while
+        # its listed timestamps (and WAL presence) stay the same, and every
+        # SLOW_DISCOVERY_SECONDS all of them are stat-ed for real, in case
+        # NTFS has not yet updated the listing for a file held open.
+        sweep = not (0 <= now - self.antigravity_swept < SLOW_DISCOVERY_SECONDS)
         for root, source in self._antigravity_roots():
-            paths = list(root.glob("*.db"))
+            try:
+                with os.scandir(root) as listing:
+                    entries = {entry.name: entry for entry in listing}
+            except OSError:
+                entries = {}
             good = 0
             skipped = 0
-            for path in paths:
-                wal = path.with_name(path.name + "-wal")
-                version = (path.stat().st_mtime_ns, wal.stat().st_mtime_ns if wal.exists() else 0)
+            for name, entry in entries.items():
+                if not name.lower().endswith(".db"):
+                    continue
+                wal_entry = entries.get(name + "-wal")
+                try:
+                    listed = (entry.stat().st_mtime_ns, wal_entry.stat().st_mtime_ns if wal_entry is not None else 0)
+                except OSError:
+                    continue
+                if not sweep and self.antigravity_cold.get(entry.path) == listed:
+                    good += 1         # plain strings here: Path objects cost more than the stat saved
+                    continue
+                path = root / name
+                wal = path.with_name(name + "-wal")
+                try:
+                    version = (path.stat().st_mtime_ns, wal.stat().st_mtime_ns if wal.exists() else 0)
+                except OSError:
+                    continue
+                if version[0] / 1e9 < now - 86400 and version[1] / 1e9 < now - 86400:
+                    self.antigravity_cold[entry.path] = listed     # nothing from the last day
+                else:
+                    self.antigravity_cold.pop(entry.path, None)
                 if self.database_versions.get(path) == version:
                     good += 1
                     continue
-                if path.stat().st_mtime < now - 86400 and version[1] / 1e9 < now - 86400:
-                    self.database_versions[path] = version   # nothing from the last day
+                if entry.path in self.antigravity_cold:
+                    self.database_versions[path] = version
                     good += 1
                     continue
                 try:
@@ -1040,6 +1089,9 @@ class TpsMonitor:
                 self.database_versions[path] = version
                 good += 1
             self.health[source] = {"status": "已接入" if good else "未发现记录", "sessions": good, "skipped": skipped}
+        if sweep:
+            self.antigravity_cold = {name: listed for name, listed in self.antigravity_cold.items() if os.path.exists(name)}
+            self.antigravity_swept = now
 
     def _antigravity_rows(self, path: Path, source: str, rows: list, steps: list, now: float) -> int:
         skipped = 0

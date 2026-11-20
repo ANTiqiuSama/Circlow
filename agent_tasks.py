@@ -127,7 +127,8 @@ def _command_action(command: str) -> str:
     command = re.sub(r"^\s*(?:cd\s+\S+\s*(?:&&|;)\s*)+", "", command or "").strip()
     # Skip PowerShell/shell variable set-up ("$o = ...; python ...") to reach the real command.
     parts = [part.strip() for part in re.split(r"\s*(?:;|&&)\s*", command) if part.strip()]
-    useful = [part for part in parts if not re.match(r"^(?:\$[\w:]+\s*=|set\s+\w+=|export\s+\w+=|cd\s)", part, re.I)]
+    # A bare POSIX assignment ("S=/tmp/work; cd $S && ...") is set-up as well.
+    useful = [part for part in parts if not re.match(r"^(?:\$[\w:]+\s*=|set\s+\w+=|export\s+\w+=|cd\s|\w+=\S*$)", part, re.I)]
     if useful and useful[0] != command:
         command = "; ".join(useful)
     lower = command.lower()
@@ -137,8 +138,10 @@ def _command_action(command: str) -> str:
         return "安装依赖"
     if re.search(r"\b(build|pyinstaller|tsc|webpack|vite build|cargo build|make)\b", lower):
         return "构建"
-    words = re.findall(r"[^\s\"']+", command)
-    if not words:
+    words = [word.rstrip(";&|") for word in re.findall(r"[^\s\"']+", command)]
+    while len(words) > 1 and re.match(r"^\w+=", words[0]):        # FOO=1 python x.py
+        words.pop(0)
+    if not words or not words[0]:
         return "运行命令"
     tool = _basename(words[0]).lower().removesuffix(".exe")
     if tool == "git" and len(words) > 1:

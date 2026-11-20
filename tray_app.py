@@ -1498,6 +1498,33 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
 LEFTOVER_MIN_AGE = 3600          # an unpack folder younger than this may be another copy starting up
 
 
+TEMPORARY_MIN_AGE = 3600       # a writer is long done with a temporary file this old
+
+
+def clean_stale_temporaries(folder: Path | None = None, now: float | None = None) -> int:
+    """Delete orphaned "<file>.<pid>.tmp" files in the data folder. The Claude
+    status-line receiver writes one before renaming it into place; when Claude
+    Code ends the receiver mid-write the file stays (44 KB each, a dozen a
+    week). Only names of that shape, and only ones untouched for an hour."""
+    if folder is None:
+        import claude_status
+        folder = claude_status.data_dir()
+    now = time.time() if now is None else now
+    removed = 0
+    try:
+        candidates = [path for path in folder.glob("*.json.*.tmp") if path.name.split(".")[-2].isdigit()]
+    except OSError:
+        return 0
+    for path in candidates:
+        try:
+            if now - path.stat().st_mtime >= TEMPORARY_MIN_AGE:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def clean_runtime_leftovers(folder: Path | None = None, keep: Path | None = None, now: float | None = None) -> int:
     """Delete the onefile build's leftover unpack folders (_MEI*). The
     bootloader removes its folder only on a normal exit; a forced close, a
@@ -1751,8 +1778,12 @@ def main() -> int:
     if handle is None:
         return 0
     setup_logging()
-    threading.Thread(target=lambda: log.info("removed %d leftover unpack folders", clean_runtime_leftovers()),
-                     name="runtime-cleanup", daemon=True).start()
+    def cleanup() -> None:
+        log.info("removed %d leftover unpack folders", clean_runtime_leftovers())
+        stale = clean_stale_temporaries()
+        if stale:
+            log.info("removed %d orphaned temporary files", stale)
+    threading.Thread(target=cleanup, name="runtime-cleanup", daemon=True).start()
     tray = QuotaTray()
     tray.run()
     if getattr(tray, "restart_requested", False):

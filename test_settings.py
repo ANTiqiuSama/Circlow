@@ -126,6 +126,30 @@ class SettingsViewTests(unittest.TestCase):
         self.assertEqual(settings_window.bar_note(True, False, now + 3600, now), "不显示图标，仍照常读取")
         self.assertEqual(settings_window.save_delay(["bar:claude"]), settings_window.SAVE_DELAYS["switch"])
 
+    def test_paragraph_width_request_does_not_follow_its_text(self):
+        # Requesting the wrapped text's width made each wrap narrow the column
+        # by S(8) and wrap again: ~70 relayouts per paragraph on first open.
+        import tkinter as tk
+        import tkinter.font as tkfont
+        import settings_window
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest("no display")
+        root.withdraw()
+        try:
+            win = SimpleNamespace(tk=tk, tkfont=tkfont, root=root, measures={}, family="Microsoft YaHei UI", S=lambda v: v)
+            win.font = lambda size=10, weight="normal": settings_window.SettingsWindow.font(win, size, weight)
+            win.label = lambda *a, **k: settings_window.SettingsWindow.label(win, *a, **k)
+            win.measure_for = lambda font: settings_window.SettingsWindow.measure_for(win, font)
+            frame = tk.Frame(root, bg="#000000")
+            short = settings_window.SettingsWindow.para(win, frame, "短")
+            long = settings_window.SettingsWindow.para(win, frame, "很长的一段说明文字，" * 30)
+            self.assertEqual(short.winfo_reqwidth(), long.winfo_reqwidth())
+            self.assertLess(long.winfo_reqwidth(), 260)
+        finally:
+            root.destroy()
+
     def test_paragraphs_wrap_chinese_by_character_and_keep_latin_words_whole(self):
         import settings_window
         measure = len                                   # one unit per character

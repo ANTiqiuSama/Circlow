@@ -45,6 +45,10 @@ class TaskTextTests(unittest.TestCase):
         self.assertEqual(tool_action("exec_command", '{"cmd": "cd x && python -m unittest test_a"}'), "运行测试")
         self.assertEqual(tool_action("apply_patch", "*** Begin Patch\n*** Update File: src/hover.py\n"), "编辑 hover.py")
         self.assertEqual(tool_action("Bash", {"command": "git status"}), "git status")
+        # Shell set-up and separators never become the shown tool ("运行 scratchpad;").
+        self.assertEqual(tool_action("Bash", {"command": "S=/tmp/scratchpad; cd /d/x && node app.js"}), "运行 node")
+        self.assertEqual(tool_action("Bash", {"command": "FOO=1 node app.js;"}), "运行 node")
+        self.assertEqual(tool_action("Bash", {"command": "git status; ls"}), "git status")
         self.assertEqual(tool_action("Read", {"file_path": "/a/b/readme.md"}), "阅读 readme.md")
         self.assertEqual(tool_action("Task", {"description": "x"}), "派发子任务")
         self.assertEqual(tool_action("mcp__github__create_pr", {}), "调用 github")
@@ -135,6 +139,31 @@ class NotesTests(unittest.TestCase):
             agents = monitor.agents(now + 0.5)
             self.assertEqual([(a["key"], a["title"], a["live"], a["provider"], a["folder"]) for a in agents],
                              [("t1", "整理发布说明", True, "codex", "proj")])
+
+    def test_day_old_codex_rollout_is_checked_again_only_when_its_thread_moves(self):
+        import os
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            now = time.time()
+            rollout = home / ".codex/sessions/2026/01/01/rollout-y.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text("{}\n", encoding="utf-8")
+            os.utime(rollout, (now - 3 * 86400, now - 3 * 86400))
+            state = home / ".codex/state_5.sqlite"
+            with closing(sqlite3.connect(state)) as db, db:
+                db.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, model TEXT, model_provider TEXT, updated_at INT, title TEXT, cwd TEXT)")
+                db.execute("INSERT INTO threads VALUES ('t2', ?, 'gpt-5', 'openai', 1, '旧任务', 'D:/proj')", (str(rollout),))
+            monitor = TpsMonitor(home)
+            with mock.patch.object(TpsMonitor, "_recent", wraps=TpsMonitor._recent) as recent:
+                monitor.discover(now)
+                monitor.discover(now + 2)                       # same thread, same updated_at: not looked at again
+                self.assertEqual(sum(1 for call in recent.call_args_list if call.args[0] == rollout), 1)
+                os.utime(rollout, (now, now))
+                with closing(sqlite3.connect(state)) as db, db:
+                    db.execute("UPDATE threads SET updated_at = 2")
+                monitor.discover(now + 4)                       # the thread moved: its rollout is read again
+            self.assertIn(rollout, monitor.readers)
 
 
 class ScheduleTests(unittest.TestCase):
