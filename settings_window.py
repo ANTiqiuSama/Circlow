@@ -1891,7 +1891,8 @@ class SettingsWindow:
         if state is not None and state.release:
             info.append(f"榜单 {state.release}")
         if state is not None and state.fetched_at:
-            info.append("上次读取 " + time.strftime("%m-%d %H:%M", time.localtime(state.fetched_at)))
+            info.append("上次读取 " + time.strftime("%m-%d %H:%M", time.localtime(state.fetched_at)) +
+                        (f"（{state.synced_from} 同步）" if getattr(state, "synced_from", "") else ""))
         if state is not None and state.error:
             info.append(state.error)
         for widget, text in ((self.grok_figure, figure + unit), (self.grok_caption, caption),
@@ -1901,7 +1902,8 @@ class SettingsWindow:
         if not hasattr(self.app, "model_iq_status"):
             return
         status = self.app.model_iq_status()
-        parts = [f"上次读取：{status['fetched']}", f"今日已用 {status['calls']} / {model_iq.DAILY_LIMIT} 次（00:00 UTC 重置）"]
+        fetched = status["fetched"] + (f"（{status['synced_from']} 读取后同步）" if status.get("synced_from") else "")
+        parts = [f"上次读取：{fetched}", f"今日已用 {status['calls']} / {model_iq.DAILY_LIMIT} 次（00:00 UTC 重置）"]
         if status["env_key"]:
             parts.append(f"已设置 {model_iq.ENV_KEY} 环境变量，优先于本页的 Key")
         if status["error"]:
@@ -1919,7 +1921,8 @@ class SettingsWindow:
             self.iq_checks = {}
             models = status["models"]
             if not models:
-                self.label(self.iq_table, "填写 API Key 后点“立即读取”，这里会列出所有模型的分数。", 10, view.INK_3).grid(row=0, column=0, sticky="w")
+                self.label(self.iq_table, "填写 API Key 后点“立即读取”，这里会列出所有模型的分数；"
+                           "开启同步时，也会显示其他设备读到的分数。", 10, view.INK_3).grid(row=0, column=0, sticky="w")
                 return
             for column, title in enumerate(("显示", "#", "模型", "厂商", "编程分")):
                 self.label(self.iq_table, title, 9, view.INK_3).grid(row=0, column=column, sticky="w", padx=(0, S(14)), pady=(0, S(4)))

@@ -39,6 +39,7 @@ class GrokIq:
     fetched_at: float = 0.0
     attempted_at: float = 0.0
     error: str = ""
+    synced_from: str = ""     # another device's label when its read is the one kept
 
 
 def due(state: GrokIq | None, now: float) -> bool:
@@ -46,7 +47,8 @@ def due(state: GrokIq | None, now: float) -> bool:
     before the comparison) so the column does not wait hours for its base."""
     if state is None or not state.top_score:
         return True
-    return now - state.attempted_at >= READ_SECONDS
+    # A fresh result synced from another device counts as a read here too.
+    return now - state.attempted_at >= READ_SECONDS and now - state.fetched_at >= READ_SECONDS
 
 
 def score_text(score: float | None) -> str:
@@ -186,8 +188,38 @@ def read(state: GrokIq, now: float, get=None) -> GrokIq:
     state.release = release
     state.script = path or state.script
     state.fetched_at = now
-    state.error = ""
+    state.error = state.synced_from = ""
     return state
+
+
+SHARED = ("score", "top_score", "top_model", "release", "fetched_at")
+
+
+def export(state: GrokIq | None) -> dict | None:
+    """The last LiveBench result for the other devices (sync_hub)."""
+    if state is None or state.score is None or not state.top_score or not state.fetched_at:
+        return None
+    return {name: getattr(state, name) for name in SHARED}
+
+
+def _number(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    return float(value)
+
+
+def adopt(state: GrokIq, shared, source: str) -> bool:
+    """Take another device's result (see export) when it was read later
+    than the one here; True when taken."""
+    if not isinstance(shared, dict):
+        return False
+    fetched, score, top = (_number(shared.get(name)) for name in ("fetched_at", "score", "top_score"))
+    if fetched is None or fetched <= state.fetched_at or score is None or not top or top <= 0:
+        return False
+    state.score, state.top_score, state.fetched_at = score, top, fetched
+    state.top_model, state.release = str(shared.get("top_model") or ""), str(shared.get("release") or "")
+    state.synced_from = source
+    return True
 
 
 def load_state(path) -> GrokIq:
