@@ -372,9 +372,17 @@ class SceneTests(unittest.TestCase):
             frames.append(scene.render(1))
         columns = agent_panel.meter_columns(len(shared.quota))
         x = round(agent_panel.MARGIN + columns[-1][0])
-        y = round(agent_panel.MARGIN + agent_panel.METER_TOP + agent_panel.header_offset(shared) + 55)
-        box = (x, y, x + 40, y + 12)
+        top = agent_panel.MARGIN + agent_panel.METER_TOP + agent_panel.header_offset(shared)
+        y = round(top + agent_panel.BAR_MID)
+        box = (x, y - 9, x + 40, y + 9)
         self.assertNotEqual(frames[0].crop(box).tobytes(), frames[1].crop(box).tobytes())
+        # "本机 35" sits on the line of the quota bars beside it, level with them.
+        rows = [row for row in range(box[1], box[3])
+                if frames[0].crop((x, row, x + 40, row + 1)).tobytes() != frames[1].crop((x, row, x + 40, row + 1)).tobytes()]
+        bar_x = round(agent_panel.MARGIN + columns[0][0]) + 2
+        bar = [row for row in range(round(top + agent_panel.FIGURE_Y), round(top + agent_panel.RESET_Y))
+               if frames[1].getpixel((bar_x, row))[:3] != frames[1].getpixel((bar_x, round(top + agent_panel.RESET_Y) - 1))[:3]]
+        self.assertAlmostEqual((rows[0] + rows[-1]) / 2, (bar[0] + bar[-1]) / 2, delta=1.5)
         # The figure is drawn per frame; the cached background only knows sync is on.
         self.assertEqual(mine.header, replace(mine, local_tps=80.0).header)
         self.assertEqual((shared.tps_label, mine.tps_label), ("TPS", "总 TPS"))

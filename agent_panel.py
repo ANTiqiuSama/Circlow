@@ -24,7 +24,7 @@ from icon_art import AMBER, CLAY, PAID, POOL_SHADES, UNIFORM_LETTERS, WINDOW_SHA
 
 WIDTH = 420
 PAD = 18
-FIELD_TOP = 118
+FIELD_TOP = 134
 BASE_RADIUS = 30.0
 GAP = 10.0                  # Clearance between neighbouring bubble boxes.
 LABEL = 20.0                # Caption height under a bubble.
@@ -151,6 +151,16 @@ class PanelModel:
 
 
 METER_TOP = PAD + 32        # Top of the quota / TPS row.
+# Rows of a header column, from METER_TOP: its title, the figure's baseline,
+# the bar, and the reset time under the bar. Columns without a bar (TPS,
+# today's use, the IQ slot) put their second line ("本机 5") on the bar's
+# line, level with the bars beside them.
+FIGURE_Y = 41
+BAR_Y, BAR_H = 54, 4
+BAR_MID = BAR_Y + BAR_H / 2
+RESET_Y = 64
+LABEL_FONT, SMALL_FONT = 12, 12
+FIGURE_FONT, FIGURE_UNIT_FONT = 26, 13      # the big figure and its unit ("%", "tok/s")
 FOOTER = 40                 # Two forecast lines plus a separate settings button.
 CHART_AXIS = 11             # Clock row under the plot.
 CHART = 80 + CHART_AXIS     # Burn chart under the task field.
@@ -795,32 +805,33 @@ class Scene:
             shown = None if value is None else spring.value
             override = model.figure_of(slot)
             if override:     # e.g. Codex at 0 %: the purchased credits left instead of "0 %"
-                blit_at(frame, figure(override[0], override[1], shade, shade, scale), at(x), at(meter_top + 38))
+                blit_at(frame, figure(override[0], override[1], shade, shade, scale), at(x), at(meter_top + FIGURE_Y))
             else:
                 blit_at(frame, figure("—" if shown is None else f"{max(0.0, shown):.0f}", "" if shown is None else "%",
-                                      shade, shade, scale), at(x), at(meter_top + 38))
+                                      shade, shade, scale), at(x), at(meter_top + FIGURE_Y))
             if paid:
-                draw.rounded_rectangle((round(at(x)), round(at(meter_top + 45)), round(at(end)), round(at(meter_top + 49))),
+                draw.rounded_rectangle((round(at(x)), round(at(meter_top + BAR_Y)), round(at(end)), round(at(meter_top + BAR_Y + BAR_H))),
                                        radius=max(1, round(2 * scale)), fill=PAID)
             elif shown and shown > 0.3:
                 fill = quota_shade(model.letter, slot, value, pooled(model))
-                draw.rounded_rectangle((round(at(x)), round(at(meter_top + 45)),
-                                        round(at(x + max(4.0, (end - x) * min(100.0, shown) / 100))), round(at(meter_top + 49))),
+                draw.rounded_rectangle((round(at(x)), round(at(meter_top + BAR_Y)),
+                                        round(at(x + max(4.0, (end - x) * min(100.0, shown) / 100))), round(at(meter_top + BAR_Y + BAR_H))),
                                        radius=max(1, round(2 * scale)), fill=fill)
         if model.provider == "mimo":
             number, unit = compact_usage(None if model.today_used is None else self.today_usage.value)
             blit_at(frame, figure(number, unit, accent(model.letter), SECONDARY_TEXT, scale),
-                    at(columns[-2][0]), at(meter_top + 38))
+                    at(columns[-2][0]), at(meter_top + FIGURE_Y))
         if model.provider != "gemini":
             x = columns[-1][0]
             color = accent(model.letter)
             rate = max(0.0, self.rate.value)
             blit_at(frame, figure(f"{rate:.0f}", "tok/s", color if model.tps and rate >= 0.5 else TEXT, SECONDARY_TEXT, scale),
-                    at(x), at(meter_top + 38))
+                    at(x), at(meter_top + FIGURE_Y))
             if model.local_tps is not None:
-                # The figure is the same on every synced device; this one's own share below.
-                draw.text((at(x), at(meter_top + 55)), f"本机 {model.local_tps:.0f}", font=ui_font(max(1, round(10 * scale))),
-                          fill=MUTED_TEXT, anchor="lt")
+                # The figure is the same on every synced device; this one's own
+                # share below it, on the line of the quota bars beside it.
+                draw.text((at(x), at(meter_top + BAR_MID)), f"本机 {model.local_tps:.0f}",
+                          font=ui_font(max(1, round(SMALL_FONT * scale))), fill=MUTED_TEXT, anchor="lm")
         if model.status_tone == "live":
             p = (self.time % 1.8) / 1.8
             blit(frame, faded(ring(round((4 + 7 * ease_out_cubic(p)) * scale), max(1, round(1.2 * scale)), model.letter),
@@ -941,11 +952,11 @@ def blit_at(frame: Image.Image, sprite: tuple[Image.Image, int], left: float, ba
 def figure(number: str, unit: str, shade, unit_shade, scale: float) -> tuple[Image.Image, int]:
     """Big header figure with its unit, e.g. "72 %" or "85 tok/s"."""
     px = lambda value: round(value * scale)  # noqa: E731
-    value_font, unit_font = figure_font(px(21)), ui_font(px(11), "bold")
+    value_font, unit_font = figure_font(px(FIGURE_FONT)), ui_font(px(FIGURE_UNIT_FONT), "bold")
     probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     width = probe.textlength(number, font=value_font) + (px(3) + probe.textlength(unit, font=unit_font) if unit else 0)
-    baseline = px(24)
-    image = Image.new("RGBA", (round(width) + px(4), px(30)), (0, 0, 0, 0))
+    baseline = px(FIGURE_FONT + 4)
+    image = Image.new("RGBA", (round(width) + px(4), px(FIGURE_FONT + 10)), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     draw.text((0, baseline), number, font=value_font, fill=shade, anchor="ls")
     if unit:
@@ -1942,21 +1953,21 @@ def _background(header: tuple, field_h: int, scale: float) -> Image.Image:
     draw.text((px(right - width / 2), px(y + 9)), status, font=pill, fill=ink, anchor="mm")
 
     y = METER_TOP + header_offset(model)
-    label_font, small = ui_font(px(11)), ui_font(px(10))
+    label_font, small = ui_font(px(LABEL_FONT)), ui_font(px(SMALL_FONT))
     columns = meter_columns(len(meters) + daily, show_tps)
     labels = tuple(meters) + ((("今日用量", "", ""),) if daily else ()) + (((show_tps, "", "tps"),) if show_tps else ())
     for (x, end), (label, reset, column_tone) in zip(columns, labels):
         draw.text((px(x), px(y)), label, font=label_font, fill=MUTED_TEXT, anchor="lt")
         if daily and label == "今日用量":
             if reset:
-                draw.text((px(x), px(y + 51)), reset, font=small, fill=MUTED_TEXT, anchor="lt")
+                draw.text((px(x), px(y + BAR_MID)), reset, font=small, fill=MUTED_TEXT, anchor="lm")
             continue
         if column_tone != "tps":
-            draw.rounded_rectangle((px(x), px(y + 45), px(end), px(y + 49)), radius=px(2), fill=TRACK)
+            draw.rounded_rectangle((px(x), px(y + BAR_Y), px(end), px(y + BAR_Y + BAR_H)), radius=px(2), fill=TRACK)
             if reset:
                 ink = {"active": accent(letter), "paid": PAID, "blocked": CLAY}.get(column_tone, MUTED_TEXT)
-                face = ui_font(px(10), "bold") if column_tone == "active" else small
-                draw.text((px(x), px(y + 55)), reset, font=face, fill=ink, anchor="lt")
+                face = ui_font(px(SMALL_FONT), "bold") if column_tone == "active" else small
+                draw.text((px(x), px(y + RESET_Y)), reset, font=face, fill=ink, anchor="lt")
     if column_iq:
         slot = spare_slot(len(meters) + daily, show_tps)
         if slot:
@@ -1966,8 +1977,8 @@ def _background(header: tuple, field_h: int, scale: float) -> Image.Image:
             label, value, caption, unit = (tuple(column_iq) + ("",))[:4]
             draw.text((px(x), px(y)), label, font=label_font, fill=MUTED_TEXT, anchor="lt")
             if caption:
-                draw.text((px(x), px(y + 51)), caption, font=small, fill=MUTED_TEXT, anchor="lt")
-            blit_at(content, figure(value or "—", unit, TEXT, TEXT, s), px(x), px(y + 38))
+                draw.text((px(x), px(y + BAR_MID)), caption, font=small, fill=MUTED_TEXT, anchor="lm")
+            blit_at(content, figure(value or "—", unit, TEXT, TEXT, s), px(x), px(y + FIGURE_Y))
     if header_offset(model):
         _banner(draw, px, s, banner, alert, intel, note, letter)
     # On glass the sections are a faint lift with no outline (LumaCenter's
