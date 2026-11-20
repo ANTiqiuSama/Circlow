@@ -239,7 +239,17 @@ class SplitRingTests(unittest.TestCase):
         hour_cols = ivory_cols("h")
         minute_cols = ivory_cols("m")
         day_cols = ivory_cols("d", 12)
-        self.assertGreaterEqual(max(minute_cols) - min(minute_cols), max(hour_cols) - min(hour_cols) + 4)
+        self.assertGreater(max(minute_cols) - min(minute_cols), max(hour_cols) - min(hour_cols))
+        for unit in ("h", "m", "d"):
+            # Whole on the icon: the ink stops short of the edge that used
+            # to cut off m's and d's last stroke.
+            canvas = Image.new("RGBA", (icon_art.CANVAS, icon_art.CANVAS))
+            icon_art._draw_unit(canvas, unit)
+            left, top, right, bottom = canvas.getbbox()
+            self.assertLessEqual(right, icon_art.CANVAS - 2, unit)
+            self.assertGreater(top, 0, unit)
+        for unit in ("m", "d"):                           # shrunk only a little from h
+            self.assertGreaterEqual(icon_art._unit_glyph(unit, draw)[0].size, 0.6 * hour.size)
         self.assertGreater(min(day_cols), min(ivory_cols("h", 12)))
         self.assertGreater(min(ivory_cols("m", 12)), min(ivory_cols("h", 12)) - 6)
         self.assertNotEqual(icon_art.waiting_icon(2, "C", unit="m").tobytes(),

@@ -319,7 +319,33 @@ _CLAUDE_PROBE_LOCK = threading.Lock()
 
 def native_claude_quota(report: dict) -> QuotaSnapshot:
     """Claude's quota as the status-line receiver last saw it (no /usage)."""
-    return _claude_native(report)
+    return claude_live(_claude_native(report))
+
+
+def _claude_window_live(used: float | None, reset: int | None, now: float) -> tuple[float | None, int | None]:
+    if used is not None and reset is not None and reset <= now:
+        return 0.0, None
+    return used, reset
+
+
+def claude_live(snapshot: QuotaSnapshot | None, now: float | None = None) -> QuotaSnapshot | None:
+    """A Claude reading as it stands now: a window whose reset has passed is
+    over, so it reads as the fresh window after it, unused with no reset
+    known yet - as cli_usage reads a /usage section still showing the ended
+    window. The status line and the last /usage result keep the ended
+    window's figure until Claude Code redraws or /usage is asked again.
+    The same object when no window has ended."""
+    if snapshot is None or snapshot.provider != "claude":
+        return snapshot
+    now = time.time() if now is None else now
+    used, reset = _claude_window_live(snapshot.used_percent, snapshot.resets_at, now)
+    second, second_reset = _claude_window_live(snapshot.secondary_used_percent, snapshot.secondary_resets_at, now)
+    if reset == snapshot.resets_at and second_reset == snapshot.secondary_resets_at:
+        return snapshot
+    return replace(snapshot, used_percent=used, remaining_percent=None if used is None else 100.0 - used,
+                   resets_at=reset, secondary_used_percent=second,
+                   secondary_remaining_percent=None if second is None else 100.0 - second,
+                   secondary_resets_at=second_reset)
 
 
 def _claude_native(report: dict) -> QuotaSnapshot:
@@ -368,13 +394,15 @@ def _further(window_a: tuple, window_b: tuple) -> int:
     """1 when (used, reset, changed) a is further along than b, -1 when b
     is, else 0: a later reset is a newer window; in one window, more used is
     newer, except that a figure CLAUDE_CARD_DROP or more lower that is newer
-    (changed later) is an early reset of the limit."""
+    (changed later) is an early reset of the limit. A fresh window whose
+    reset is not known yet (see claude_live) is never such a reset."""
     (used_a, reset_a, changed_a), (used_b, reset_b, changed_b) = window_a, window_b
     if used_a is None or used_b is None:
         return (used_a is not None) - (used_b is not None)
     if reset_a and reset_b and abs(reset_a - reset_b) > 180:
         return 1 if reset_a > reset_b else -1
-    if changed_a is not None and changed_b is not None and abs(used_a - used_b) >= CLAUDE_CARD_DROP:
+    if reset_a and reset_b and changed_a is not None and changed_b is not None and \
+            abs(used_a - used_b) >= CLAUDE_CARD_DROP:
         lower, higher = (changed_a, changed_b) if used_a < used_b else (changed_b, changed_a)
         if lower > higher:
             return 1 if used_a < used_b else -1
@@ -384,14 +412,17 @@ def _further(window_a: tuple, window_b: tuple) -> int:
 def claude_newer(first: QuotaSnapshot, second: QuotaSnapshot) -> QuotaSnapshot:
     """The reading further along, window by window: `/usage` and the status
     line can each trail the other, and the account's use never goes back
-    within a window unless the limit was reset early (see _further). A
-    window that ties follows the other; `first` wins a full tie. When each
-    reading is ahead in one window, a copy of the one ahead in the 5-hour
-    window carries the other's weekly window."""
-    primary = _further((first.used_percent, first.resets_at, first.changed_at),
-                       (second.used_percent, second.resets_at, second.changed_at))
-    secondary = _further((first.secondary_used_percent, first.secondary_resets_at, first.secondary_changed_at),
-                         (second.secondary_used_percent, second.secondary_resets_at, second.secondary_changed_at))
+    within a window unless the limit was reset early (see _further). Both
+    are compared as they stand now (claude_live): an ended window is not
+    further along than the fresh one after it. A window that ties follows
+    the other; `first` wins a full tie. When each reading is ahead in one
+    window, a copy of the one ahead in the 5-hour window carries the
+    other's weekly window."""
+    now = time.time()
+    a, b = claude_live(first, now), claude_live(second, now)
+    primary = _further((a.used_percent, a.resets_at, a.changed_at), (b.used_percent, b.resets_at, b.changed_at))
+    secondary = _further((a.secondary_used_percent, a.secondary_resets_at, a.secondary_changed_at),
+                         (b.secondary_used_percent, b.secondary_resets_at, b.secondary_changed_at))
     if primary >= 0 and secondary >= 0:
         return first
     if primary <= 0 and secondary <= 0:
@@ -422,7 +453,7 @@ def get_claude_quota() -> QuotaSnapshot:
         # Between checks, the last /usage result still counts: a status line
         # behind it (an idle session's older figure) does not pull it back.
         last = _CLAUDE_PROBE.get("snapshot")
-        return native if last is None or last.error else claude_newer(native, last)
+        return claude_live(native if last is None or last.error else claude_newer(native, last))
     if verify or fresh_look:
         gap = 0
     elif watched:
@@ -434,9 +465,9 @@ def get_claude_quota() -> QuotaSnapshot:
     probed = _claude_probe_cached(gap)
     if probed.error is None:
         # An old status line never outvotes a live /usage check.
-        return probed if native is None or native.stale else claude_newer(probed, native)
+        return claude_live(probed if native is None or native.stale else claude_newer(probed, native))
     # A failed read keeps the last native numbers (marked stale) on screen.
-    return native or probed
+    return claude_live(native or probed)
 
 
 _MIMO_TRACKER = None
@@ -534,7 +565,7 @@ def keep_last_good(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaS
         for name in SECONDARY_FIELDS:
             setattr(snapshot, name, getattr(old, name))
         snapshot.stale = True
-    return snapshot
+    return claude_live(snapshot)          # carried-over figures of a window that has since ended
 
 
 def collect(providers, previous: dict[str, QuotaSnapshot] | None = None) -> dict[str, QuotaSnapshot]:

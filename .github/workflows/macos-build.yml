@@ -52,6 +52,8 @@ on:
       - 'test_claude_status.py'
       - 'test_features.py'
       - 'test_model_iq.py'
+      - 'test_*.py'
+      - 'power_source.py'
       - '.github/workflows/macos-build.yml'
   pull_request:
     paths:
@@ -103,6 +105,8 @@ on:
       - 'test_claude_status.py'
       - 'test_features.py'
       - 'test_model_iq.py'
+      - 'test_*.py'
+      - 'power_source.py'
       - '.github/workflows/macos-build.yml'
   workflow_dispatch:
 
