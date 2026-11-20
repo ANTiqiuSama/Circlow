@@ -240,7 +240,8 @@ class SplitRingTests(unittest.TestCase):
         hour_cols = ivory_cols("h")
         minute_cols = ivory_cols("m")
         day_cols = ivory_cols("d", 12)
-        self.assertGreater(max(minute_cols) - min(minute_cols), max(hour_cols) - min(hour_cols))
+        # m is never narrower than h (as wide with Windows' font, wider with the Mac's).
+        self.assertGreaterEqual(max(minute_cols) - min(minute_cols), max(hour_cols) - min(hour_cols))
         for unit in ("h", "m", "d"):
             # Whole on the icon: the ink stops short of the edge that used
             # to cut off m's and d's last stroke.
