@@ -456,5 +456,62 @@ class TpsTests(unittest.TestCase):
         self.assertEqual(50.0, monitor.snapshot(now)["providers"]["gemini"]["display_tps"])  # working: last rate, not 0
 
 
+class ClaudeStreamTests(unittest.TestCase):
+    """A Claude Code session and its sub-agents write their replies at once."""
+
+    def setUp(self):
+        self.now = time.time()
+        self.monitor = TpsMonitor(home=Path(__file__).parent / "work/tps-tests" / str(uuid.uuid4()))
+
+    def request(self, stream, ident, at):
+        self.monitor._claude_record({"type": "api-request", "id": ident, "timestamp": at,
+                                     "params": {"model": "claude-opus-5-5"}}, "s", self.now, stream)
+
+    def line(self, stream, mid, ref, at, output, stop=None):
+        message = {"id": mid, "model": "claude-opus-5-5", "stop_reason": stop, "usage": {"output_tokens": output}}
+        self.monitor._claude_record({"type": "assistant", "requestRef": ref, "timestamp": at, "message": message},
+                                    "s", self.now, stream)
+
+    def test_sub_agent_lines_do_not_settle_the_sessions_reply(self):
+        t = self.now - 60
+        self.request("s", "r1", t)
+        self.request("agent-a", "r2", t + 1)
+        self.line("s", "m1", "r1", t + 5, 40)                    # thinking block: count so far
+        self.line("agent-a", "m2", "r2", t + 6, 300)             # the sub-agent writes in between
+        self.line("s", "m1", "r1", t + 10, 1000, "tool_use")      # the session's reply goes on
+        self.line("agent-a", "m2", "r2", t + 11, 500, "end_turn")
+        self.monitor._claude_flush(self.now)
+        self.monitor._claude_record({"type": "user", "timestamp": t + 12, "message": {}}, "s", self.now, "s")
+        events = {e.identity: e for e in self.monitor.events}
+        session, agent = events[key("claude", "m1")], events[key("claude", "m2")]
+        self.assertEqual((session.output_tokens, session.native_tps, session.stream), (1000, 100.0, ""))
+        self.assertEqual((agent.output_tokens, agent.native_tps, agent.stream, agent.turn_end), (500, 50.0, "agent-a", True))
+        self.assertEqual(len(self.monitor.events), 2)
+
+    def observe(self, ident, stream, ended, tokens, seconds, session="s", turn_end=False):
+        self.monitor.add(Observation(ident, "Claude Code", session, "claude", "claude-opus-5-5", ended, tokens, seconds,
+                                     "b", True, round(tokens / seconds, 1), stream=stream, turn_end=turn_end), self.now)
+
+    def test_streams_generating_at_once_add_up(self):
+        n = self.now
+        self.observe("a1", "", n - 40, 900, 10)                  # the session: 90 tok/s
+        self.observe("a2", "", n - 20, 1000, 10)                 # (two replies: 95 weighted)
+        self.observe("b1", "agent-x", n - 15, 600, 10)           # its sub-agent: 60 tok/s
+        self.observe("c1", "", n - 10, 800, 10, session="t")     # another session: 80 tok/s
+        data = self.monitor.snapshot(n)["providers"]["claude"]
+        self.assertEqual(data["display_tps"], 235.0)
+        self.assertIn("3 路同时生成", data["display_basis"])
+        self.assertIn("含 1 个子代理", data["display_basis"])
+        self.observe("b2", "agent-x", n - 5, 300, 10, turn_end=True)    # the sub-agent finished
+        self.assertEqual(self.monitor.snapshot(n)["providers"]["claude"]["display_tps"], 175.0)
+
+    def test_one_stream_is_not_averaged_with_another(self):
+        n = self.now
+        self.observe("old", "", n - 200, 200, 10, session="t", turn_end=True)   # another session, done: 20 tok/s
+        self.observe("new", "", n - 150, 900, 10)
+        data = self.monitor.snapshot(n)["providers"]["claude"]
+        self.assertEqual(data["display_tps"], 90.0)                    # only its own replies
+
+
 if __name__ == "__main__":
     unittest.main()
