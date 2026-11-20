@@ -1051,8 +1051,8 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         """(models on the banner's right, note when there are none): coding
         scores, the source's running model first, then the highest scores."""
         state, config = getattr(self, "iq_state", None), getattr(self, "iq_config", None) or {}
-        if not model_iq.effective_key(config):
-            return (), "未设置"
+        if not model_iq.effective_key(config) and not (state is not None and state.models):
+            return (), "未设置"             # no key here, and nothing synced from another device
         models = model_iq.hover_models(state, config.get("shown"), running)
         if not models:                 # nothing ever read: no quota or error wording on the panel
             error = state.error if state else ""
@@ -1078,7 +1078,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                 "shown": config.get("shown"), "models": state.scores(), "fetched": model_iq.age_text(state, now),
                 "fetched_at": state.fetched_at, "remaining": model_iq.remaining_today(state, now),
                 "calls": model_iq.calls_today(state, now), "error": state.error,
-                "default": model_iq.default_selection(state.scores())}
+                "default": model_iq.default_selection(state.scores()), "synced_from": state.synced_from}
 
     def save_model_iq(self, key: str, shown: list[str] | None) -> None:
         model_iq.save_config(IQ_CONFIG_PATH, key, shown)
@@ -1381,10 +1381,19 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         """What this device shares: its quota readings, its own hourly output
         totals, and the weekly ledger. Numbers only."""
         usage, ledger = getattr(self, "usage", None), getattr(self, "weekly", None)
-        return {"label": sync_hub.device_label(), "platform": sys.platform, "sent_at": now,
-                "snapshots": sync_hub.snapshot_payload(dict(self.snapshots)),
-                "usage": usage.export_hours(now - sync_hub.USAGE_DAYS * 86400) if usage is not None else {},
-                "weekly": ledger.export() if ledger is not None else {}}
+        payload = {"label": sync_hub.device_label(), "platform": sys.platform, "sent_at": now,
+                   "snapshots": sync_hub.snapshot_payload(dict(self.snapshots)),
+                   "usage": usage.export_hours(now - sync_hub.USAGE_DAYS * 86400) if usage is not None else {},
+                   "weekly": ledger.export() if ledger is not None else {}}
+        # The model IQ scores read here (AI Stupid Level, LiveBench), so a
+        # device without its own key, or between its reads, shows them too.
+        with self.__dict__.setdefault("iq_lock", threading.Lock()):
+            iq, grok = model_iq.export(getattr(self, "iq_state", None)), grok_iq.export(getattr(self, "grok_iq", None))
+        if iq:
+            payload["iq"] = iq
+        if grok:
+            payload["grok_iq"] = grok
+        return payload
 
     def sync_merge(self, payloads: dict, now: float) -> None:
         """Take the other devices' newer quota readings, their output hours
@@ -1404,9 +1413,35 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                 usage.set_remote(device, str(payload.get("label") or device), payload.get("usage"))
             if ledger is not None:
                 ledger.merge(payload.get("weekly"))
+        iq_taken = self.merge_synced_iq(payloads, me)
         if taken:
             log.info("sync: newer readings from other devices for %s", ", ".join(sorted({p for p, _ in taken})))
+        if taken or iq_taken:
             self.update_ui()
+
+    def merge_synced_iq(self, payloads: dict, me: str) -> bool:
+        """Take the newest model IQ results the other devices read (later
+        than the ones here) and save them; True when any was taken."""
+        taken = []
+        with self.__dict__.setdefault("iq_lock", threading.Lock()):
+            state, grok = getattr(self, "iq_state", None), getattr(self, "grok_iq", None)
+            for device, record in payloads.items():
+                if device == me or not isinstance(record, dict):
+                    continue
+                payload = record.get("payload") or {}
+                label = str(payload.get("label") or device)
+                if state is not None and model_iq.adopt(state, payload.get("iq"), label):
+                    taken.append(("model iq", label))
+                if grok is not None and grok_iq.adopt(grok, payload.get("grok_iq"), label):
+                    taken.append(("grok iq", label))
+            names = {name for name, _ in taken}
+            if "model iq" in names:
+                model_iq.save_state(IQ_STATE_PATH, state)
+            if "grok iq" in names:
+                grok_iq.save_state(GROK_IQ_PATH, grok)
+        for name, label in taken:
+            log.info("sync: %s from %s", name, label)
+        return bool(taken)
 
     def sync_status(self) -> str:
         sync = getattr(self, "sync", None)

@@ -61,6 +61,7 @@ class IqState:
     blocked_day: str = ""                           # 429 seen: no calls until the next UTC day
     error: str = ""
     board: str = "coding"                      # provenance of the cached score values
+    synced_from: str = ""                      # another device's label when its read is the one kept
 
     def scores(self) -> list[ModelScore]:
         result = []
@@ -91,7 +92,9 @@ def due(state: IqState, now: float) -> bool:
     if state.blocked_day == utc_day(now):
         return False
     # A failed call also waits the full interval: a bad key must not spend the day's calls.
-    return now - state.attempted_at >= READ_SECONDS and calls_today(state, now) < AUTO_CALLS_PER_DAY
+    # A fresh result synced from another device counts as a read here too.
+    return now - state.attempted_at >= READ_SECONDS and now - state.fetched_at >= READ_SECONDS and \
+        calls_today(state, now) < AUTO_CALLS_PER_DAY
 
 
 # ----- names ---------------------------------------------------------------------------------
@@ -258,8 +261,44 @@ def read(state: IqState, key: str, now: float, get: Callable[[str], dict] | None
         return state
     state.models = [asdict(m) for m in models]
     state.fetched_at, state.error = now, ""
-    state.board = "coding"
+    state.board, state.synced_from = "coding", ""
     return state
+
+
+# ----- other devices --------------------------------------------------------------------------
+
+def export(state: IqState | None) -> dict | None:
+    """The last coding-board result for the other devices (sync_hub): the
+    scores and when they were read; never the key or the call count."""
+    if state is None or not state.fetched_at or state.board != "coding":
+        return None
+    models = [asdict(score) for score in state.scores()]
+    return {"models": models, "fetched_at": state.fetched_at} if models else None
+
+
+def adopt(state: IqState, shared: Any, source: str) -> bool:
+    """Take another device's result (see export) when it was read later
+    than the one here; True when taken. A device without a key shows the
+    scores read elsewhere, and one with a key waits READ_SECONDS from them
+    before spending a call of its own. Its own last error stays."""
+    if not isinstance(shared, dict) or not isinstance(shared.get("models"), list):
+        return False
+    fetched = _number(shared.get("fetched_at"))
+    if fetched is None or fetched <= state.fetched_at:
+        return False
+    models = []
+    for item in shared["models"]:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        models.append(ModelScore(str(item.get("id") or item["name"]), str(item["name"]), str(item.get("provider") or ""),
+                                 _number(item.get("score")), str(item.get("trend") or ""), str(item.get("status") or ""),
+                                 _number(item.get("lower")), _number(item.get("upper")), str(item.get("updated") or "")))
+    if not models:
+        return False
+    models.sort(key=lambda s: -(s.score if s.score is not None else -1))
+    state.models = [asdict(m) for m in models]
+    state.fetched_at, state.board, state.synced_from = fetched, "coding", source
+    return True
 
 
 # ----- storage --------------------------------------------------------------------------------

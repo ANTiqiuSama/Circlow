@@ -292,6 +292,56 @@ class AppMergeTests(unittest.TestCase):
         payload = tray.sync_payload(9700)
         self.assertEqual(set(payload["snapshots"]), {"codex", "claude"})
         self.assertEqual(payload["usage"], {})                        # the Mac's hours are not passed on
+        self.assertNotIn("iq", payload)                               # nothing read yet
+
+    def test_model_iq_read_on_one_device_shows_on_the_other(self):
+        import grok_iq
+        import model_iq
+        import tray_app
+        from tray_app import QuotaTray
+
+        def tray_with(state, grok):
+            tray = QuotaTray.__new__(QuotaTray)
+            tray.snapshots, tray.history, tray.usage, tray.weekly = {}, None, None, None
+            tray.iq_state, tray.grok_iq, tray.iq_config = state, grok, {"key": "", "shown": None}
+            tray.update_ui = mock.Mock()
+            return tray
+
+        scores = [model_iq.ModelScore("a", "claude-opus-5-5", "anthropic", 71.0),
+                  model_iq.ModelScore("b", "gpt-6.1-sol", "openai", 74.5)]
+        windows_state = model_iq.IqState(models=[vars(s) for s in scores], fetched_at=9000.0,
+                                         attempted_at=9000.0, calls={"x": 3})
+        windows_grok = grok_iq.GrokIq(score=60.0, top_score=80.0, top_model="gpt-6.1-sol", release="2026-11-01",
+                                      script="/a.js", fetched_at=9100.0)
+        windows = tray_with(windows_state, windows_grok)
+        with mock.patch.object(sync_hub, "device_label", return_value="Windows · pc"):
+            payload = windows.sync_payload(9500)
+        self.assertNotIn("calls", payload["iq"])                       # scores only: no key, no call count
+        mac = tray_with(model_iq.IqState(), grok_iq.GrokIq())
+        mac.sync = sync_hub.SyncLoop(FakeClient(), "mac-air", mac.sync_payload, mac.sync_merge)
+        self.assertEqual(mac.panel_intel(9600), ((), "未设置"))
+        with mock.patch.object(tray_app, "IQ_STATE_PATH", self.folder / "iq.json"), \
+                mock.patch.object(tray_app, "GROK_IQ_PATH", self.folder / "grok.json"):
+            mac.sync_merge({"win-pc": record(payload)}, 9600)
+            self.assertEqual(model_iq.load_state(self.folder / "iq.json").fetched_at, 9000.0)     # kept on disk
+            self.assertEqual(grok_iq.load_state(self.folder / "grok.json").score, 60.0)
+        mac.update_ui.assert_called_once()
+        intel, note = mac.panel_intel(9600)
+        self.assertEqual(([name for name, *_ in intel], note), (["GPT-6.1 Sol", "Opus 5.5"], ""))
+        self.assertEqual((mac.iq_state.synced_from, mac.iq_state.calls), ("Windows · pc", {}))
+        self.assertEqual(grok_iq.column(mac.grok_iq)[1], "75")
+        self.assertFalse(model_iq.due(mac.iq_state, 9600))                # a fresh synced read waits its turn
+        self.assertFalse(grok_iq.due(mac.grok_iq, 9600))
+        mac.sync_merge({"win-pc": record(payload)}, 9700)                # the same round again: nothing new
+        mac.update_ui.assert_called_once()
+        echoed = mac.sync_payload(9800)                                  # passed on, but never newer
+        windows.sync = sync_hub.SyncLoop(FakeClient(), "win-pc", windows.sync_payload, windows.sync_merge)
+        self.assertFalse(windows.merge_synced_iq({"mac-air": record(echoed)}, "win-pc"))
+        self.assertEqual(windows.iq_state.synced_from, "")
+        stale = {"models": [{"name": "old"}], "fetched_at": 8000.0}
+        self.assertFalse(model_iq.adopt(mac.iq_state, stale, "elsewhere"))   # older than the one shown
+        self.assertFalse(model_iq.adopt(mac.iq_state, {"models": [], "fetched_at": 9999.0}, "elsewhere"))
+        self.assertFalse(grok_iq.adopt(mac.grok_iq, {"score": "x", "top_score": 80, "fetched_at": 9999.0}, "elsewhere"))
 
 
 class ServerTests(unittest.TestCase):

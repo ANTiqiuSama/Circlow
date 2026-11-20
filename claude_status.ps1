@@ -36,20 +36,27 @@ try {
         $live = @{}
         foreach ($name in @('five_hour', 'seven_day')) {
             $window = $payload.rate_limits.$name
+            $old = if ($null -ne $previous) { $previous.rate_limits.$name } else { $null }
             if ($null -ne $window -and $null -ne $window.used_percentage) {
                 $used = [double]$window.used_percentage
                 if ($used -ge 0 -and $used -le 100) {
-                    $limits[$name] = [ordered]@{used_percentage=$used; resets_at=$window.resets_at; observed_at=$now}
+                    # When this session's figure last changed: an idle session
+                    # re-reports its last request's limits on every redraw, so
+                    # a repeat keeps the time (null: unknown, held from before).
+                    $changed = $now
+                    if ($null -ne $old -and $null -ne $old.used_percentage -and [double]$old.used_percentage -eq $used -and
+                            "$($old.resets_at)" -eq "$($window.resets_at)") { $changed = $old.changed_at }
+                    $limits[$name] = [ordered]@{used_percentage=$used; resets_at=$window.resets_at; observed_at=$now; changed_at=$changed}
                     $live[$name] = $true
                     continue
                 }
             }
             # Claude Code omits a window once its reading passes the reset; keep
             # the last reading so the tray sees the rollover instead of a gap.
-            $old = if ($null -ne $previous) { $previous.rate_limits.$name } else { $null }
             if ($null -ne $old -and $null -ne $old.used_percentage) {
                 $seen = if ($null -ne $old.observed_at) { [double]$old.observed_at } else { [double]$previous.updated_at }
-                $limits[$name] = [ordered]@{used_percentage=[double]$old.used_percentage; resets_at=$old.resets_at; observed_at=$seen}
+                $limits[$name] = [ordered]@{used_percentage=[double]$old.used_percentage; resets_at=$old.resets_at; observed_at=$seen;
+                                            changed_at=$old.changed_at}
             }
         }
         $sessions[$session] = [ordered]@{updated_at=$now; rate_limits=$limits}

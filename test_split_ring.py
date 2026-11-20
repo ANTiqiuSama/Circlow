@@ -229,7 +229,8 @@ class SplitRingTests(unittest.TestCase):
         draw = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
         hour = icon_art._unit_face(draw)
         self.assertEqual(hour.size, icon_art._fit("h", icon_art.number_font, 96, 96, 132, draw).size)
-        self.assertGreater(hour.size, icon_art._fit("m", icon_art.number_font, 96, 96, 132, draw).size)
+        # m is the widest letter: never a larger size than h (equal with Windows' font, smaller with the Mac's).
+        self.assertGreaterEqual(hour.size, icon_art._fit("m", icon_art.number_font, 96, 96, 132, draw).size)
 
         def ivory_cols(unit, amount=1):
             image = icon_art.waiting_icon(amount, "C", unit=unit)
@@ -239,7 +240,8 @@ class SplitRingTests(unittest.TestCase):
         hour_cols = ivory_cols("h")
         minute_cols = ivory_cols("m")
         day_cols = ivory_cols("d", 12)
-        self.assertGreater(max(minute_cols) - min(minute_cols), max(hour_cols) - min(hour_cols))
+        # m is never narrower than h (as wide with Windows' font, wider with the Mac's).
+        self.assertGreaterEqual(max(minute_cols) - min(minute_cols), max(hour_cols) - min(hour_cols))
         for unit in ("h", "m", "d"):
             # Whole on the icon: the ink stops short of the edge that used
             # to cut off m's and d's last stroke.

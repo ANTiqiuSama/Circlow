@@ -324,6 +324,26 @@ def _claude_window_possible(name: str, at: float, resets_at: int | None) -> bool
     return at - RESET_TOLERANCE <= resets_at <= at + minutes * 60 + RESET_TOLERANCE
 
 
+CLAUDE_CARD_DROP = 10.0        # an early reset (reset card) drops at least this much
+
+
+def _back_to_reset_level(clean: list[Sample], item: Sample) -> bool:
+    """Whether `item` jumps back up to where its window stood before an early
+    reset inside it (a reset card: down CLAUDE_CARD_DROP or more, to 5% or
+    less, same reset time). That is a session that has not heard of the
+    reset; use after it climbs step by step, never CLAUDE_CARD_DROP at once."""
+    if not clean or not same_window(clean[-1].resets_at, item.resets_at) or \
+            item.used - clean[-1].used < CLAUDE_CARD_DROP:
+        return False
+    for index in range(len(clean) - 1, 0, -1):
+        before, after = clean[index - 1], clean[index]
+        if not same_window(after.resets_at, item.resets_at) or not same_window(before.resets_at, after.resets_at):
+            return False
+        if before.used - after.used >= CLAUDE_CARD_DROP and after.used <= 5:
+            return item.used >= before.used - 2
+    return False
+
+
 class QuotaHistory:
     """Small persisted series keyed by "provider" and "provider:secondary"."""
 
@@ -347,7 +367,8 @@ class QuotaHistory:
     @staticmethod
     def _without_false_claude_recoveries(name: str, readings: list[Sample]) -> list[Sample]:
         """Repair old saved spikes (false recoveries, readings of no live
-        window) without erasing real new reset windows."""
+        window, returns to the level before an early reset) without erasing
+        real new reset windows."""
         if name not in ("claude", "claude:secondary"):
             return readings
         clean: list[Sample] = []
@@ -356,6 +377,8 @@ class QuotaHistory:
                 continue
             if clean and same_window(clean[-1].resets_at, item.resets_at) and \
                     clean[-1].used - item.used >= CLAUDE_DROP_TOLERANCE and item.used > 5:
+                continue
+            if _back_to_reset_level(clean, item):
                 continue
             clean.append(item)
         return clean
@@ -384,6 +407,8 @@ class QuotaHistory:
             if name in ("claude", "claude:secondary") and series and \
                     same_window(series[-1].resets_at, resets_at) and \
                     series[-1].used - sample.used >= CLAUDE_DROP_TOLERANCE and sample.used > 5:
+                return False
+            if name in CLAUDE_WINDOW_MINUTES and _back_to_reset_level(series, sample):
                 return False
             if len(series) >= 2 and series[-1].at < at and all(
                     s.used == sample.used and same_window(s.resets_at, resets_at) for s in series[-2:]):
