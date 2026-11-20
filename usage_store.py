@@ -11,6 +11,7 @@ import gzip
 import json
 import os
 import time
+import dataclasses
 from dataclasses import astuple
 from pathlib import Path
 from threading import Lock
@@ -57,8 +58,15 @@ class UsageStore:
                 payload = json.load(handle)
             if payload.get("version") != VERSION:
                 return
-            width = len(self.observation_type.__dataclass_fields__)
-            self.raw = [tuple(row) for row in payload.get("raw", []) if len(row) == width]
+            # Rows saved before newer fields with defaults were added are short:
+            # those fields take their defaults.
+            fields = dataclasses.fields(self.observation_type)
+            width = len(fields)
+            required = sum(1 for field in fields
+                           if field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING)
+            defaults = tuple(field.default for field in fields[required:])
+            self.raw = [tuple(row) + defaults[len(row) - required:] for row in payload.get("raw", [])
+                        if isinstance(row, list) and required <= len(row) <= width]
             self.hours = {provider: {int(hour): [int(tokens), int(replies)] for hour, (tokens, replies) in hours.items()}
                           for provider, hours in payload.get("hours", {}).items()}
         except (OSError, ValueError, TypeError, KeyError, EOFError):

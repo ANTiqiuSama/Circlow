@@ -159,8 +159,12 @@ log = logging.getLogger(__name__)
 THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 MIN_TPS_TOKENS = 16      # shorter replies give meaningless rates
 MIN_TPS_SECONDS = 0.3
-TPS_GROUP_SECONDS = 90
-HOLD_TPS_SECONDS = 1800  # while still working, show the last rate measured this recently   # replies finished this close together are averaged
+TPS_GROUP_SECONDS = 90   # one stream's replies finished this close together are averaged
+HOLD_TPS_SECONDS = 1800  # while still working, show the last rate measured this recently
+# A stream (a session, or one of its sub-agents) whose last reply ended this
+# recently, and did not end its turn, is still generating: the speeds of all
+# such streams add up, as the devices' do (sync_hub.combine).
+CONCURRENT_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,8 @@ class Observation:
     native_tps: float | None = None
     input_tokens: int | None = None      # uncached input (for MiMo Credit accounting)
     cached_tokens: int | None = None     # cache-hit input
+    stream: str = ""                     # the session's sub-agent that wrote it ("": the session itself)
+    turn_end: bool = False               # the reply ended the turn: that stream stopped generating
 
 
 class JsonlReader:
@@ -231,7 +237,7 @@ class TpsMonitor:
         self.claude_root = self.home / ".claude" if home else providers.claude_home()
         self.recent_work: list[dict[str, Any]] = []     # agent_tasks.AgentNotes.work, for the hover hint
         self.claude_pending: dict[str, dict[str, Any]] = {}
-        self.claude_last_input: dict[str, float] = {}   # session -> last user / tool-result record
+        self.claude_last_input: dict[str, float] = {}   # stream -> last user / tool-result record
         self.claude_request_starts: dict[tuple[str, str], float] = {}
         self.claude_desktop_last_use = 0.0
         self.home_override = home is not None
@@ -509,14 +515,18 @@ class TpsMonitor:
         known = sum(1 for path in self.readers if self.context.get(self.file_sessions.get(path, ""), {}).get("source") == "Claude Code")
         self.health["Claude Code"] = {"status": "已接入" if known or count else "未发现记录", "sessions": max(known, count)}
 
-    def _claude_record(self, record: dict, session: str, now: float):
-        """Numbers only: message id, model, output token count, timestamps."""
+    def _claude_record(self, record: dict, session: str, now: float, stream: str | None = None):
+        """Numbers only: message id, model, output token count, timestamps.
+        `stream` is the file the record came from: the session itself, or one
+        of its sub-agents (subagents/agent-*.jsonl), which writes its own
+        replies at the same time as the session and its other sub-agents."""
+        stream = stream or session
         moment = timestamp(record.get("timestamp"))
         if moment is None:
             return
         kind = record.get("type")
         if kind == "api-request" and record.get("id"):
-            self.claude_request_starts[(session, str(record["id"]))] = moment
+            self.claude_request_starts[(stream, str(record["id"]))] = moment
             if moment > now - 120:
                 model = (record.get("params") or {}).get("model", "")
                 provider = provider_for(model)
@@ -524,14 +534,16 @@ class TpsMonitor:
             return
         if kind not in ("assistant", "user"):
             return
-        # Any later record means earlier messages of this session are final.
+        # Any later record of the same stream means its earlier messages are
+        # final. Not another stream's: a sub-agent's line used to settle the
+        # session's reply half written, and the rest of it was then dropped.
         message = record.get("message") or {}
         current = message.get("id") if kind == "assistant" else None
         for mid, pending in list(self.claude_pending.items()):
-            if pending["session"] == session and mid != current:
+            if pending["stream"] == stream and mid != current:
                 self._claude_emit(mid, now)
         if kind == "user":
-            self.claude_last_input[session] = moment
+            self.claude_last_input[stream] = moment
             if moment > now - 120:
                 self.activity[session] = ("claude", moment, "请求中")
             return
@@ -541,10 +553,10 @@ class TpsMonitor:
         if output is None or not current or model == "<synthetic>":
             return
         pending = self.claude_pending.setdefault(current, {
-            "session": session, "model": model, "last": moment, "output": 0, "stop": None, "seen_at": now,
-            "input": 0, "cached": 0, "requested": self.claude_last_input.get(session),
+            "session": session, "stream": stream, "model": model, "last": moment, "output": 0, "stop": None, "seen_at": now,
+            "input": 0, "cached": 0, "requested": self.claude_last_input.get(stream),
         })
-        request_start = self.claude_request_starts.get((session, str(record.get("requestRef") or "")))
+        request_start = self.claude_request_starts.get((stream, str(record.get("requestRef") or "")))
         if request_start is not None:
             pending["api_requested"] = request_start
         self.context.setdefault(session, {}).update({"model": model, "provider": provider_for(model)})
@@ -578,9 +590,11 @@ class TpsMonitor:
                 basis = ("Claude Code API 端到端速率（真实输出 token ÷ 本次 API 请求至输出完成，含首字延迟）"
                          if pending.get("api_requested") else
                          "Claude Code 端到端速率（真实输出token数÷请求发出至回复结束，含首字延迟，偏低）")
+        stream = pending.get("stream", pending["session"])
         self.add(Observation(key("claude", mid), "Claude Code", pending["session"], provider, pending["model"],
                              pending["last"], pending["output"], seconds, basis, True, tps,
-                             pending.get("input", 0), pending.get("cached", 0)), now)
+                             pending.get("input", 0), pending.get("cached", 0),
+                             "" if stream == pending["session"] else stream, pending["stop"] == "end_turn"), now)
         if pending["stop"] == "end_turn":
             if pending["last"] > now - 3:
                 self.activity[pending["session"]] = (provider, pending["last"], "刚完成生成")
@@ -1144,7 +1158,7 @@ class TpsMonitor:
                     agent = path.stem if path.parent.name == "subagents" else session
                     for record in reader.read():
                         self.notes.claude(agent, record, session if agent != session else "")
-                        self._claude_record(record, session, now)
+                        self._claude_record(record, session, now, agent)
                 elif source == "Grok CLI":
                     session = path.parent.name
                     for record in reader.read():
@@ -1194,7 +1208,7 @@ class TpsMonitor:
             if event.ended_at < now - 300:
                 break
             if event.native_tps is not None:
-                rates.setdefault(event.session, event.native_tps)
+                rates.setdefault(event.stream or event.session, event.native_tps)   # a sub-agent's bubble: its own
         agents = self.notes.export(self.activity, self.context, rates, now, provider_for, self.schedules)
         try:
             agents = self.herdr.attach(agents, now)
@@ -1263,16 +1277,22 @@ class TpsMonitor:
             # herdr sees agents working before (and between) their local records.
             active += self.herdr.working(provider, set(self.activity))
             output = sum(e.output_tokens for e in recent)
-            generation = latest.native_tps if latest else None
-            basis_text = latest.basis if latest else None
-            if latest is not None and latest.generation_seconds:
-                # Token-weighted over replies finished within TPS_GROUP_SECONDS of
-                # the latest: short tool-call replies no longer swing the figure.
-                group = [e for e in samples if e.generation_seconds and e.ended_at >= latest.ended_at - TPS_GROUP_SECONDS
-                         and e.source == latest.source]
-                if len(group) > 1:
-                    generation = round(sum(e.output_tokens for e in group) / sum(e.generation_seconds for e in group), 1)
-                    basis_text = f"{latest.basis}；最近 {len(group)} 次回复按 token 加权"
+            generation, basis_text = stream_rate(samples, latest) if latest else (None, None)
+            # Several sessions, or a session and its sub-agents, generating at
+            # once: their speeds add up (each stream's own rate, as above).
+            newest: dict[tuple[str, str, str], Observation] = {}
+            for e in samples:
+                stream = (e.source, e.session, e.stream)
+                if stream not in newest or e.ended_at > newest[stream].ended_at:
+                    newest[stream] = e
+            running = [e for e in newest.values() if not e.turn_end and now - e.ended_at <= CONCURRENT_SECONDS]
+            if len(running) > 1:
+                rates = [stream_rate(samples, e)[0] for e in running]
+                generation = round(sum(rate for rate in rates if rate is not None), 1)
+                agents = sum(1 for e in running if e.stream)
+                basis_text = (f"{len(running)} 路同时生成（" + (f"含 {agents} 个子代理，" if agents else "") +
+                              f"每路取最近回复按 token 加权），速率相加；{running[0].basis}")
+                latest = max(running, key=lambda e: e.ended_at)
             if generation is None and active:
                 # A long reply or tool run has no finished sample for minutes; keep
                 # the last measured rate (up to HOLD_TPS_SECONDS) instead of 0.
@@ -1282,6 +1302,21 @@ class TpsMonitor:
                     generation, basis_text = latest.native_tps, f"{latest.basis}；仍在工作，保留上次测得的速率"
             providers[provider] = {"label": label, "active_sessions": active, "generation_tps": generation, "output_tps_60": round(output / 60, 2), "output_tokens_60": output, "generation_samples": len(samples), "basis": [basis_text] if latest else ["客户端暂未提供可核验TPS"], "models": sorted({e.model for e in samples}), "sources": sorted(sources.get(provider, ())), "last_sample_at": latest.ended_at if latest else None, "display_tps": generation, "display_model": latest.model if latest else None, "display_basis": basis_text if latest else "客户端暂未取得TPS"}
         return {"generated_at": now, "window_seconds": 60, "providers": providers, "total_output_tps_60": round(sum(p["output_tokens_60"] for p in providers.values()) / 60, 2), "software": self.software, "source_health": self.health, "measurement_note": "Grok直读CLI原生TPS；Codex使用客户端真实输出token数÷首个输出项至计数完成的流式时间，含思考及工具调用输出，完成时结算。使用时显示最近完成的TPS，缺少完整计数时保留额度；不使用字符数或近似分词器。60秒输出速率为已报告输出数之和÷60，不计输入/缓存，不重复加思考token。"}
+
+
+def stream_rate(samples: list[Observation], latest: Observation) -> tuple[float | None, str | None]:
+    """(speed, basis) of the stream `latest` belongs to: its rate, token-
+    weighted over that stream's replies finished within TPS_GROUP_SECONDS
+    of it, so short tool-call replies do not swing the figure. Another
+    session's or sub-agent's replies are another stream, not mixed in."""
+    if latest.generation_seconds:
+        stream = (latest.source, latest.session, latest.stream)
+        group = [e for e in samples if e.generation_seconds and (e.source, e.session, e.stream) == stream
+                 and latest.ended_at - TPS_GROUP_SECONDS <= e.ended_at <= latest.ended_at]
+        if len(group) > 1:
+            return (round(sum(e.output_tokens for e in group) / sum(e.generation_seconds for e in group), 1),
+                    f"{latest.basis}；最近 {len(group)} 次回复按 token 加权")
+    return latest.native_tps, latest.basis
 
 
 def _find_text(value: Any, wanted: str) -> str:

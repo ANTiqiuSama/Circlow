@@ -65,6 +65,14 @@ class UsageStoreTests(unittest.TestCase):
         self.assertGreater(week.total, sum(400 + i % 50 for i in range(3000) if i * 200 < 6 * 86400))   # beyond the raw day
         self.assertEqual(store.hour_rows(["claude"], now - 86400, now), [])
 
+    def test_replies_saved_before_newer_fields_still_load(self):
+        now = time.time()
+        old = list(reply("a", now - 60, 300).__dict__.values())[:13]          # saved before stream / turn_end
+        with gzip.open(self.path, "wt", encoding="utf-8") as handle:
+            json.dump({"version": usage_store.VERSION, "raw": [old, old[:5]], "hours": {}}, handle)
+        restored = UsageStore(self.path).restore(now)
+        self.assertEqual(restored, [reply("a", now - 60, 300)])                  # the short-by-8 row is not a reply
+
     def test_a_damaged_file_starts_empty(self):
         self.path.write_bytes(b"not gzip")
         store = UsageStore(self.path)
