@@ -67,11 +67,12 @@ def share(state: GrokIq | None) -> float | None:
 
 
 def column(state: GrokIq | None) -> tuple[str, str, str, str]:
-    """(label, figure, caption, unit) for the spare header slot."""
+    """(label, figure, caption, unit) for the spare header slot. The caption
+    names only the model Grok is measured against (the denominator): with
+    both names it ran past its column into the TPS one."""
     value = share(state)
     rival = short_name(state.top_model) if state is not None and state.top_model else ""
-    caption = f"{CAPTION}/{rival}" if rival else CAPTION
-    return LABEL, "—" if value is None else f"{value:.0f}", caption, "" if value is None else "%"
+    return LABEL, "—" if value is None else f"{value:.0f}", rival, "" if value is None else "%"
 
 
 def script_path(html: str) -> str | None:

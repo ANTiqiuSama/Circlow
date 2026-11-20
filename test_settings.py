@@ -404,7 +404,7 @@ class AutoSaveTests(unittest.TestCase):
         window.app = app or Mock()
         window.vars = {"summary": Var(False), "startup": Var(False), "herdr": Var(True), "source:claude": Var(True)}
         window.fields = {"url": Var(""), "model": Var(""), "key": Var("")}
-        window.iq_key, window.iq_selected = Var(""), []
+        window.iq_key = Var("")
         window.mimo_fields = {name: Var("") for name in ("total", "end", "used", "name")}
         window.root = Mock()
         window.root.after.return_value = "job"

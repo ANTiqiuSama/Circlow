@@ -1177,9 +1177,9 @@ class GrokIqColumnTests(unittest.TestCase):
         state = grok_iq.read(grok_iq.GrokIq(), 1000.0, self.fetch(pages))
         best = grok_iq.overall(grok_iq.parse_row(self.CSV, "claude-fable-5.1"), self.CATEGORIES)
         self.assertEqual(grok_iq.leader(self.CSV, self.CATEGORIES), ("claude-fable-5.1", best))
-        # The smartest model is the 100 % mark; the caption names both models.
-        self.assertEqual(grok_iq.column(state), ("智商", f"{100 * state.score / best:.0f}", "Grok 4.7/Fable 5.1", "%"))
-        self.assertEqual(grok_iq.column(None), ("智商", "—", "Grok 4.7", ""))
+        # The smartest model is the 100 % mark; the caption names it (the denominator) only.
+        self.assertEqual(grok_iq.column(state), ("智商", f"{100 * state.score / best:.0f}", "Fable 5.1", "%"))
+        self.assertEqual(grok_iq.column(None), ("智商", "—", "", ""))
         self.assertEqual(state.release, "20261025")
         self.assertEqual(state.error, "")
         # A cache from before the comparison is read again to learn the leader.
@@ -1201,8 +1201,8 @@ class GrokIqColumnTests(unittest.TestCase):
     def test_grok_spare_column_shows_the_score_and_leaves_tps_on_the_right(self):
         from PIL import Image, ImageChops, ImageDraw
         grok = agent_panel.PanelModel("grok", "X", "Grok", "空闲", (("每周", 75, ""),), 12, (),
-                                      column_iq=("智商", "82", "Grok 4.7/Fable 5.1", "%"))
-        self.assertEqual(grok.header[-3], ("智商", "82", "Grok 4.7/Fable 5.1", "%"))
+                                      column_iq=("智商", "82", "Fable 5.1", "%"))
+        self.assertEqual(grok.header[-3], ("智商", "82", "Fable 5.1", "%"))
         self.assertTrue(grok.header[-2])
         codex = agent_panel.PanelModel("codex", "C", "Codex", "空闲", (("5小时", 40, ""), ("每周", 80, "")), 3, ())
         gemini = agent_panel.PanelModel("gemini", "G", "Gemini", "空闲",
@@ -1233,6 +1233,10 @@ class GrokIqColumnTests(unittest.TestCase):
                                                 plain.crop((right + 2, 0, plain.width, plain.height))).getbbox())
         self.assertIsNotNone(ImageChops.difference(shown.crop((left, 0, right, shown.height)),
                                                    plain.crop((left, 0, right, plain.height))).getbbox())
+        # A long rival name is cut short within the column, never under the TPS one.
+        long = agent_panel.background(replace(grok, column_iq=("智商", "82", "Gemini 4 Neon Ultra Deep Think Preview", "%")).header, 120, 1)
+        self.assertIsNone(ImageChops.difference(long.crop((right + 2, 0, long.width, long.height)),
+                                                plain.crop((right + 2, 0, plain.width, plain.height))).getbbox())
         number, _ = agent_panel.figure("82", "%", agent_panel.TEXT, agent_panel.TEXT, 1)
         self.assertLess(number.width, span)
         caption = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textlength("Grok 4.7/Fable 5.1", font=agent_panel.ui_font(10))
