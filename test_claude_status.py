@@ -45,7 +45,7 @@ class ClaudeStatusTests(unittest.TestCase):
             (root / 'bad.json').write_text('{broken')
             result = claude_status.latest(2100, root)['rate_limits']
             self.assertEqual(result['five_hour'], {'used_percentage': 0.0, 'resets_at': None, 'idle': True})
-            self.assertEqual(result['seven_day'], {'used_percentage': 40, 'resets_at': 9000})
+            self.assertEqual(result['seven_day'], {'used_percentage': 40, 'resets_at': 9000, 'changed_at': 0.0})
             self.assertIsNone(claude_status.latest(1000 + 8 * 86400, root))
 
     def test_window_left_out_by_claude_code_is_idle_not_unknown(self):
@@ -72,7 +72,7 @@ class ClaudeStatusTests(unittest.TestCase):
                 'five_hour': {'used_percentage': 12, 'resets_at': 5000, 'observed_at': 900}}}))
             result = claude_status.latest(1300, root)
             self.assertEqual(result['updated_at'], 1200)
-            self.assertEqual(result['rate_limits']['five_hour'], {'used_percentage': 30, 'resets_at': 5000})
+            self.assertEqual(result['rate_limits']['five_hour'], {'used_percentage': 30, 'resets_at': 5000, 'changed_at': 0.0})
             self.assertEqual(result['rate_limits']['seven_day']['used_percentage'], 7)
 
     def test_rolled_over_window_reads_as_full_quota(self):
@@ -153,7 +153,7 @@ class ClaudeStatusTests(unittest.TestCase):
                 (Path(tmp) / f'{name}.json').write_text(json.dumps({'updated_at': seen, 'rate_limits': {
                     'five_hour': {'used_percentage': used, 'resets_at': at, 'observed_at': seen}}}), encoding='utf-8')
             report = claude_status.latest(now, Path(tmp))
-        self.assertEqual(report['rate_limits']['five_hour'], {'used_percentage': 26.0, 'resets_at': reset})
+        self.assertEqual(report['rate_limits']['five_hour'], {'used_percentage': 26.0, 'resets_at': reset, 'changed_at': 0.0})
         self.assertAlmostEqual(report['observed_at'], now - 30)
 
     def test_claude_is_checked_against_usage_while_in_use_and_after_a_doubtful_reading(self):
@@ -198,6 +198,93 @@ class ClaudeStatusTests(unittest.TestCase):
         self.assertTrue(value.stale)
         self.assertLess(value.updated_at, now - quota_sources.CLAUDE_NATIVE_FRESH_SECONDS)
 
+    def test_reset_card_beats_idle_sessions_holding_the_old_week(self):
+        # A reset card drops the weekly figure and keeps its reset time. Idle
+        # sessions re-report the figure of their last request (96%, change
+        # time unknown) on every redraw; sessions that ran since report 3%.
+        now = time.time()
+        week, hour = int(now + 2 * 86400), int(now + 3 * 3600)
+
+        def session(used, changed, five=None):
+            limits = {'seven_day': {'used_percentage': used, 'resets_at': week, 'observed_at': now, 'changed_at': changed}}
+            if five is not None:
+                limits['five_hour'] = {'used_percentage': five, 'resets_at': hour, 'observed_at': now, 'changed_at': changed}
+            return {'updated_at': now, 'rate_limits': limits}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rolling = Path(tmp) / 'claude-status.json'
+            sessions = {'idle-a': session(96, None), 'idle-b': session(88, None),
+                        'ran': session(3, now - 600, 4), 'runs': session(3, now - 60, 5)}
+            rolling.write_text(json.dumps({'sessions': sessions}), encoding='utf-8')
+            weekly = claude_status.latest(now, rolling=rolling)['rate_limits']['seven_day']
+            self.assertEqual((weekly['used_percentage'], weekly['changed_at']), (3, now - 60))
+            sessions['runs'] = session(4, now - 30, 6)                 # use grows again after the reset
+            sessions['late'] = session(3.5, now - 20)                   # rounding: not another reset
+            rolling.write_text(json.dumps({'sessions': sessions}), encoding='utf-8')
+            self.assertEqual(claude_status.latest(now, rolling=rolling)['rate_limits']['seven_day']['used_percentage'], 4)
+            only_old = {'idle-a': session(96, None), 'idle-b': session(88, None)}
+            rolling.write_text(json.dumps({'sessions': only_old}), encoding='utf-8')
+            self.assertEqual(claude_status.latest(now, rolling=rolling)['rate_limits']['seven_day']['used_percentage'], 96)
+            normal = {'early': session(40, now - 900), 'later': session(41, now - 60), 'idle': session(30, None)}
+            rolling.write_text(json.dumps({'sessions': normal}), encoding='utf-8')
+            self.assertEqual(claude_status.latest(now, rolling=rolling)['rate_limits']['seven_day']['used_percentage'], 41)
+
+    def test_usage_check_after_a_reset_card_wins_until_a_session_runs(self):
+        now = time.time()
+        week, hour = int(now + 2 * 86400), int(now + 3 * 3600)
+        native = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 12, 88, hour, now, False, None,
+                                             10080, 96, 4, week, changed_at=now - 120, secondary_changed_at=0.0)
+        usage = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 11, 89, hour - 60, now - 30, False, None,
+                                            10080, 2, 98, week - 60, changed_at=now - 30, secondary_changed_at=now - 30)
+        merged = quota_sources.claude_newer(usage, native)
+        self.assertEqual((merged.used_percent, merged.secondary_used_percent), (12, 2))   # each window from its newer source
+        self.assertEqual(merged.updated_at, now)
+        self.assertIs(quota_sources.claude_newer(native, native), native)
+        # A /usage check older than the status line's change does not pull it back.
+        older = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 1, 99, hour, now - 900, False, None,
+                                            10080, 70, 30, week, changed_at=now - 900, secondary_changed_at=now - 900)
+        grown = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 12, 88, hour, now, False, None,
+                                            10080, 85, 15, week, changed_at=now - 60, secondary_changed_at=now - 60)
+        self.assertIs(quota_sources.claude_newer(grown, older), grown)
+        # A small lag either way is not a reset: more used wins.
+        behind = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 10, 90, hour, now, False, None,
+                                             10080, 80, 20, week, changed_at=now, secondary_changed_at=now)
+        self.assertIs(quota_sources.claude_newer(behind, grown), grown)
+
+    def test_drop_shown_by_usage_is_taken_not_held(self):
+        now = time.time()
+        week = int(now + 2 * 86400)
+        old = quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 10, 90, None, now - 60, False, None,
+                                          10080, 96, 4, week)
+        fresh = lambda: quota_sources.QuotaSnapshot('claude', 'Claude Code', 300, 10, 90, None, now, False, None,
+                                                    10080, 20, 80, week)
+        held = quota_sources.keep_last_good(fresh(), old)
+        self.assertTrue(held.held)                                                         # nothing confirms it yet
+        self.assertTrue(quota_sources._CLAUDE_PROBE.pop('verify'))
+        quota_sources._CLAUDE_PROBE.update(snapshot=fresh(), at=time.time())                 # /usage shows it too
+        taken = quota_sources.keep_last_good(fresh(), old)
+        self.assertFalse(taken.held)
+        self.assertEqual(taken.secondary_used_percent, 20)
+
+    def test_receiver_merge_keeps_when_a_figure_last_changed(self):
+        with patch.dict(sys.modules, {'fcntl': SimpleNamespace()}):
+            sys.modules.pop('claude_status_receiver', None)
+            import claude_status_receiver as receiver
+        self.addCleanup(sys.modules.pop, 'claude_status_receiver', None)
+        week = {'used_percentage': 96, 'resets_at': 1900000000}
+        record, _ = receiver.merge(None, 's', {'rate_limits': {'seven_day': week}}, 100.0)
+        self.assertEqual(record['sessions']['s']['rate_limits']['seven_day']['changed_at'], 100.0)
+        record, _ = receiver.merge(record, 's', {'rate_limits': {'seven_day': week}}, 200.0)   # a redraw repeats it
+        saved = record['sessions']['s']['rate_limits']['seven_day']
+        self.assertEqual((saved['observed_at'], saved['changed_at']), (200.0, 100.0))
+        record, _ = receiver.merge(record, 's', {'rate_limits': {'seven_day': {**week, 'used_percentage': 2}}}, 300.0)
+        self.assertEqual(record['sessions']['s']['rate_limits']['seven_day']['changed_at'], 300.0)
+        record, _ = receiver.merge(record, 's', {'rate_limits': {}}, 400.0)                    # left out: kept as it was
+        self.assertEqual(record['sessions']['s']['rate_limits']['seven_day']['changed_at'], 300.0)
+        before = {'sessions': {'s': {'updated_at': 50.0, 'rate_limits': {'seven_day': {**week, 'observed_at': 50.0}}}}}
+        record, _ = receiver.merge(before, 's', {'rate_limits': {'seven_day': week}}, 500.0)    # held from an older receiver
+        self.assertIsNone(record['sessions']['s']['rate_limits']['seven_day']['changed_at'])
+
     def test_held_readings_age_by_observation_not_by_rewrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             now = time.time()
@@ -241,6 +328,13 @@ class ClaudeStatusTests(unittest.TestCase):
             self.assertEqual(saved['rate_limits']['five_hour']['used_percentage'], 15)
             self.assertLess(saved['rate_limits']['five_hour']['observed_at'], saved['rate_limits']['seven_day']['observed_at'] + 0.001)
             self.assertEqual(saved['rate_limits']['seven_day']['used_percentage'], 4)
+            changed = saved['rate_limits']['seven_day']['changed_at']
+            self.assertIsNotNone(changed)
+            result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File', str(receiver)],
+                                    input=json.dumps(payload), capture_output=True, text=True, timeout=10)
+            saved = json.loads(rolling.read_text(encoding='utf-8-sig'))['sessions']['test-session']['rate_limits']
+            self.assertEqual(saved['seven_day']['changed_at'], changed)                        # a repeat keeps it
+            self.assertGreater(saved['seven_day']['observed_at'], changed)
             # The tray reads the rolling file: the furthest reading per window across sessions.
             report = claude_status.latest(time.time(), rolling=rolling)
             self.assertEqual(report['rate_limits']['five_hour']['used_percentage'], 30)
@@ -277,6 +371,11 @@ class ClaudeStatusTests(unittest.TestCase):
             saved = sessions['test-session']['rate_limits']
             self.assertEqual(saved['five_hour']['used_percentage'], 15)
             self.assertLessEqual(saved['five_hour']['observed_at'], saved['seven_day']['observed_at'])
+            changed = saved['seven_day']['changed_at']
+            self.assertIsNotNone(changed)
+            run(payload)                                                                         # a redraw repeats it
+            again = json.loads(rolling.read_text(encoding='utf-8'))['sessions']['test-session']['rate_limits']
+            self.assertEqual(again['seven_day']['changed_at'], changed)
             report = claude_status.latest(time.time(), rolling=rolling)
             self.assertEqual(report['rate_limits']['five_hour']['used_percentage'], 30)
             self.assertEqual(report['rate_limits']['seven_day']['used_percentage'], 4)

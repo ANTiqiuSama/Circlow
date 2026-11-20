@@ -1,4 +1,5 @@
 """Platform-neutral tests: forecast, refresh scheduling, detail card, quota parsing."""
+import json
 import math
 import tempfile
 import time
@@ -138,6 +139,20 @@ class ForecastTests(unittest.TestCase):
             self.assertEqual([row.used for row in fresh.samples("claude")], [80])
             self.assertEqual([row.used for row in fresh.samples("claude:secondary")], [83])
             self.assertTrue(fresh.add("claude", 1120, 4, reset))  # a real >=95% recovery is retained
+
+    def test_reset_card_history_drops_returns_to_the_old_level(self):
+        with tempfile.TemporaryDirectory() as folder:
+            week = 500_000
+            rows = [[1000, 95, week], [1100, 96, week], [1200, 0, week], [1300, 97, week], [1400, 1, week],
+                    [1500, 95, week], [1600, 2, week], [1700, 3, week], [1800, 96, week], [1900, 4, week]]
+            path = Path(folder) / "history.json"
+            path.write_text(json.dumps({"series": {"claude:secondary": rows}}), encoding="utf-8")
+            history = QuotaHistory(path)
+            self.assertEqual([row.used for row in history.samples("claude:secondary")], [95, 96, 0, 1, 2, 3, 4])
+            self.assertFalse(history.add("claude:secondary", 2000, 96, week))         # an idle session's old week
+            self.assertTrue(history.add("claude:secondary", 2100, 5, week))
+            self.assertTrue(history.add("claude", 2000, 40, 5000))                    # no early reset: a jump stays
+            self.assertTrue(history.add("claude", 2100, 55, 5000))
 
     def test_confirmed_full_recovery_is_drawn_as_a_step(self):
         reset = 2_000_000

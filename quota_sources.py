@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -47,6 +47,11 @@ class QuotaSnapshot:
     credits_balance: float | None = None     # Codex purchased credits left; None when not reported
     reset_credits: int | None = None         # Codex free full resets (5 h + weekly) available
     held: bool = False                       # a doubtful reading set aside (not a failed read)
+    # Claude: when each window's figure was last known to be new (a /usage
+    # check: its read time; the status line: when the figure last changed,
+    # 0 when unknown). None for other sources.
+    changed_at: float | None = None
+    secondary_changed_at: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -63,7 +68,8 @@ class QuotaSnapshot:
 
 
 LABELS = {spec.key: (spec.label, spec.window_minutes) for spec in providers.SPECS}
-SECONDARY_FIELDS = ("secondary_window_minutes", "secondary_used_percent", "secondary_remaining_percent", "secondary_resets_at")
+SECONDARY_FIELDS = ("secondary_window_minutes", "secondary_used_percent", "secondary_remaining_percent", "secondary_resets_at",
+                    "secondary_changed_at")
 
 
 def placeholder(provider: str, error: str = "正在读取…") -> QuotaSnapshot:
@@ -324,7 +330,8 @@ def _claude_native(report: dict) -> QuotaSnapshot:
     return QuotaSnapshot("claude", "Claude Code", 300, used, None if used is None else 100.0 - used,
                          primary.get("resets_at"), seen, time.time() - seen > CLAUDE_NATIVE_FRESH_SECONDS, None,
                          10080 if secondary else None, second, None if second is None else 100.0 - second,
-                         secondary.get("resets_at"))
+                         secondary.get("resets_at"), changed_at=float(primary.get("changed_at") or 0.0),
+                         secondary_changed_at=float(secondary.get("changed_at") or 0.0))
 
 
 def _claude_probe() -> QuotaSnapshot:
@@ -333,10 +340,12 @@ def _claude_probe() -> QuotaSnapshot:
         return _unknown("claude", "Claude", 300, "未找到 Claude Code（claude.exe / claude.cmd），可设置 CIRCLOW_CLAUDE_EXE")
     try:
         parsed = cli_quota.read_usage(str(executable))
+        now = time.time()
         return QuotaSnapshot("claude", "Claude Code", parsed["window_minutes"], parsed["used_percent"], parsed["remaining_percent"],
-                             parsed["resets_at"], time.time(), False, None,
+                             parsed["resets_at"], now, False, None,
                              parsed.get("secondary_window_minutes"), parsed.get("secondary_used_percent"),
-                             parsed.get("secondary_remaining_percent"), parsed.get("secondary_resets_at"))
+                             parsed.get("secondary_remaining_percent"), parsed.get("secondary_resets_at"),
+                             changed_at=now, secondary_changed_at=now)
     except Exception as exc:
         return _unknown("claude", "Claude", 300, f"读取 /usage 失败：{type(exc).__name__}: {exc}")
 
@@ -350,27 +359,46 @@ def _claude_probe_cached(gap: float = CLAUDE_PROBE_GAP_SECONDS) -> QuotaSnapshot
         return cached
 
 
+# A limit reset early (a reset card) drops a window's figure and keeps its
+# reset time. A reading this much lower, and newer than the other, is that.
+CLAUDE_CARD_DROP = 10.0
+
+
 def _further(window_a: tuple, window_b: tuple) -> int:
-    """1 when (used, reset) a is further along than b, -1 when b is, else 0:
-    a later reset is a newer window; in one window, more used is newer."""
-    (used_a, reset_a), (used_b, reset_b) = window_a, window_b
+    """1 when (used, reset, changed) a is further along than b, -1 when b
+    is, else 0: a later reset is a newer window; in one window, more used is
+    newer, except that a figure CLAUDE_CARD_DROP or more lower that is newer
+    (changed later) is an early reset of the limit."""
+    (used_a, reset_a, changed_a), (used_b, reset_b, changed_b) = window_a, window_b
     if used_a is None or used_b is None:
         return (used_a is not None) - (used_b is not None)
     if reset_a and reset_b and abs(reset_a - reset_b) > 180:
         return 1 if reset_a > reset_b else -1
+    if changed_a is not None and changed_b is not None and abs(used_a - used_b) >= CLAUDE_CARD_DROP:
+        lower, higher = (changed_a, changed_b) if used_a < used_b else (changed_b, changed_a)
+        if lower > higher:
+            return 1 if used_a < used_b else -1
     return (used_a > used_b) - (used_a < used_b)
 
 
-def claude_newer(probed: QuotaSnapshot, native: QuotaSnapshot) -> QuotaSnapshot:
-    """The reading further along: `/usage` and the status line can each trail
-    the other, but the account's use never goes back within a window."""
-    for pick in ((probed.used_percent, probed.resets_at), (native.used_percent, native.resets_at)), \
-                ((probed.secondary_used_percent, probed.secondary_resets_at),
-                 (native.secondary_used_percent, native.secondary_resets_at)):
-        order = _further(*pick)
-        if order:
-            return probed if order > 0 else native
-    return probed
+def claude_newer(first: QuotaSnapshot, second: QuotaSnapshot) -> QuotaSnapshot:
+    """The reading further along, window by window: `/usage` and the status
+    line can each trail the other, and the account's use never goes back
+    within a window unless the limit was reset early (see _further). A
+    window that ties follows the other; `first` wins a full tie. When each
+    reading is ahead in one window, a copy of the one ahead in the 5-hour
+    window carries the other's weekly window."""
+    primary = _further((first.used_percent, first.resets_at, first.changed_at),
+                       (second.used_percent, second.resets_at, second.changed_at))
+    secondary = _further((first.secondary_used_percent, first.secondary_resets_at, first.secondary_changed_at),
+                         (second.secondary_used_percent, second.secondary_resets_at, second.secondary_changed_at))
+    if primary >= 0 and secondary >= 0:
+        return first
+    if primary <= 0 and secondary <= 0:
+        return second
+    base, weekly = (first, second) if primary > 0 else (second, first)
+    return replace(base, updated_at=max(base.updated_at or 0, weekly.updated_at or 0) or None,
+                   **{name: getattr(weekly, name) for name in SECONDARY_FIELDS})
 
 
 def get_claude_quota() -> QuotaSnapshot:
@@ -462,19 +490,32 @@ def _reader(provider: str):
             "mimo": get_mimo_quota}[provider]
 
 
+def _usage_shows_drop(before: float, reset: int, weekly: bool) -> bool:
+    """Whether a /usage check of the last CLAUDE_ACTIVE_VERIFY_SECONDS shows
+    the window `reset` 5 points or more below `before` too: the account
+    itself went down (the limit was reset early), not another session."""
+    probe = _CLAUDE_PROBE.get("snapshot")
+    if probe is None or probe.error or time.time() - _CLAUDE_PROBE.get("at", 0.0) > CLAUDE_ACTIVE_VERIFY_SECONDS:
+        return False
+    used, probe_reset = (probe.secondary_used_percent, probe.secondary_resets_at) if weekly else         (probe.used_percent, probe.resets_at)
+    return used is not None and probe_reset is not None and abs(probe_reset - reset) <= 180 and before - used >= 5
+
+
 def keep_last_good(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaSnapshot:
     """Keep stale figures on failure, except Gemini whose CLI account may have changed."""
     if snapshot.provider == "claude" and old and not snapshot.error:
         # Claude statusLine observations can come from another session whose
         # held account figures suddenly look much less used. In the same
-        # reset window, accept a real recovery to >=95% remaining; a jump
-        # only to 70% is an anomalous reading, not a confirmed reset.
-        windows = ((old.used_percent, snapshot.used_percent, old.resets_at, snapshot.resets_at),
+        # reset window, accept a real recovery to >=95% remaining, or a drop
+        # that a recent /usage check shows too (the limit reset early); a
+        # jump only to 70% is otherwise an anomalous reading.
+        windows = ((old.used_percent, snapshot.used_percent, old.resets_at, snapshot.resets_at, False),
                    (old.secondary_used_percent, snapshot.secondary_used_percent,
-                    old.secondary_resets_at, snapshot.secondary_resets_at))
+                    old.secondary_resets_at, snapshot.secondary_resets_at, True))
         if any(before is not None and after is not None and old_reset is not None and new_reset is not None
                and abs(old_reset - new_reset) <= 180 and before - after >= 5 and after > 5
-               for before, after, old_reset, new_reset in windows):
+               and not _usage_shows_drop(before, new_reset, weekly)
+               for before, after, old_reset, new_reset, weekly in windows):
             # Set aside, not a failed read: the scheduler keeps reading, and
             # the next read asks /usage at once instead of the status line.
             snapshot.error, snapshot.held = CLAUDE_HELD, True
@@ -489,6 +530,7 @@ def keep_last_good(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaS
         snapshot.resets_at = old.resets_at
         snapshot.window_minutes = old.window_minutes or snapshot.window_minutes
         snapshot.updated_at = old.updated_at
+        snapshot.changed_at = old.changed_at
         for name in SECONDARY_FIELDS:
             setattr(snapshot, name, getattr(old, name))
         snapshot.stale = True

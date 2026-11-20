@@ -39,17 +39,26 @@ def merge(existing, session, payload, now):
     for name in WINDOWS:
         window = reported.get(name) if isinstance(reported.get(name), dict) else {}
         used = number(window.get("used_percentage"))
+        old = ((previous or {}).get("rate_limits") or {}).get(name)
+        old = old if isinstance(old, dict) and number(old.get("used_percentage")) is not None else None
         if used is not None and 0 <= used <= 100:
-            limits[name] = {"used_percentage": used, "resets_at": window.get("resets_at"), "observed_at": now}
+            # When this session's figure last changed: an idle session
+            # re-reports its last request's limits on every redraw, so a
+            # repeat keeps the time (None: unknown, held from before).
+            changed = now
+            if old is not None and number(old["used_percentage"]) == used and old.get("resets_at") == window.get("resets_at"):
+                changed = number(old.get("changed_at"))
+            limits[name] = {"used_percentage": used, "resets_at": window.get("resets_at"), "observed_at": now,
+                            "changed_at": changed}
             live[name] = used
             continue
         # Claude Code omits a window once its reading passes the reset; keep
         # the last reading so the tray sees the rollover instead of a gap.
-        old = ((previous or {}).get("rate_limits") or {}).get(name)
-        if isinstance(old, dict) and number(old.get("used_percentage")) is not None:
+        if old is not None:
             seen = number(old.get("observed_at"))
             limits[name] = {"used_percentage": old["used_percentage"], "resets_at": old.get("resets_at"),
-                            "observed_at": seen if seen is not None else previous["updated_at"]}
+                            "observed_at": seen if seen is not None else previous["updated_at"],
+                            "changed_at": number(old.get("changed_at"))}
     sessions[session] = {"updated_at": now, "rate_limits": limits}
     if len(sessions) > KEEP_SESSIONS:
         newest = sorted(sessions, key=lambda key: sessions[key]["updated_at"], reverse=True)[:KEEP_SESSIONS]

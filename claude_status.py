@@ -123,8 +123,9 @@ _rolling: dict[str, tuple[int, int, list]] = {}   # path -> (mtime_ns, size, [(u
 
 
 def _readings(row: dict) -> tuple | None:
-    """(updated_at, [(window, seen, used, reset)]) of one session's record, or
-    None when it holds no usable reading."""
+    """(updated_at, [(window, seen, used, reset, changed)]) of one session's
+    record, or None when it holds no usable reading. `changed` is when the
+    session's figure last changed, None when unknown (an older receiver)."""
     at = float(row["updated_at"])
     limits = row.get("rate_limits")
     if not math.isfinite(at) or not isinstance(limits, dict):
@@ -138,8 +139,12 @@ def _readings(row: dict) -> tuple | None:
         seen = float(value.get("observed_at", at))
         reset = value.get("resets_at")
         reset = int(reset) if reset is not None else None
+        changed = value.get("changed_at")
+        changed = float(changed) if isinstance(changed, (int, float)) and not isinstance(changed, bool) else None
+        if changed is not None and not (math.isfinite(changed) and changed <= at + 1):
+            changed = None
         if math.isfinite(used) and 0 <= used <= 100 and math.isfinite(seen) and seen <= at + 1:
-            readings.append((name, seen, used, reset))
+            readings.append((name, seen, used, reset, changed))
     return (at, readings) if readings else None
 
 
@@ -277,23 +282,25 @@ def latest(now: float | None = None, folder: Path | None = None, rolling: Path |
             for path in [path for path in _parsed if not os.path.exists(path)]:
                 _parsed.pop(path, None)
         records += [record for record in (_parse(entry) for entry in entries) if record is not None]
-    reports, observed = [], {}          # window -> [(seen, used, reset)] from every session
+    reports, observed = [], {}          # window -> [(seen, used, reset, changed)] from every session
     for at, readings in records:
         if not now - MAX_AGE_SECONDS <= at <= now + 30:
             continue
-        for name, seen, used, reset in readings:
-            observed.setdefault(name, []).append((seen, used, reset))
+        for name, seen, used, reset, changed in readings:
+            observed.setdefault(name, []).append((seen, used, reset, changed))
         reports.append(at)
     if not reports:
         return None
     observed = {name: _furthest(rows) for name, rows in observed.items()}
     windows = {}
     for name in WINDOWS:
-        _, used, reset = observed.get(name, (None, None, None))
+        _, used, reset, changed = observed.get(name, (None, None, None, None))
         if used is None or (reset is not None and reset <= now):
             windows[name] = {"used_percentage": 0.0, "resets_at": None, "idle": True}
         else:
-            windows[name] = {"used_percentage": used, "resets_at": reset}
+            # changed_at: when that figure was last reported as new (0: before
+            # the receiver recorded it), to weigh it against a /usage check.
+            windows[name] = {"used_percentage": used, "resets_at": reset, "changed_at": changed or 0.0}
     # Sessions re-save held readings with a new updated_at; observed_at is
     # when Claude Code last actually reported a number.
     seen = max((value[0] for value in observed.values()), default=max(reports))
@@ -301,23 +308,39 @@ def latest(now: float | None = None, folder: Path | None = None, rolling: Path |
 
 
 RESET_JITTER = 180
+# A limit reset early (a reset card) drops the figure without moving the
+# window's reset time. A session's figure that changed after the others and
+# is this much lower is such a reset, not an older reading.
+CARD_DROP = 10.0
 
 
-def _furthest(rows: list[tuple[float, float, int | None]]) -> tuple[float, float, int | None]:
-    """The account's figure for one window out of every session's reading.
+def _furthest(rows: list[tuple]) -> tuple[float, float, int | None, float | None]:
+    """The account's figure for one window out of every session's
+    (seen, used, reset, changed) reading: (seen, used, reset, changed).
 
     A session re-reports the limits from its own last request each time its
     status line redraws, with a fresh timestamp, so the newest timestamp is
     often an idle session's old figure. Usage only grows inside a reset
-    window: the newest window wins, and in it the highest figure."""
-    resets = [reset for _, _, reset in rows if reset is not None]
+    window: the newest window wins, and in it the highest figure; unless a
+    figure that changed later is CARD_DROP or more lower, which ends every
+    reading before it (the limit was reset early). Figures of unknown change
+    time are older than any known one."""
+    resets = [row[2] for row in rows if row[2] is not None]
     if resets:
         newest = max(resets)
         rows = [row for row in rows if row[2] is not None and abs(row[2] - newest) <= RESET_JITTER]
-    used = max(row[1] for row in rows)
-    seen = max(row[0] for row in rows if row[1] == used)
-    reset = max((row[2] for row in rows if row[1] == used and row[2] is not None), default=None)
-    return seen, used, reset
+    order = sorted(rows, key=lambda row: (row[3] is not None, row[3] or 0.0))
+    start, used = 0, None
+    for index, row in enumerate(order):
+        if used is not None and row[3] is not None and row[1] <= used - CARD_DROP:
+            start, used = index, row[1]
+        elif used is None or row[1] > used:
+            used = row[1]
+    live = [row for row in order[start:] if row[1] == used]
+    seen = max(row[0] for row in live)
+    reset = max((row[2] for row in live if row[2] is not None), default=None)
+    changed = max((row[3] for row in live if row[3] is not None), default=None)
+    return seen, used, reset, changed
 
 
 def desktop_roots() -> list[Path]:
