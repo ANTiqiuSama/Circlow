@@ -130,38 +130,57 @@ def short_name(name: str) -> str:
     return " ".join(pretty) or name
 
 
+_MAKERS = (("gpt", "openai"), ("o1", "openai"), ("o3", "openai"), ("o4", "openai"), ("claude", "anthropic"),
+           ("opus", "anthropic"), ("sonnet", "anthropic"), ("haiku", "anthropic"), ("fable", "anthropic"),
+           ("gemini", "google"), ("grok", "xai"), ("kimi", "kimi"), ("deepseek", "deepseek"), ("qwen", "qwen"),
+           ("glm", "glm"), ("mimo", "xiaomi"), ("mistral", "mistral"), ("llama", "meta"))
+
+
+def maker(score: ModelScore) -> str:
+    """Who makes the model, for "one model per maker": the board's provider
+    (aliases folded: moonshot is Kimi), else the name's family; a model of
+    unknown family counts as a maker of its own."""
+    label = provider_label(score.provider)
+    if label:
+        return label.lower()
+    name = _key(score.name)
+    return next((who for prefix, who in _MAKERS if name.startswith(prefix)), name)
+
+
+def best_per_maker(scores: list[ModelScore], skip: set[str] | None = None) -> list[ModelScore]:
+    """Each maker's highest coding score, best first; makers in `skip` left out.
+    Ties keep the board's order."""
+    taken = set(skip or ())
+    result = []
+    for score in sorted((s for s in scores if s.score is not None), key=lambda s: -s.score):
+        who = maker(score)
+        if who not in taken:
+            result.append(score)
+            taken.add(who)
+    return result
+
+
 def default_selection(scores: list[ModelScore]) -> list[str]:
-    """The HOVER_MAX highest-scoring models, best first."""
-    ranked = sorted((s for s in scores if s.score is not None), key=lambda s: -s.score)
-    return [s.name for s in ranked[:HOVER_MAX]]
+    """What the panel line shows while nothing runs: the HOVER_MAX best
+    makers' best models."""
+    return [s.name for s in best_per_maker(scores)[:HOVER_MAX]]
 
 
-def hover_models(state: IqState | None, selection: list[str] | None, running: list[str] | None = None) -> list[tuple[ModelScore, bool]]:
-    """(model, running) shown on the panel line: the models the source is
-    running right now (the TPS figure's model) first, then the chosen ones
-    (default: the highest coding scores), HOVER_MAX in all."""
+def hover_models(state: IqState | None, running: list[str] | None = None) -> list[tuple[ModelScore, bool]]:
+    """(model, running) shown on the panel line, HOVER_MAX in all: on the
+    left the model the source is running right now (the TPS figure's), then
+    the smartest models by coding score, one per maker and none of the
+    running model's maker (never Astra next to Sol, or Opus next to Fable)."""
     if state is None:
         return []
     scores = state.scores()
-    names = selection if selection else default_selection(scores)
-    by_name = {s.name: s for s in scores}
-    result, seen = [], set()
+    result, makers = [], set()
     for local in running or ():
         found = match(local, scores)
-        if found and found.name not in seen:
+        if found and maker(found) not in makers:
             result.append((found, True))
-            seen.add(found.name)
-    for name in names:
-        if name in by_name and name not in seen:
-            result.append((by_name[name], False))
-            seen.add(name)
-    if not selection:                  # top up with the next best when a running model took a slot
-        for score in scores:
-            if len(result) >= HOVER_MAX:
-                break
-            if score.name not in seen and score.score is not None:
-                result.append((score, False))
-                seen.add(score.name)
+            makers.add(maker(found))
+    result += [(score, False) for score in best_per_maker(scores, makers)]
     return result[:HOVER_MAX]
 
 

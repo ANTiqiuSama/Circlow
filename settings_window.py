@@ -494,7 +494,6 @@ class SettingsWindow:
         self.vars = {}
         self.origins = {}
         self.notice = ("", 0.0)
-        self.iq_selected: list[str] = []
         self.cards = []               # (SourceCard, icon) from the last live read
         self.card_art = {}            # provider -> (signature, normal, hovered)
         self.card_lit = {}            # provider -> 0..1 hover glow
@@ -1780,13 +1779,13 @@ class SettingsWindow:
         import grok_iq
         import model_iq
         tk, S = self.tk, self.S
-        self.heading(page, "模型智商", "面板横条显示所选模型的编程分，Grok 栏显示它相对最强模型的总分。")
+        self.heading(page, "模型智商", "面板横条左边是正在使用的模型，右边是其他厂商编程分最高的模型（每家一个）；"
+                                       "Grok 栏显示它相对最强模型的总分。")
         self.section(page, "面板横条", "AI Stupid Level · 近 24 小时编程分（0–100）")
         box = self.card(page)
         self.iq_key = tk.StringVar()
         self.iq_key.trace_add("write", lambda *_: self.update_footer())
         self.iq_built = None
-        self.iq_checks = {}
         self.form(box, ((self.iq_key, "API Key", "asl_live_…，仅保存在本机", True),))
         line = tk.Frame(box, bg=view.SURFACE)
         line.pack(fill="x", pady=(S(10), 0))
@@ -1819,8 +1818,7 @@ class SettingsWindow:
                         "每 3 小时检查一次，只有出现新榜单时才重新下载。", 9, view.INK_3).pack(anchor="w", fill="x", pady=(S(10), 0))
         self.link(grok, "数据来源：livebench.ai", lambda: os.startfile(grok_iq.SITE)).pack(anchor="w", pady=(S(6), 0))  # type: ignore[attr-defined]
 
-        pick = self.section(page, "横条显示的模型")
-        self.button(pick, "恢复默认", self.iq_default).pack(side="right")
+        pick = self.section(page, "全部模型的编程分")
         self.iq_pick = self.label(pick, "", 9, view.INK_3)
         self.iq_pick.pack(side="left", padx=S(10))
         table = self.panel(page, padx=14, pady=10)
@@ -1833,7 +1831,7 @@ class SettingsWindow:
         if not hasattr(self.app, "refresh_model_iq"):
             return
         try:
-            self.app.save_model_iq(self.iq_key.get(), list(self.iq_selected) or None)
+            self.app.save_model_iq(self.iq_key.get(), None)
         except (OSError, ValueError) as error:
             self.messagebox.showerror("未能保存", str(error), parent=self.root)
             return
@@ -1860,27 +1858,6 @@ class SettingsWindow:
             self.commands.put(("grok", text))
         threading.Thread(target=worker, name="grok-iq-manual", daemon=True).start()
 
-    def iq_default(self):
-        self.iq_selected = []
-        for var in self.iq_checks.values():
-            var.set(False)
-        self._fill_iq(rebuild=False)
-        self.update_footer()
-
-    def iq_toggle(self, name):
-        import model_iq
-        var = self.iq_checks[name]
-        if var.get():
-            if len(self.iq_selected) >= model_iq.HOVER_MAX:
-                var.set(False)
-                self.iq_message.set(f"横条最多显示 {model_iq.HOVER_MAX} 个模型")
-                return
-            self.iq_selected.append(name)
-        elif name in self.iq_selected:
-            self.iq_selected.remove(name)
-        self._fill_iq(rebuild=False)
-        self.update_footer()
-
     def _fill_iq(self, rebuild=True):
         import grok_iq
         import model_iq
@@ -1895,6 +1872,7 @@ class SettingsWindow:
                         (f"（{state.synced_from} 同步）" if getattr(state, "synced_from", "") else ""))
         if state is not None and state.error:
             info.append(state.error)
+        caption = f"{grok_iq.CAPTION} / {caption}" if caption else grok_iq.CAPTION     # room here for both models
         for widget, text in ((self.grok_figure, figure + unit), (self.grok_caption, caption),
                              (self.grok_info, " · ".join(info) or "尚未读取")):
             if widget.cget("text") != text:
@@ -1909,35 +1887,28 @@ class SettingsWindow:
         if status["error"]:
             parts.append("⚠ " + status["error"])
         self.set_text(self.iq_info, " · ".join(parts))
-        shown = self.iq_selected or status["default"]
-        pick = ("、".join(model_iq.short_name(n) for n in shown) or "—") + \
-            ("（默认：编程分最高的 3 个，正在运行的模型始终在最前）" if not self.iq_selected else "") + f"；最多 {model_iq.HOVER_MAX} 个"
+        pick = "空闲时横条：" + ("、".join(model_iq.short_name(n) for n in status["default"]) or "—")
         if self.iq_pick.cget("text") != pick:
             self.iq_pick.configure(text=pick)
         if rebuild and self.iq_built != status["fetched_at"]:
             self.iq_built = status["fetched_at"]
             for child in self.iq_table.winfo_children():
                 child.destroy()
-            self.iq_checks = {}
             models = status["models"]
             if not models:
                 self.label(self.iq_table, "填写 API Key 后点“立即读取”，这里会列出所有模型的分数；"
                            "开启同步时，也会显示其他设备读到的分数。", 10, view.INK_3).grid(row=0, column=0, sticky="w")
                 return
-            for column, title in enumerate(("显示", "#", "模型", "厂商", "编程分")):
+            for column, title in enumerate(("#", "模型", "厂商", "编程分")):
                 self.label(self.iq_table, title, 9, view.INK_3).grid(row=0, column=column, sticky="w", padx=(0, S(14)), pady=(0, S(4)))
-            self.iq_table.columnconfigure(2, weight=1)
+            self.iq_table.columnconfigure(1, weight=1)
             for index, score in enumerate(models, 1):
-                var = self.iq_checks[score.name] = tk.BooleanVar(value=score.name in self.iq_selected)
-                tk.Checkbutton(self.iq_table, variable=var, command=lambda name=score.name: self.iq_toggle(name), bg=view.SURFACE,
-                               activebackground=view.SURFACE, selectcolor=view.FIELD, fg=view.INK, bd=0,
-                               highlightthickness=0).grid(row=index, column=0, sticky="w")
                 cells = (str(index), f"{score.short}  ({score.name})" if score.short != score.name else score.name,
                          model_iq.provider_label(score.provider), model_iq.score_text(score))
-                for column, value in enumerate(cells, 1):
-                    color = view.INK if column in (2, 4) else view.INK_2
-                    self.label(self.iq_table, value, 10 if column in (2, 4) else 9, color,
-                               weight="bold" if column == 4 else "normal").grid(row=index, column=column, sticky="w", padx=(0, S(14)))
+                for column, value in enumerate(cells):
+                    color = view.INK if column in (1, 3) else view.INK_2
+                    self.label(self.iq_table, value, 10 if column in (1, 3) else 9, color,
+                               weight="bold" if column == 3 else "normal").grid(row=index, column=column, sticky="w", padx=(0, S(14)))
 
     # ----- 任务 ---------------------------------------------------------------------------
     def _tasks(self, page):
@@ -2076,7 +2047,6 @@ class SettingsWindow:
         values = {name: bool(var.get()) for name, var in self.vars.items()}
         values.update({"field:" + name: var.get().strip() for name, var in self.fields.items()})
         values["iq:key"] = self.iq_key.get().strip()
-        values["iq:shown"] = tuple(self.iq_selected)
         values.update({"mimo:" + name: var.get().strip() for name, var in getattr(self, "mimo_fields", {}).items()})
         return values
 
@@ -2085,8 +2055,7 @@ class SettingsWindow:
         return [name for name, value in self.staged().items() if self.origins.get(name, value) != value]
 
     def pending(self) -> list[str]:
-        labels = {"herdr": "herdr 适配", "startup": "开机自启", "summary": "任务命名", "iq:key": "智商 API Key",
-                  "iq:shown": "横条显示的模型"}
+        labels = {"herdr": "herdr 适配", "startup": "开机自启", "summary": "任务命名", "iq:key": "智商 API Key"}
         changed, seen = [], set()
         for name in self.changed_keys():
             if name.startswith("source:"):
@@ -2208,7 +2177,6 @@ class SettingsWindow:
         if hasattr(self.app, "model_iq_status"):
             info = self.app.model_iq_status()
             self.iq_key.set(info["key"])
-            self.iq_selected = list(info["shown"] or [])
             self.iq_built = None
         job = getattr(self, "save_job", None)
         if job is not None:
@@ -2253,8 +2221,7 @@ class SettingsWindow:
                                                       self.vars["summary"].get()))
         group("startup", "开机自启", ["startup"], self.app.toggle_startup)
         if hasattr(self.app, "save_model_iq"):
-            group("iq", "智商设置", ["iq:key", "iq:shown"],
-                  lambda: self.app.save_model_iq(self.iq_key.get(), list(self.iq_selected) or None))
+            group("iq", "智商设置", ["iq:key"], lambda: self.app.save_model_iq(self.iq_key.get(), None))
         if hasattr(self.app, "save_preferences"):
             group("herdr", "herdr 适配", ["herdr"], lambda: self.app.save_preferences({"herdr": bool(self.vars["herdr"].get())}))
         group("mimo", "手动套餐", ["mimo:" + name for name in getattr(self, "mimo_fields", {})], self._save_mimo_manual)

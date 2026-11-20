@@ -50,28 +50,40 @@ class ModelIqTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             model_iq.parse({"error": "api_key_required"})
 
-    def test_default_is_the_three_best_models_and_choice_keeps_order(self):
+    def test_idle_line_is_each_makers_best_model(self):
         state = model_iq.IqState(models=[m.__dict__ for m in model_iq.parse(PAYLOAD)], fetched_at=DAY)
-        self.assertEqual([m.name for m, _ in model_iq.hover_models(state, None)],      # default: the top three
+        self.assertEqual([m.name for m, _ in model_iq.hover_models(state)],              # nothing running
                          ["gpt-5.6-sol", "claude-opus-4-7-20260101", "gemini-3-pro-preview"])
-        chosen = ["gemini-3-pro-preview", "gpt-5.6-mini", "missing-model", "claude-sonnet-4-5"]
-        self.assertEqual([m.name for m, _ in model_iq.hover_models(state, chosen)],
-                         ["gemini-3-pro-preview", "gpt-5.6-mini", "claude-sonnet-4-5"])
-        self.assertEqual(model_iq.hover_models(None, None), [])
+        self.assertEqual(model_iq.default_selection(state.scores()),
+                         ["gpt-5.6-sol", "claude-opus-4-7-20260101", "gemini-3-pro-preview"])
+        self.assertEqual(model_iq.hover_models(None), [])
 
-    def test_running_model_leads_and_the_rest_are_the_best(self):
+    def test_running_model_leads_and_the_rest_are_other_makers_best(self):
         state = model_iq.IqState(models=[m.__dict__ for m in model_iq.parse(PAYLOAD)], fetched_at=DAY)
-        shown = model_iq.hover_models(state, None, ["claude-sonnet-4.5-20260301"])
-        self.assertEqual([(m.name, live) for m, live in shown],
-                         [("claude-sonnet-4-5", True), ("gpt-5.6-sol", False), ("claude-opus-4-7-20260101", False)])
-        already = model_iq.hover_models(state, None, ["gpt-5.6-sol"])    # a top model running: not listed twice
+        shown = model_iq.hover_models(state, ["claude-sonnet-4.5-20260301"])
+        self.assertEqual([(m.name, live) for m, live in shown],                         # Opus is Anthropic too: left out
+                         [("claude-sonnet-4-5", True), ("gpt-5.6-sol", False), ("gemini-3-pro-preview", False)])
+        already = model_iq.hover_models(state, ["gpt-5.6-sol"])    # a top model running: not listed twice
         self.assertEqual([(m.name, live) for m, live in already],
                          [("gpt-5.6-sol", True), ("claude-opus-4-7-20260101", False), ("gemini-3-pro-preview", False)])
-        chosen = model_iq.hover_models(state, ["gpt-5.6-mini"], ["unknown-local-model"])
-        self.assertEqual([(m.name, live) for m, live in chosen], [("gpt-5.6-mini", False)])
+        unknown = model_iq.hover_models(state, ["unknown-local-model"])                 # not on the board
+        self.assertEqual([(m.name, live) for m, live in unknown],
+                         [("gpt-5.6-sol", False), ("claude-opus-4-7-20260101", False), ("gemini-3-pro-preview", False)])
         self.assertEqual(model_iq.match("Claude Opus 4-7", state.scores()).name, "claude-opus-4-7-20260101")
         self.assertEqual(model_iq.match("gpt-5.6-sol-high", state.scores()).name, "gpt-5.6-sol")
         self.assertIsNone(model_iq.match("gpt-5", state.scores()))
+
+    def test_one_model_per_maker_even_when_one_maker_tops_the_board(self):
+        rows = [("claude-opus-5-5", "anthropic", 96), ("gpt-6.2-astra", "openai", 96), ("claude-fable-5-2", "anthropic", 96),
+                ("claude-sonnet-5-5", "anthropic", 95), ("gemini-4-argon", "google", 95), ("gpt-6.2-sol", "openai", 94),
+                ("kimi-k3.1-pro", "moonshot", 93), ("kimi-k3", "kimi", 92), ("grok-5", "", 91)]
+        state = model_iq.IqState(models=[model_iq.ModelScore(n, n, p, s).__dict__ for n, p, s in rows], fetched_at=DAY)
+        pick = lambda running: [m.short for m, _ in model_iq.hover_models(state, running)]
+        self.assertEqual(pick(["gpt-6.2-sol"]), ["GPT-6.2 Sol", "Opus 5.5", "Gemini 4 Argon"])          # no Astra beside Sol
+        self.assertEqual(pick(["claude-fable-5-2"]), ["Fable 5.2", "GPT-6.2 Astra", "Gemini 4 Argon"])  # no Opus beside Fable
+        self.assertEqual(pick([]), ["Opus 5.5", "GPT-6.2 Astra", "Gemini 4 Argon"])
+        makers = [model_iq.maker(s) for s in model_iq.best_per_maker(state.scores())]
+        self.assertEqual(makers, ["anthropic", "openai", "google", "kimi", "xai"])         # moonshot is Kimi; grok by name
 
     def test_daily_budget_is_kept_across_restarts_and_429_stops_for_the_day(self):
         with tempfile.TemporaryDirectory() as folder:

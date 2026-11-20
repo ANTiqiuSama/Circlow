@@ -1973,10 +1973,12 @@ def _background(header: tuple, field_h: int, scale: float) -> Image.Image:
         if slot:
             # Same label and figure as the other columns, and no bar: the slot
             # was the gap left so a single quota would not stretch.
-            x, _end = slot
+            x, end = slot
             label, value, caption, unit = (tuple(column_iq) + ("",))[:4]
             draw.text((px(x), px(y)), label, font=label_font, fill=MUTED_TEXT, anchor="lt")
             if caption:
+                # Within its own column: the next one's figure has a line there too.
+                caption = forecast_text(caption, px(end - x), small, draw)
                 draw.text((px(x), px(y + BAR_MID)), caption, font=small, fill=MUTED_TEXT, anchor="lm")
             blit_at(content, figure(value or "—", unit, TEXT, TEXT, s), px(x), px(y + FIGURE_Y))
     if header_offset(model):

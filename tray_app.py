@@ -1053,7 +1053,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         state, config = getattr(self, "iq_state", None), getattr(self, "iq_config", None) or {}
         if not model_iq.effective_key(config) and not (state is not None and state.models):
             return (), "未设置"             # no key here, and nothing synced from another device
-        models = model_iq.hover_models(state, config.get("shown"), running)
+        models = model_iq.hover_models(state, running)
         if not models:                 # nothing ever read: no quota or error wording on the panel
             error = state.error if state else ""
             return (), ("Key 无效" if "Key" in error else "读取中")
