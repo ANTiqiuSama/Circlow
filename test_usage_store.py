@@ -171,6 +171,38 @@ class UsageStoreTests(unittest.TestCase):
             self.assertFalse(any(line[:1] in view.NO_LINE_START for line in lines if line), (limit, lines))
             self.assertFalse(any(line[-1:] in view.NO_LINE_END for line in lines[:-1] if line), (limit, lines))
 
+    def test_the_hint_names_the_quota_to_use_first_before_it_resets(self):
+        from types import SimpleNamespace
+        import quota_charts
+        from quota_sources import QuotaSnapshot
+        now = time.mktime((2026, 11, 21, 12, 0, 0, 0, 0, -1))
+        soon, later, far = int(now + 10 * 3600), int(now + 30 * 3600), int(now + 80 * 3600)
+        def idle(name, used, reset):
+            return {name: [Sample(now - 7200, used, reset), Sample(now - 60, used, reset)]}
+        series = {**idle("grok", 40, later), **idle("claude:secondary", 30, soon), **idle("codex:secondary", 30, soon),
+                  **idle("gemini:pool:argon", 50, soon), **idle("gemini:pool:claude_gpt", 97, soon),
+                  **idle("gemini:pool:gemini", 20, far)}
+        pools = [{"key": "argon", "label": "Argon", "remaining_percent": 50.0, "resets_at": soon, "window_minutes": 10080},
+                 {"key": "claude_gpt", "label": "Claude/GPT", "remaining_percent": 3.0, "resets_at": soon, "window_minutes": 10080},
+                 {"key": "gemini", "label": "Gemini", "remaining_percent": 80.0, "resets_at": far, "window_minutes": 10080}]
+        snapshots = {
+            "grok": QuotaSnapshot("grok", "Grok", 10080, 40, 60, later, now - 60, False, None),
+            "claude": QuotaSnapshot("claude", "Claude Code", 300, 98, 2, soon, now - 60, False, None, 10080, 30, 70, soon),
+            "codex": QuotaSnapshot("codex", "Codex", 300, 10, 90, soon, now - 60, False, None, 10080, 30, 70, soon),
+            "gemini": QuotaSnapshot("gemini", "Gemini · Argon", 10080, 50, 50, soon, now - 60, False, None, pools=pools),
+        }
+        tray = SimpleNamespace(snapshots=snapshots, history=SimpleNamespace(samples=lambda name: series.get(name, [])))
+        spares = quota_charts.ChartData.reset_spares(tray, now)
+        # Claude's 5-hour window is used up; Argon's pool is the one about to go to waste; Gemini's own
+        # pool and Claude/GPT's are too far off or nearly empty.
+        self.assertEqual([(item["provider"], item["pool"]) for item in spares], [("codex", ""), ("gemini", "Argon"), ("grok", "")])
+        tray.reset_spares = lambda moment: quota_charts.ChartData.reset_spares(tray, moment)
+        rows = quota_charts.ChartData.spare_hints(tray, now)
+        self.assertEqual(rows, (("spare", "codex", "优先用 Codex：10 小时后重置，照现在的用法还会剩约 70%"),
+                                ("spare", "gemini", "优先用 Gemini 的 Argon：10 小时后重置，照现在的用法还会剩约 50%")))
+        snapshots["codex"].updated_at = now - 3 * 3600                    # an old reading says nothing
+        self.assertEqual([item["provider"] for item in quota_charts.ChartData.reset_spares(tray, now)], ["gemini", "grok"])
+
     def test_a_weekly_quota_that_will_go_unused_is_pointed_out_before_its_reset(self):
         now = time.mktime((2026, 11, 7, 15, 0, 0, 0, 0, -1))
         reset = int(now + 30 * 3600)

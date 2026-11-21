@@ -121,7 +121,7 @@ class PanelModel:
     column_iq: tuple = ()                       # spare header slot, Grok only: (label, figure, caption, unit)
     hint_now: str = ""                          # unused; kept for callers
     hint_next: str = ""                         # a single hint line (older callers); `hints` wins
-    hints: tuple = ()                           # hint rows: (kind, letter, text); kind "wait" | "stuck" | "idea"
+    hints: tuple = ()                           # hint rows: (kind, letter, text); kind "wait" | "stuck" | "spare" | "idea"
     hint_space: float | None = None             # the rows' height, when rebuilt from a cached header
     local_tps: float | None = None              # with multi-device sync: this device's own TPS, under the shared figure
     today_tokens: float | None = None           # tokens this device's agents of the source used today, left of the status pill
@@ -901,9 +901,10 @@ class Scene:
 
     def _hint(self, frame, model, field_h, scale, at):
         """The hint rows, each beside its mark: a dot in the source's colour
-        for a session waiting for the user, the MiMo spark for a stuck or idea
-        line. Each item wraps to two lines at most; the band is exactly as tall
-        as its rows (hint_height), and absent without any."""
+        for a session waiting for the user, a spark in the source's colour
+        for its quota to use before it resets unused, the MiMo spark for a
+        stuck or idea line. Each item wraps to two lines at most; the band is
+        exactly as tall as its rows (hint_height), and absent without any."""
         items = hint_items(model)
         if not items:
             return
@@ -915,7 +916,7 @@ class Scene:
             if len(lines) > room:           # wrapped differently at this scale: keep the reserved rows
                 limit = at(WIDTH - PAD) - at(PAD + HINT_TEXT_X)
                 lines = lines[:room - 1] + (forecast_text("".join(lines[room - 1:]), limit, text_font, draw),)
-            mark = hint_mark("now" if kind == "wait" else "next", accent(letter if kind == "wait" else "M"), scale)
+            mark = hint_mark("now" if kind == "wait" else "next", accent(letter if kind in ("wait", "spare") else "M"), scale)
             frame.alpha_composite(mark, (round(at(PAD + 2)), round(at(y) - mark.height / 2)))
             for index, line in enumerate(lines):
                 draw.text((at(PAD + HINT_TEXT_X), at(y + index * HINT_LINE)), line, font=text_font,

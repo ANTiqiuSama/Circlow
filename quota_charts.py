@@ -9,6 +9,7 @@ import time
 import agent_panel
 import forecast as forecast_module
 import providers as provider_registry
+import usage_store
 from quota_sources import mimo_tracker
 from tray_icons import quota_depleted, quota_exhausted
 
@@ -32,6 +33,12 @@ def window_label(minutes: int | None) -> str:
     if minutes % 60 == 0:
         return f"{minutes // 60} 小时"
     return f"{minutes} 分钟"
+
+
+SPARE_HINTS = 2                 # "use it before it resets" rows in the hint, at most
+SPARE_FRESH_SECONDS = 2 * 3600  # a reading older than this says nothing about the quota left
+SPARE_OTHER_EMPTY = 5.0         # % left in a source's 5-hour window below which it cannot take more now
+SPARE_NAMES = {"codex": "Codex", "claude": "Claude", "grok": "Grok", "gemini": "Gemini", "mimo": "MiMo"}
 
 
 def weekly_series_name(snapshot) -> str | None:
@@ -230,6 +237,47 @@ class ChartData:
             keep = sorted(steps | {int(i * stride) for i in range(self.CHART_POINTS - 1 - len(steps))} | {len(points) - 1})
             points = [points[i] for i in keep]
         return dataclasses.replace(series, points=tuple(points))
+
+    def reset_spares(self, now: float) -> list[dict]:
+        """Weekly windows (Gemini: each pool) that will reset with quota
+        unused (usage_store.weekly_spare: within a day and a half, at least a
+        fifth left at the pace of their own readings), soonest reset first:
+        {"provider", "pool", "reset_at", "spare"}. A source whose other
+        window is used up cannot take more work now and is left out."""
+        found = []
+        for provider, snapshot in self.snapshots.items():
+            if snapshot is None or not snapshot.updated_at or now - snapshot.updated_at > SPARE_FRESH_SECONDS:
+                continue
+            windows = []
+            if snapshot.pools and len(snapshot.pools) > 1:
+                windows = [(f"{provider}:pool:{pool['key']}", pool.get("label") or pool["key"],
+                            pool.get("remaining_percent"), pool.get("resets_at"))
+                           for pool in snapshot.pools if pool.get("key") and pool.get("window_minutes") == 10080]
+            elif (name := weekly_series_name(snapshot)) is not None:
+                weekly = snapshot.window_minutes == 10080
+                other = None if weekly else snapshot.remaining_percent
+                if other is not None and other < SPARE_OTHER_EMPTY:
+                    continue
+                windows = [(name, "", snapshot.remaining_percent if weekly else snapshot.secondary_remaining_percent,
+                            snapshot.resets_at if weekly else snapshot.secondary_resets_at)]
+            for name, pool, remaining, resets_at in windows:
+                readings = self.history.samples(name) if self.history is not None else []
+                spare = usage_store.weekly_spare(readings, now, remaining, resets_at)
+                if spare is not None:
+                    found.append({"provider": provider, "pool": pool, "reset_at": spare["reset_at"], "spare": spare["spare"]})
+        return sorted(found, key=lambda item: item["reset_at"])
+
+    def spare_hints(self, now: float) -> tuple:
+        """Hint rows (kind "spare", provider, text) for reset_spares: which
+        quota to use first before it resets unused; at most SPARE_HINTS."""
+        rows = []
+        for item in self.reset_spares(now)[:SPARE_HINTS]:
+            name = SPARE_NAMES.get(item["provider"], item["provider"])
+            if item["pool"]:
+                name += " 的 " + ("Gemini 模型" if item["pool"] == "Gemini" else item["pool"])
+            rows.append(("spare", item["provider"], f"优先用 {name}：{forecast_module.duration_text(item['reset_at'] - now)}"
+                                                   f"后重置，照现在的用法还会剩约 {item['spare']:.0f}%"))
+        return tuple(rows)
 
     def weekly_windows(self) -> dict:
         """provider -> (quota readings, remaining %, resets_at) of its weekly

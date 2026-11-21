@@ -526,6 +526,8 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         hint_data = agent_hints.context(work)
         advisor = getattr(self, "hint_advisor", None)
         rows = advisor.lookup(hint_data) if advisor is not None else agent_hints.local_hint(hint_data)
+        # Quota about to reset unused comes before MiMo's idea, after a stuck session.
+        rows = [row for row in rows if row[0] == "stuck"] + list(self.spare_hints(now)) + [row for row in rows if row[0] != "stuck"]
         hints = tuple((kind, provider_letter(source) if source else "M", text) for kind, source, text in rows)
         today_used = None
         if provider == "mimo":
