@@ -539,7 +539,8 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                                       self.burn_chart(provider, now), alert, intel, intel_note,
                                       quota_tones=tuple(tones), quota_figures=tuple(figures), column_iq=column_iq,
                                       hints=hints,
-                                      local_tps=self.local_tps(provider, data))
+                                      local_tps=self.local_tps(provider, data),
+                                      today_tokens=data.get("today_tokens"))
 
     def open_session(self, key: str) -> None:
         """A click on a bubble: open its session where the user can answer

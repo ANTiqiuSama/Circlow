@@ -29,6 +29,7 @@ import providers
 import herdr_source
 import session_links
 from herdr_source import Herdr
+from usage_store import local_day
 from agent_tasks import AgentNotes, RECUR_SPREAD, clean as clean_request, read_schedules, tool_action
 
 
@@ -1316,13 +1317,19 @@ class TpsMonitor:
         copy_source, native_source = "Codex · Gemini桥接回传", "Antigravity CLI · Codex隔离配置"
         copies, native, window = [], [], []
         cutoff = now - max(HOLD_TPS_SECONDS, 300)
+        # Today's tokens per source (input, cache and output of every counted
+        # reply since local midnight); unmatched bridge copies join below.
+        midnight, today = today_start(now), dict.fromkeys(PROVIDER_NAMES, 0)
         for e in self.events:
             if e.ended_at >= cutoff:
                 window.append(e)
             if e.source == copy_source:
                 copies.append(e)
-            elif e.source == native_source:
+                continue
+            if e.source == native_source:
                 native.append(e)
+            if e.count_in_rate and e.ended_at >= midnight:
+                today[e.provider] = today.get(e.provider, 0) + reply_tokens(e)
         sources: dict[str, set] = {}
         for (provider, source), newest in list(self.source_seen.items()):
             if newest < now - 86400:
@@ -1338,6 +1345,8 @@ class TpsMonitor:
                 available.remove(match)
             else:
                 sources.setdefault(copy.provider, set()).add(copy.source)
+                if copy.count_in_rate and copy.ended_at >= midnight:
+                    today[copy.provider] = today.get(copy.provider, 0) + reply_tokens(copy)
         providers = {}
         for provider, label in PROVIDER_NAMES.items():
             events = [e for e in window if e.provider == provider]
@@ -1373,8 +1382,21 @@ class TpsMonitor:
                 if held:
                     latest = max(held, key=lambda e: e.ended_at)
                     generation, basis_text = latest.native_tps, f"{latest.basis}；仍在工作，保留上次测得的速率"
-            providers[provider] = {"label": label, "active_sessions": active, "generation_tps": generation, "output_tps_60": round(output / 60, 2), "output_tokens_60": output, "generation_samples": len(samples), "basis": [basis_text] if latest else ["客户端暂未提供可核验TPS"], "models": sorted({e.model for e in samples}), "sources": sorted(sources.get(provider, ())), "last_sample_at": latest.ended_at if latest else None, "display_tps": generation, "display_model": latest.model if latest else None, "display_basis": basis_text if latest else "客户端暂未取得TPS"}
+            providers[provider] = {"label": label, "active_sessions": active, "generation_tps": generation, "output_tps_60": round(output / 60, 2), "output_tokens_60": output, "generation_samples": len(samples), "basis": [basis_text] if latest else ["客户端暂未提供可核验TPS"], "models": sorted({e.model for e in samples}), "sources": sorted(sources.get(provider, ())), "last_sample_at": latest.ended_at if latest else None, "display_tps": generation, "display_model": latest.model if latest else None, "display_basis": basis_text if latest else "客户端暂未取得TPS", "today_tokens": today.get(provider, 0)}
         return {"generated_at": now, "window_seconds": 60, "providers": providers, "total_output_tps_60": round(sum(p["output_tokens_60"] for p in providers.values()) / 60, 2), "software": self.software, "source_health": self.health, "measurement_note": "Grok直读CLI原生TPS；Codex使用客户端真实输出token数÷首个输出项至计数完成的流式时间，含思考及工具调用输出，完成时结算。使用时显示最近完成的TPS，缺少完整计数时保留额度；不使用字符数或近似分词器。60秒输出速率为已报告输出数之和÷60，不计输入/缓存，不重复加思考token。"}
+
+
+def today_start(now: float) -> float:
+    """Local midnight of now's day; Windows mktime refuses dates before 1970."""
+    try:
+        return local_day(now)
+    except (OverflowError, OSError, ValueError):
+        return now - now % 86400
+
+
+def reply_tokens(observation: Observation) -> int:
+    """Every token a reply moved: uncached input, cache hits and output."""
+    return max(0, observation.output_tokens) + max(0, observation.input_tokens or 0) + max(0, observation.cached_tokens or 0)
 
 
 def stream_rate(samples: list[Observation], latest: Observation) -> tuple[float | None, str | None]:

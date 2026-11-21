@@ -4,7 +4,8 @@ a restart.
 Only numbers and names are stored: provider, source, session id, model, finish
 time and token counts. The replies of the last RAW_SECONDS are kept one by one
 (the chart's longest range is a day); older work survives as per-hour totals
-per provider for KEEP_DAYS. Written gzip-compressed, at most once a minute."""
+per provider for KEEP_DAYS, beside per-day totals of every token a reply moved
+(input, cache hits and output) for the overview's daily board. Written gzip-compressed, at most once a minute."""
 from __future__ import annotations
 
 import gzip
@@ -45,6 +46,9 @@ class UsageStore:
         # Other devices' hours from the sync hub (sync_hub), in memory only:
         # device -> (label, provider -> hour start -> [output tokens, replies]).
         self.remote: dict[str, tuple[str, dict[str, dict[int, list[int]]]]] = {}
+        # provider -> local midnight -> every token of the day's replies (this device only)
+        self.days: dict[str, dict[int, int]] = {}
+        self.days_since = 0                              # the first local midnight the daily totals cover in full
         self.dirty = False
         self.saved_at = 0.0
         if observation_type is None:
@@ -69,8 +73,42 @@ class UsageStore:
                         if isinstance(row, list) and required <= len(row) <= width]
             self.hours = {provider: {int(hour): [int(tokens), int(replies)] for hour, (tokens, replies) in hours.items()}
                           for provider, hours in payload.get("hours", {}).items()}
-        except (OSError, ValueError, TypeError, KeyError, EOFError):
-            self.raw, self.hours = [], {}
+            if "days" in payload:
+                self.days = {provider: {int(day): int(tokens) for day, tokens in days.items()}
+                             for provider, days in payload["days"].items()}
+                self.days_since = int(payload.get("days_since") or 0)
+            else:
+                # Saved before the daily totals: the replies kept one by one
+                # cover today in full (they reach back 26 hours); earlier days
+                # keep their output totals only.
+                self.days = {}
+                self.days_since = self._today()
+                for row in self.raw:
+                    try:
+                        self._count_day(self.observation_type(*row))
+                    except (TypeError, ValueError, OverflowError, OSError):
+                        continue
+        except (OSError, ValueError, TypeError, KeyError, EOFError, AttributeError):
+            self.raw, self.hours, self.days = [], {}, {}
+        if not self.days_since:
+            self.days_since = self._today()
+
+    @staticmethod
+    def _today() -> int:
+        try:
+            return local_day(time.time())
+        except (OverflowError, OSError, ValueError):
+            return 0
+
+    def _count_day(self, observation: Any) -> None:
+        if not observation.count_in_rate:
+            return
+        tokens = (max(0, observation.output_tokens) + max(0, observation.input_tokens or 0)
+                  + max(0, observation.cached_tokens or 0))
+        if tokens > 0:
+            days = self.days.setdefault(observation.provider, {})
+            day = local_day(observation.ended_at)
+            days[day] = days.get(day, 0) + int(tokens)
 
     def note(self, observation: Any) -> None:
         """A new observation from the monitor (each identity arrives once)."""
@@ -80,6 +118,10 @@ class UsageStore:
                 slot = self.hours.setdefault(observation.provider, {}).setdefault(_hour(observation.ended_at), [0, 0])
                 slot[0] += int(observation.output_tokens)
                 slot[1] += 1
+            try:
+                self._count_day(observation)
+            except (OverflowError, OSError, ValueError):
+                pass
             self.dirty = True
 
     def restore(self, now: float, seconds: float = 86400) -> list[Any]:
@@ -104,9 +146,14 @@ class UsageStore:
             oldest = now - KEEP_DAYS * 86400
             self.hours = {provider: {hour: value for hour, value in hours.items() if hour >= oldest}
                           for provider, hours in self.hours.items()}
+            self.days = {provider: {day: value for day, value in days.items() if day >= oldest - 86400}
+                         for provider, days in self.days.items()}
             payload = {"version": VERSION, "raw": self.raw,
                        "hours": {provider: {str(hour): value for hour, value in sorted(hours.items())}
-                                 for provider, hours in self.hours.items() if hours}}
+                                 for provider, hours in self.hours.items() if hours},
+                       "days": {provider: {str(day): value for day, value in sorted(days.items())}
+                                for provider, days in self.days.items() if days},
+                       "days_since": self.days_since}
             self.dirty = False
             self.saved_at = now
             try:                            # under the lock: the exit save and the reader thread's never interleave
@@ -180,6 +227,29 @@ class UsageStore:
             out = [(label, sum(tokens for provider, hours in source.items() if provider in keys
                                for hour, (tokens, _replies) in hours.items() if hour >= since)) for label, source in rows]
         return [(label, tokens) for index, (label, tokens) in enumerate(out) if tokens or index == 0]
+
+    def daily(self, providers: Iterable[str], now: float, count: int = 14) -> list[tuple[int, dict[str, int], bool]]:
+        """The last `count` local days, oldest first: (midnight, tokens per
+        provider, complete). A day with a recorded daily total counts every
+        token (input, cache hits, output); an older day without one falls back
+        to its hourly output totals, and `complete` is False for it."""
+        keys = tuple(providers)
+        today = local_day(now)
+        starts = [today]
+        for _ in range(count - 1):
+            starts.append(local_day(starts[-1] - 43200))   # noon of the day before: safe across DST changes
+        starts.reverse()
+        rows = []
+        with self.lock:
+            for index, start in enumerate(starts):
+                end = starts[index + 1] if index + 1 < len(starts) else start + 86400 * 2
+                if start >= self.days_since:
+                    rows.append((start, {provider: self.days.get(provider, {}).get(start, 0) for provider in keys}, True))
+                    continue
+                output = {provider: sum(tokens for hour, (tokens, _replies) in self.hours.get(provider, {}).items()
+                                        if start <= hour < end) for provider in keys}
+                rows.append((start, output, False))
+        return rows
 
     def hour_rows(self, providers: Iterable[str], since: float, now: float) -> list[Any]:
         """Hourly totals as chart events (one per provider and hour, at the

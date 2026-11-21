@@ -1276,6 +1276,13 @@ class AgentPanelTests(unittest.TestCase):
             tracker.return_value.view.return_value.today_used = 1234
             self.assertEqual(self.tray.panel("mimo").today_used, 1234)
 
+    def test_panel_carries_todays_tokens_from_the_monitor(self):
+        self.tray.headline_forecast = Mock(return_value=("", "unknown"))
+        self.tray.performance['providers']['codex']['today_tokens'] = 1.2e9
+        self.assertEqual(self.tray.panel("codex").tokens_text, "1.2B")
+        self.tray.performance['providers']['codex'].pop('today_tokens')
+        self.assertEqual(self.tray.panel("codex").tokens_text, "")
+
     def test_claude_stays_on_the_chart_after_its_reply(self):
         from pathlib import Path
         from forecast import QuotaHistory

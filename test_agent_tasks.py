@@ -439,6 +439,29 @@ class SceneTests(unittest.TestCase):
         from dataclasses import replace
         self.assertEqual(model.header, replace(model, today_used=2e9).header)
 
+    def test_today_tokens_sit_left_of_the_status_pill(self):
+        from dataclasses import replace
+        model = agent_panel.PanelModel("codex", "C", "GPT / Codex", "2 个在工作", (("5 小时", 70.0, ""),), 80.0, ())
+        self.assertEqual(model.tokens_text, "")
+        self.assertEqual(replace(model, today_tokens=0).tokens_text, "")
+        counted = replace(model, today_tokens=1.04e9)
+        self.assertEqual(counted.tokens_text, "1.04B")
+        self.assertEqual(replace(model, today_tokens=987_654).tokens_text, "988K")
+        # The cached header follows the shown figure, not every token.
+        self.assertEqual(counted.header, replace(model, today_tokens=1.0401e9).header)
+        self.assertNotEqual(counted.header, replace(model, today_tokens=1.06e9).header)
+        from PIL import ImageChops
+        plain = agent_panel._background(model.header, 160, 1.0)
+        shown = agent_panel._background(counted.header, 160, 1.0)
+        margin = (plain.width - agent_panel.WIDTH) / 2         # the card's shadow margin
+        pill = agent_panel.ui_font(11)
+        probe = agent_panel.ImageDraw.Draw(agent_panel.Image.new("RGBA", (1, 1)))
+        pill_left = margin + agent_panel.WIDTH - agent_panel.PAD - probe.textlength(model.status, font=pill) - 18
+        left, top, right, bottom = ImageChops.difference(plain, shown).getbbox()
+        self.assertLess(right, pill_left)                     # only the figure, beside the pill
+        self.assertGreater(left, pill_left - 70)
+        self.assertLess(bottom, margin + agent_panel.PAD + 18 + 1)
+
     def test_tps_takes_the_rightmost_header_slot_for_every_source(self):
         right = agent_panel.meter_columns(2)[-1]
         for count in (1, 2):                                   # Grok has a single quota column

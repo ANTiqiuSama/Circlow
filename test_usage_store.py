@@ -25,6 +25,48 @@ class UsageStoreTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.folder, ignore_errors=True)
 
+    def test_daily_totals_count_every_token_and_survive_a_restart(self):
+        noon = local_day(time.time()) + 12 * 3600
+        store = UsageStore(self.path)
+        store.days_since = local_day(noon - 86400)             # yesterday's totals were recorded in full
+        store.note(reply("a", noon - 60, 100))                   # 100 output + 10 input + 5 cache
+        store.note(reply("b", noon - 86400, 40, "claude"))       # yesterday
+        store.note(reply("c", noon - 30, 999, counted=False))    # a copy the rate leaves out
+        self.assertTrue(store.save(noon, force=True))
+        rows = UsageStore(self.path).daily(("codex", "claude"), noon, 3)
+        self.assertEqual([len(rows), rows[-1][1], rows[-2][1]], [3, {"codex": 115, "claude": 0}, {"codex": 0, "claude": 55}])
+        self.assertEqual([complete for _start, _tokens, complete in rows], [False, True, True])
+        self.assertEqual(rows[-1][0], local_day(noon))
+
+    def test_daily_falls_back_to_output_before_the_totals_began(self):
+        noon = local_day(time.time()) + 12 * 3600
+        store = UsageStore(self.path)
+        store.note(reply("old", noon - 3 * 86400, 70))
+        store.save(noon, force=True)
+        payload = json.loads(gzip.decompress(self.path.read_bytes()))
+        del payload["days"], payload["days_since"]                 # a file saved before the daily totals
+        self.path.write_bytes(gzip.compress(json.dumps(payload).encode()))
+        reopened = UsageStore(self.path)
+        rows = reopened.daily(("codex",), noon, 4)
+        self.assertEqual(rows[0], (local_day(noon - 3 * 86400), {"codex": 70}, False))   # output only
+        self.assertEqual(reopened.days_since, local_day(time.time()))
+        caption = view.daily_totals(rows)
+        self.assertEqual([c for c, _v, _w in caption], ["今日", "昨日 · 仅输出", "近 7 天 · 部分仅输出"])
+
+    def test_daily_board_draws_and_picks_a_day(self):
+        noon = local_day(time.time()) + 12 * 3600
+        rows = [(local_day(noon - (13 - i) * 86400), {"codex": i * 1000, "claude": 500}, i > 10) for i in range(14)]
+        letters = {"codex": "C", "claude": "A"}
+        for scale in (1, 1.5):
+            image = view.daily_chart(rows, letters, scale, width=640, height=190, hover=13)
+            self.assertEqual(image.size, (round(640 * scale), round(190 * scale)))
+        self.assertIsNotNone(view.daily_chart([], letters))
+        left, right, _top, _bottom, _slot = view.daily_frame(640, 190, 14)
+        self.assertEqual(view.daily_index(right - 1, 640, 190, 14), 13)
+        self.assertEqual(view.daily_index(left, 640, 190, 14), 0)
+        self.assertIsNone(view.daily_index(left - 1, 640, 190, 14))
+        self.assertNotEqual(view.daily_chart(rows, letters, hover=13).tobytes(), view.daily_chart(rows, letters).tobytes())
+
     def test_output_records_survive_a_restart_without_counting_twice(self):
         now = time.time()
         store = UsageStore(self.path)

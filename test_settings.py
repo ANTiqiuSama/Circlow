@@ -508,3 +508,21 @@ class AutoSaveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DailyBoardTests(unittest.TestCase):
+    def test_today_on_the_board_is_the_live_figure_of_the_hover_card(self):
+        import settings_window
+        from usage_store import local_day
+        noon = local_day(time.time()) + 12 * 3600
+        day = local_day(noon)
+        store = SimpleNamespace(daily=lambda keys, now, count: [(day - 86400, {k: 7 for k in keys}, False),
+                                                                (day, {k: 1 for k in keys}, True)])
+        app = SimpleNamespace(snapshots={"codex": None, "claude": None}, usage=store,
+                              performance={"providers": {"codex": {"today_tokens": 1_200_000}, "claude": {}}})
+        letters, rows = settings_window.SettingsWindow.daily_rows(SimpleNamespace(app=app), noon)
+        self.assertEqual(set(letters), {"codex", "claude"})
+        self.assertEqual(rows[-1], (day, {"codex": 1_200_000, "claude": 0}, True))
+        self.assertEqual(rows[0][1], {"codex": 7, "claude": 7})
+        app.usage = None
+        self.assertEqual(settings_window.SettingsWindow.daily_rows(SimpleNamespace(app=app), noon)[1], [])

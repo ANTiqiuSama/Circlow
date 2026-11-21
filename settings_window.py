@@ -1429,6 +1429,7 @@ class SettingsWindow:
         self.card_flow = FlowGrid(self, page, changed=self.reflow)
         self.card_grid = self.card_flow.frame
         self._activity_panel(page, "overview", lambda: {provider: letter_of(provider) for provider in in_tray_order(self.app.snapshots)})
+        self._daily_panel(page)
 
     def _fill_overview(self):
         S = self.S
@@ -1443,6 +1444,7 @@ class SettingsWindow:
         self.cards = build_cards(self.app)
         self._layout_overview()
         self._paint_chart(self.charts["overview"], fresh=True)
+        self._paint_daily(fresh=True)
 
     def _layout_overview(self):
         """Lay the cards into the flowing grid from the last read; a resize
@@ -1459,6 +1461,73 @@ class SettingsWindow:
         self.card_flow.set(tiles)
         self.card_flow.layout()
         self._paint_chart(self.charts["overview"])
+        self._paint_daily()
+
+    DAILY_H = 190
+
+    def _daily_panel(self, page):
+        """The daily usage board under the output chart: every token of each
+        day (input, cache hits, output), stacked by source, for two weeks."""
+        tk, S = self.tk, self.S
+        box = tk.Frame(page, bg=view.BG)
+        box.pack(anchor="w")
+        head = tk.Frame(box, bg=view.BG)
+        head.pack(fill="x", pady=(S(16), S(8)))
+        self.label(head, "每日用量", 11, weight="bold").pack(side="left")
+        note = self.label(head, "", 9, view.INK_3)
+        note.pack(side="left", padx=(S(10), 0))
+        holder = tk.Frame(box, bg=view.BG)
+        holder.pack(anchor="w")
+        self.daily = {"note": note, "holder": holder, "rows": None, "hover": None, "width": None, "drawn": None}
+
+    def daily_rows(self, now):
+        """The board's days from the usage store; today from the live monitor
+        (the hover card's figure: bridge copies counted once)."""
+        providers = {provider: letter_of(provider) for provider in in_tray_order(self.app.snapshots)}
+        store = getattr(self.app, "usage", None)
+        if store is None or not providers:
+            return providers, []
+        rows = store.daily(tuple(providers), now, view.DAILY_DAYS)
+        performance = (getattr(self.app, "performance", None) or {}).get("providers", {})
+        if rows:
+            start, tokens, _complete = rows[-1]
+            live = {provider: int((performance.get(provider) or {}).get("today_tokens") or 0) for provider in providers}
+            rows[-1] = (start, {provider: max(live[provider], 0) if provider in performance else tokens[provider]
+                                for provider in providers}, True)
+        return providers, rows
+
+    def _paint_daily(self, fresh=False):
+        daily = getattr(self, "daily", None)
+        if daily is None:
+            return
+        if fresh or daily["rows"] is None:
+            daily["letters"], daily["rows"] = self.daily_rows(time.time())
+        rows = daily["rows"]
+        flow = self.card_flow
+        width = min(self.page_width("overview"), max(self.CHART_MIN_W, flow.widest))
+        daily["width"] = width
+        partial = any(not complete and any(tokens.values()) for _start, tokens, complete in rows)
+        self.set_text(daily["note"], "输入、缓存与输出 token 合计 · 悬停查看数值" + (" · 浅色为仅输出的早期记录" if partial else ""))
+        drawn = (tuple((start, tuple(tokens.items()), complete) for start, tokens, complete in rows), round(width), daily["hover"])
+        if daily["drawn"] == drawn:
+            return
+        daily["drawn"] = drawn
+        image = view.daily_chart(rows, daily["letters"], self.scale * self.f, width=round(width), height=self.DAILY_H,
+                                 hover=daily["hover"])
+        widget = self.picture(daily["holder"], "chart:daily", image)
+        if not widget.winfo_manager():
+            widget.pack(anchor="w")
+            widget.bind("<Motion>", lambda event: self._daily_hover(event.x / self.scale))
+            widget.bind("<Leave>", lambda _: self._daily_hover(None))
+
+    def _daily_hover(self, x):
+        daily = self.daily
+        index = None
+        if daily["rows"] and x is not None and daily["width"]:
+            index = view.daily_index(x, daily["width"], self.DAILY_H, len(daily["rows"]))
+        if index != daily["hover"]:
+            daily["hover"] = index
+            self._paint_daily()
 
     def _draw_card(self, card, icon, width, slots):
         """The card picture at this width; the hover version is drawn only

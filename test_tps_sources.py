@@ -148,6 +148,23 @@ class TpsTests(unittest.TestCase):
         self.assertEqual(data["output_tokens_60"], 200)
         self.assertIsNone(data["generation_tps"])
 
+    def test_today_tokens_add_input_cache_and_output_since_local_midnight(self):
+        from usage_store import local_day
+        noon = local_day(self.now) + 12 * 3600
+        add = lambda *row, **extra: self.monitor.add(Observation(*row, **extra), noon)  # noqa: E731
+        add("a", "Codex", "s", "codex", "gpt", noon - 60, 100, input_tokens=1000, cached_tokens=9000)
+        add("b", "Claude Code", "c", "claude", "opus", noon - 30, 50)
+        add("old", "Codex", "s", "codex", "gpt", noon - 13 * 3600, 7777, input_tokens=1)   # yesterday
+        add("held", "Grok CLI", "g", "grok", "grok", noon - 10, 500, None, "", False)       # not counted (a counter copy)
+        add("native", "Antigravity CLI · Codex隔离配置", "x", "gemini", "gemini", noon - 2, 200, 2, "流式", input_tokens=10)
+        add("copy", "Codex · Gemini桥接回传", "y", "gemini", "gemini", noon - 1, 200, 4, "API平均", input_tokens=10)
+        add("lone", "Codex · Gemini桥接回传", "z", "gemini", "gemini", noon - 900, 30, 4, "API平均")
+        providers = self.monitor.snapshot(noon)["providers"]
+        self.assertEqual(providers["codex"]["today_tokens"], 10100)
+        self.assertEqual(providers["claude"]["today_tokens"], 50)
+        self.assertEqual(providers["grok"]["today_tokens"], 0)
+        self.assertEqual(providers["gemini"]["today_tokens"], 210 + 30)    # the matched copy once, the lone copy kept
+
     def make_agy_db(self, corrupt_total=False, step_type=None, total=True):
         folder = self.home / ".gemini/antigravity-cli/conversations"
         folder.mkdir(parents=True)

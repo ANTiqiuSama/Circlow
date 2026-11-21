@@ -652,3 +652,150 @@ def health_tone(status: str) -> str:
     if any(word in status for word in ("失败", "不可", "未运行")):
         return "error"
     return "idle"
+
+
+# ----- daily usage board (概览) ---------------------------------------------------------------
+DAILY_DAYS = 14
+DAILY_TOP, DAILY_FOOT = 62, 30
+
+
+def daily_totals(rows) -> tuple[tuple[str, int, bool], ...]:
+    """(caption, tokens, every token counted) for today, yesterday and the
+    last 7 days, from daily rows, oldest first. A span holding a day with
+    output totals only says so in its caption."""
+    sums = [(sum(tokens.values()), complete) for _start, tokens, complete in rows]
+    spans = (("今日", sums[-1:]), ("昨日", sums[-2:-1]), ("近 7 天", sums[-7:]))
+    out = []
+    for caption, picked in spans:
+        whole = all(complete for _value, complete in picked)
+        if not whole:
+            caption += " · 仅输出" if len(picked) == 1 else " · 部分仅输出"
+        out.append((caption, sum(value for value, _complete in picked), whole))
+    return tuple(out)
+
+
+def daily_frame(width: float, height: float, count: int) -> tuple[float, float, float, float, float]:
+    left, right = CHART_PAD + CHART_GUTTER, width - CHART_PAD
+    return left, right, DAILY_TOP, height - DAILY_FOOT, (right - left) / max(1, count)
+
+
+def daily_index(x: float, width: float, height: float, count: int) -> int | None:
+    left, right, _top, _bottom, slot = daily_frame(width, height, count)
+    if not left <= x < right:
+        return None
+    return min(count - 1, int((x - left) // slot))
+
+
+def _day_label(start: float, today: bool) -> str:
+    local = time.localtime(start)
+    return "今天" if today else f"{local.tm_mon}/{local.tm_mday}"
+
+
+def daily_chart(rows, letters: dict[str, str], scale: float = 1.0, width: int = 652, height: int = 190,
+                hover: int | None = None) -> Image.Image:
+    """Tokens per local day, stacked by source, today on the right. Each row
+    is (midnight, tokens per provider, complete); a day recorded before the
+    daily totals existed has output tokens only and is drawn paler."""
+    s = scale
+    px = lambda value: round(value * s)  # noqa: E731
+    image = _rounded((px(width), px(height)), 12, CARD_RGB, CARD_EDGE, s)
+    draw = ImageDraw.Draw(image)
+    big, label, small, tiny = ui_font(px(18), "bold"), ui_font(px(10)), ui_font(px(11)), ui_font(px(10))
+    line = max(1, round(s))
+    count = len(rows)
+    left, right, top, bottom, slot = daily_frame(width, height, count)
+    providers = tuple(rows[0][1]) if rows else ()
+
+    # Headline: today, yesterday and the last seven days.
+    x = CHART_PAD
+    for caption, value, whole in daily_totals(rows) if rows else ():
+        draw.text((px(x), px(14)), caption, font=label, fill=MUTED_TEXT, anchor="lt")
+        text = tokens_text(value) if value else "—"
+        draw.text((px(x), px(30)), text, font=big, fill=TEXT if whole else SECONDARY_TEXT, anchor="lt")
+        x += max(draw.textlength(text, font=big) / s, draw.textlength(caption, font=label) / s) + 28
+
+    # Legend: the sources with any use on the board (their figures are in the
+    # hover readout), right-aligned.
+    used = [provider for provider in providers if any(tokens.get(provider) for _start, tokens, _complete in rows)]
+    lx = right
+    for provider in reversed(used):
+        text = SHORT_NAMES.get(provider, provider)
+        w = draw.textlength(text, font=tiny) / s
+        if lx - w - 12 < x:
+            break
+        draw.text((px(lx), px(22)), text, font=tiny, fill=SECONDARY_TEXT, anchor="rm")
+        draw.ellipse((px(lx - w - 12), px(18), px(lx - w - 4), px(26)), fill=accent(letters.get(provider, "?")))
+        lx -= w + 22
+
+    peak = max([sum(tokens.values()) for _start, tokens, _complete in rows] + [0])
+    ceiling = nice_ceiling(peak)
+    for fraction in (0.0, 0.5, 1.0):
+        y = bottom - (bottom - top) * fraction
+        draw.line((px(left), px(y), px(right), px(y)), fill=RULE if fraction else TRACK_RGB, width=line)
+        if fraction:
+            draw.text((px(left - 8), px(y)), tokens_text(ceiling * fraction), font=tiny, fill=MUTED_TEXT, anchor="rm")
+
+    if hover is not None and 0 <= hover < count:
+        draw.rectangle((px(left + hover * slot), px(top - 6), px(left + (hover + 1) * slot), px(bottom)), fill=mix(IVORY_RGB, .06))
+    gap = min(10.0, slot * .3)
+    for index, (start, tokens, complete) in enumerate(rows):
+        x0, x1 = left + index * slot + gap / 2, left + (index + 1) * slot - gap / 2
+        base = bottom
+        if not any(tokens.values()):
+            draw.rectangle((px(x0), px(bottom - 2), px(x1), px(bottom)), fill=TRACK_RGB)
+        dim = hover is not None and hover != index
+        for provider in providers:
+            amount = tokens.get(provider, 0)
+            if not amount:
+                continue
+            h = max(2.0, (bottom - top) * amount / ceiling)
+            color = accent(letters.get(provider, "?"))
+            shade = mix(color, .4) if not complete else mix(color, .55) if dim else color
+            draw.rectangle((px(x0), px(base - h), px(x1), px(base)), fill=shade)
+            base -= h
+        today = index == count - 1
+        text = _day_label(start, today)
+        if today or count <= 10 or (count - 1 - index) % 2 == 0:
+            draw.text((px((x0 + x1) / 2), px(height - 14)), text, font=tiny,
+                      fill=SECONDARY_TEXT if today else MUTED_TEXT, anchor="mm")
+
+    if not peak:
+        draw.text((px((left + right) / 2), px((top + bottom) / 2)), "还没有用量记录", font=small, fill=MUTED_TEXT, anchor="mm")
+    elif hover is not None and 0 <= hover < count:
+        _daily_readout(draw, rows, letters, hover, (left, right, top, bottom, slot), s)
+    return image
+
+
+def _daily_readout(draw, rows, letters, index, frame, s) -> None:
+    px = lambda value: round(value * s)  # noqa: E731
+    left, right, top, bottom, slot = frame
+    bold, tiny = ui_font(px(11), "bold"), ui_font(px(10))
+    start, tokens, complete = rows[index]
+    local = time.localtime(start)
+    title = f"{local.tm_mon} 月 {local.tm_mday} 日" + ("（今天）" if index == len(rows) - 1 else "")
+    lines = [(provider, amount) for provider, amount in tokens.items() if amount]
+    rows_text = [f"{SHORT_NAMES.get(p, p)}  {tokens_text(amount)}" for p, amount in lines]
+    if len(lines) > 1:
+        rows_text.append(f"合计  {tokens_text(sum(tokens.values()))}")
+    if not rows_text:
+        rows_text = ["没有用量"]
+    if not complete and lines:
+        rows_text.append("仅输出 token（当时未记录输入与缓存）")
+    width = max([draw.textlength(title, font=bold) / s] + [draw.textlength(row, font=tiny) / s + 14 for row in rows_text]) + 20
+    height = 26 + len(rows_text) * 16
+    center = left + (index + .5) * slot
+    x0 = center + slot / 2 + 6
+    if x0 + width > right:
+        x0 = center - slot / 2 - 6 - width
+    x0 = max(CHART_PAD, x0)
+    y0 = top - 4
+    draw.rounded_rectangle((px(x0), px(y0), px(x0 + width), px(y0 + height)), radius=px(7),
+                           fill=(52, 51, 46, 255), outline=CARD_EDGE, width=max(1, round(s)))
+    draw.text((px(x0 + 10), px(y0 + 13)), title, font=bold, fill=TEXT, anchor="lm")
+    for row_index, row in enumerate(rows_text):
+        y = y0 + 31 + row_index * 16
+        provider = lines[row_index][0] if row_index < len(lines) else None
+        if provider:
+            draw.ellipse((px(x0 + 10), px(y - 3), px(x0 + 16), px(y + 3)), fill=accent(letters.get(provider, "?")))
+        draw.text((px(x0 + 24 if provider else x0 + 10), px(y)), row, font=tiny,
+                  fill=SECONDARY_TEXT if provider else MUTED_TEXT if row.startswith("仅输出") else TEXT, anchor="lm")

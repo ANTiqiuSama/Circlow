@@ -124,6 +124,7 @@ class PanelModel:
     hints: tuple = ()                           # hint rows: (kind, letter, text); kind "wait" | "stuck" | "idea"
     hint_space: float | None = None             # the rows' height, when rebuilt from a cached header
     local_tps: float | None = None              # with multi-device sync: this device's own TPS, under the shared figure
+    today_tokens: float | None = None           # tokens this device's agents of the source used today, left of the status pill
 
     def figure_of(self, slot: int) -> tuple[str, str] | None:
         return self.quota_figures[slot] if slot < len(self.quota_figures) else None
@@ -135,11 +136,19 @@ class PanelModel:
     def header(self) -> tuple:
         """Static part of the panel (cached background). Quota figures, bars,
         TPS and the burn chart are drawn per frame; the reset line is cached here."""
-        return (self.letter, self.title, self.status, self.status_tone,
+        return (self.letter, self.title, self.status, self.status_tone, self.tokens_text,
                 tuple((item[0], item[2] if len(item) > 2 else "", self.tone_of(slot)) for slot, item in enumerate(self.quota[:3])),
                 (self.banner, self.banner_alert, self.intel, self.intel_note),
                 (self.forecast, self.forecast_tone), self.provider == "mimo", chart_extra_for(self),
                 self.column_iq, self.tps_label, hint_height(self))
+
+    @property
+    def tokens_text(self) -> str:
+        """Today's tokens beside the status pill ("1.2B"); empty before any.
+        Rounded like the figures, so the cached header changes only with it."""
+        if not self.today_tokens or not math.isfinite(self.today_tokens) or self.today_tokens < 1:
+            return ""
+        return "".join(compact_usage(self.today_tokens))
 
     @property
     def tps_label(self) -> str:
@@ -1850,7 +1859,7 @@ def background(header: tuple, field_px: int, scale: float) -> Image.Image:
 
 
 def _header_model(header: tuple) -> PanelModel:
-    letter, title, status, tone, meters, (banner, alert, intel, note), forecast, daily, chart_padding, _iq, show_tps, hints = header
+    letter, title, status, tone, _tokens, meters, (banner, alert, intel, note), forecast, daily, chart_padding, _iq, show_tps, hints = header
     return PanelModel("mimo" if daily else "" if show_tps else "gemini", letter, title, status, tuple((label, None, reset) for label, reset, _ in meters), None, (),
                       tone, banner, forecast[0], forecast[1], banner_alert=alert,
                       intel=intel, intel_note=note, chart_padding=chart_padding,
@@ -1941,7 +1950,7 @@ def _banner(draw, px, s, banner: str, alert: str, intel: tuple, note: str, lette
 @lru_cache(maxsize=12)
 def _background(header: tuple, field_h: int, scale: float) -> Image.Image:
     model = _header_model(header)
-    letter, title, status, tone, meters, (banner, alert, intel, note), _, daily, _padding, column_iq, show_tps, _hints = header
+    letter, title, status, tone, tokens, meters, (banner, alert, intel, note), _, daily, _padding, column_iq, show_tps, _hints = header
     top = field_top(model)
     height = panel_height(model, field_h)
     s = scale
@@ -1958,6 +1967,8 @@ def _background(header: tuple, field_h: int, scale: float) -> Image.Image:
     fill, ink = PILL_TONES.get(tone, (color, (31, 30, 28, 255)))
     draw.rounded_rectangle((px(right - width), px(y), px(right), px(y + 18)), radius=px(9), fill=fill)
     draw.text((px(right - width / 2), px(y + 9)), status, font=pill, fill=ink, anchor="mm")
+    if tokens:
+        draw.text((px(right - width - 8), px(y + 9)), tokens, font=ui_font(px(11), "bold"), fill=SECONDARY_TEXT, anchor="rm")
 
     y = METER_TOP + header_offset(model)
     label_font, small = ui_font(px(LABEL_FONT)), ui_font(px(SMALL_FONT))
