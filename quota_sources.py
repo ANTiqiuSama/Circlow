@@ -52,6 +52,9 @@ class QuotaSnapshot:
     # 0 when unknown). None for other sources.
     changed_at: float | None = None
     secondary_changed_at: float | None = None
+    # Gemini: which Google account agy read (cli_usage.account_key, never the
+    # address); None when unknown and for other sources.
+    account: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -290,7 +293,8 @@ def get_gemini_quota() -> QuotaSnapshot:
             period = "每周" if minutes == 10080 else f"{minutes // 60} 小时" if minutes % 60 == 0 else f"{minutes} 分钟"
             label = f"Gemini（{period}）"
         return QuotaSnapshot("gemini", label, parsed["window_minutes"], parsed["used_percent"], parsed["remaining_percent"],
-                             parsed["resets_at"], time.time(), False, None, pools=parsed["pools"])
+                             parsed["resets_at"], time.time(), False, None, pools=parsed["pools"],
+                             account=parsed.get("account"))
     except Exception as exc:
         return _unknown("gemini", "Gemini", None, f"读取 /usage 失败：{type(exc).__name__}: {exc}")
 
@@ -532,6 +536,39 @@ def _usage_shows_drop(before: float, reset: int, weekly: bool) -> bool:
     return used is not None and probe_reset is not None and abs(probe_reset - reset) <= 180 and before - used >= 5
 
 
+# agy keeps one login for every session on the machine, and each session
+# refreshes its own token about hourly: a session signed in to another Google
+# account swaps that login back and forth under the reads. The account shown
+# stays while it was read this recently; past it, the other one is followed.
+GEMINI_ACCOUNT_HOLD_SECONDS = 90 * 60
+GEMINI_OTHER_ACCOUNT = "agy 当前登录的是另一个账号"
+
+
+def other_gemini_account(snapshot: QuotaSnapshot, shown: QuotaSnapshot | None) -> bool:
+    """True when `snapshot` read another account than the one `shown` (a
+    known account read within GEMINI_ACCOUNT_HOLD_SECONDS of it)."""
+    if shown is None or not shown.account or not snapshot.account or snapshot.account == shown.account:
+        return False
+    return (snapshot.updated_at or 0.0) - (shown.updated_at or 0.0) < GEMINI_ACCOUNT_HOLD_SECONDS
+
+
+def gemini_reading(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaSnapshot:
+    """The Gemini reading to show. Once the account is known, a failed read
+    or another account's reading (other_gemini_account) keeps the last
+    figures, marked old; a reading of unknown account counts as the same
+    account. Before that a failed read keeps nothing: without the account,
+    old figures may be someone else's."""
+    if old is None or not old.account or old.provider != "gemini" or old.used_percent is None:
+        return snapshot
+    if snapshot.error or other_gemini_account(snapshot, old):
+        # Set aside, not failed: the scheduler keeps its usual pace.
+        held = not snapshot.error
+        return replace(old, stale=True, error=GEMINI_OTHER_ACCOUNT if held else snapshot.error, held=held)
+    if not snapshot.account:
+        return replace(snapshot, account=old.account)
+    return snapshot
+
+
 def keep_last_good(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaSnapshot:
     """Keep stale figures on failure, except Gemini whose CLI account may have changed."""
     if snapshot.provider == "claude" and old and not snapshot.error:
@@ -551,10 +588,8 @@ def keep_last_good(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaS
             # the next read asks /usage at once instead of the status line.
             snapshot.error, snapshot.held = CLAUDE_HELD, True
             _CLAUDE_PROBE["verify"] = True
-    if snapshot.provider == "gemini" and snapshot.error:
-        # CLI logins can change between reads. Without an account identifier
-        # in /usage, carrying old quota across a failed read is misleading.
-        return snapshot
+    if snapshot.provider == "gemini":
+        return gemini_reading(snapshot, old)
     if snapshot.error and old and old.used_percent is not None:
         snapshot.used_percent = old.used_percent
         snapshot.remaining_percent = old.remaining_percent
@@ -619,6 +654,7 @@ def load_cached_snapshots() -> dict[str, QuotaSnapshot]:
                 today_date=item.get("today_date"),
                 credits_balance=float("inf") if item.get("credits_unlimited") is True else item.get("credits_balance"),
                 reset_credits=item.get("reset_credits"),
+                account=item.get("account") if isinstance(item.get("account"), str) else None,
             )
             result[snapshot.provider] = snapshot
         return result

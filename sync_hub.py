@@ -33,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from quota_sources import QuotaSnapshot
+from quota_sources import QuotaSnapshot, other_gemini_account
 
 log = logging.getLogger("Circlow")
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow"
@@ -161,6 +161,11 @@ def merge_snapshots(payloads: dict[str, dict], me: str, current: dict[str, Quota
             shown = current.get(provider)
             if shown is not None and (snapshot.updated_at or 0) <= (shown.updated_at or 0):
                 continue
+            if provider == "gemini" and shown is not None and shown.account:
+                if other_gemini_account(snapshot, shown):
+                    continue      # the other device's agy is signed in to another account
+                if not snapshot.account:      # an older build: counts as the same account
+                    snapshot = dataclasses.replace(snapshot, account=shown.account)
             if accept(provider, snapshot, f"sync:{device}"):
                 taken.append((provider, snapshot))
                 current[provider] = snapshot

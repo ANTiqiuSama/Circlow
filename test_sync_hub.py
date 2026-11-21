@@ -141,6 +141,18 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual([(p, s.used_percent) for p, s in taken], [("codex", 70)])   # grok is not enabled here
         self.assertEqual(accepted, ["sync:mac"])
 
+    def test_gemini_from_a_device_signed_in_to_another_account_is_not_taken(self):
+        def gemini(at, account):
+            return QuotaSnapshot("gemini", "Gemini", 10080, 10.0, 90.0, 9000, at, False, None, account=account)
+        current = {"gemini": gemini(1000.0, "mine")}
+        payloads = {"mac": record({"snapshots": {"gemini": gemini(1200.0, "other").to_dict()}})}
+        self.assertEqual(sync_hub.merge_snapshots(payloads, "me", dict(current), lambda *a: True), [])
+        payloads = {"mac": record({"snapshots": {"gemini": gemini(1200.0, None).to_dict()}})}   # an older build
+        taken = sync_hub.merge_snapshots(payloads, "me", dict(current), lambda *a: True)
+        self.assertEqual([(p, s.account) for p, s in taken], [("gemini", "mine")])
+        payloads = {"mac": record({"snapshots": {"gemini": gemini(1300.0, "mine").to_dict()}})}
+        self.assertEqual(len(sync_hub.merge_snapshots(payloads, "me", dict(current), lambda *a: True)), 1)
+
     def test_a_reading_passed_on_does_not_come_back(self):
         mine = reading(at=3000)
         payloads = {"mac": record({"snapshots": {"codex": mine.to_dict()}})}

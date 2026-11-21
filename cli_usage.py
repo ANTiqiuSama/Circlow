@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import ctypes
+import hashlib
 import os
 import re
 import signal
@@ -9,6 +10,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 try:
@@ -407,10 +409,47 @@ def parse_agy_usage_json(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# agy writes a log for every run (cli-YYYYMMDD_HHMMSS.log, local start time)
+# naming the Google account it signed in with; /usage itself does not say.
+AGY_LOG_DIR = Path.home() / ".gemini" / "antigravity-cli" / "log"
+AGY_ACCOUNT_RE = re.compile(r"applyAuthResult: email=([^,\s]+)")
+
+
+def account_key(email: str) -> str:
+    """A short stable fingerprint of an account, so the address itself is
+    never stored or synced."""
+    return hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:12]
+
+
+def agy_account(started: float, finished: float, log_dir: Path | str | None = None) -> str | None:
+    """The account (account_key) an `agy --print /usage` run between
+    `started` and `finished` used, from that run's log. None when no log of
+    a /usage run begun then names one, or the ones found disagree."""
+    folder = Path(log_dir) if log_dir is not None else AGY_LOG_DIR
+    first, last = ("cli-" + time.strftime("%Y%m%d_%H%M%S", time.localtime(moment)) for moment in (started - 2, finished + 1))
+    try:
+        names = [entry.name for entry in os.scandir(folder)
+                 if entry.name.startswith("cli-") and entry.name.endswith(".log") and first <= entry.name[:19] <= last]
+    except OSError:
+        return None
+    found = set()
+    for name in names:
+        try:
+            with open(folder / name, encoding="utf-8", errors="replace") as handle:
+                text = handle.read(1_000_000)
+        except OSError:
+            continue
+        match = AGY_ACCOUNT_RE.search(text)
+        if match and "running slash command /usage" in text:
+            found.add(account_key(match.group(1)))
+    return found.pop() if len(found) == 1 else None
+
+
 def run_agy_usage(executable: str, timeout: float = 10.0) -> dict[str, Any]:
     env = os.environ.copy()
     env["AGY_DISABLE_AUTO_UPDATE"] = "1"
     import process_jail
+    started = time.time()
     process = process_jail.run(
         [executable, "--print", "/usage", "--output-format", "json"],
         stdin=subprocess.DEVNULL,
@@ -428,7 +467,9 @@ def run_agy_usage(executable: str, timeout: float = 10.0) -> dict[str, Any]:
     payload = json.loads(process.stdout)
     if payload.get("status") != "SUCCESS":
         raise RuntimeError(str(payload.get("response") or "agy /usage 未成功"))
-    return parse_agy_usage_json(payload)
+    parsed = parse_agy_usage_json(payload)
+    parsed["account"] = agy_account(started, time.time())
+    return parsed
 
 
 # ----- Claude Code ---------------------------------------------------------------

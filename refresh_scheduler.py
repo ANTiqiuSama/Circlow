@@ -46,6 +46,9 @@ GIVE_UP_AFTER = 3            # consecutive failures before GIVE_UP applies
 DURATION_GAP = 2             # a read that took 20 s waits at least 40 s before the next
 HOVER_REPEAT = 3             # pointer out and back within this many seconds: the same look
 HELD_RECHECK = 10            # a reading set aside as doubtful is checked again this soon
+# Sources whose set-aside readings are checked that soon. Gemini's (another
+# agy account) only change when the login swaps back, so it keeps its pace.
+HELD_SOON = frozenset({"claude"})
 # Errors meaning "this account has no such quota": retrying cannot help.
 NO_PLAN_MARKERS = ("未找到订阅额度", "API Key 计费", "未找到 Claude Code", "未登录", "not logged in", "no subscription")
 
@@ -197,8 +200,9 @@ class RefreshScheduler:
                 # A doubtful reading set aside is not a failure: no backoff and
                 # never the long "no quota" pause; check again shortly.
                 interval, reason = self._tier(provider, now)
-                self.due[provider] = now + min(interval, HELD_RECHECK)
-                self.reason[provider] = "核对读数"
+                soon = provider in HELD_SOON
+                self.due[provider] = now + (min(interval, HELD_RECHECK) if soon else interval)
+                self.reason[provider] = "核对读数" if soon else reason
             elif error:
                 self.failures[provider] += 1
                 delay = min(RETRY[min(self.failures[provider], len(RETRY)) - 1], IDLE[provider])

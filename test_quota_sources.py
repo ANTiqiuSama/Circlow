@@ -176,6 +176,69 @@ class QuotaTests(unittest.TestCase):
         weekly = read([{"name": "Gemini Models", "buckets": [{"id": "gemini-weekly", "remaining_fraction": .8}]}])
         self.assertIn("每周", weekly.label)
 
+    def test_agy_account_comes_from_the_log_of_that_usage_run(self):
+        started = datetime(2026, 11, 21, 0, 22, 4).timestamp()
+        usage = "I1121 applyAuthResult: email={}, authMethod=consumer\nI1121 Print mode: running slash command /usage\n"
+        with tempfile.TemporaryDirectory() as folder:
+            def log(name, text):
+                Path(folder, name).write_text(text, encoding="utf-8")
+            log("cli-20261121_002204.log", usage.format("Second@Example.com"))      # this run
+            log("cli-20261121_002205.log", "I1121 applyAuthResult: email=main@example.com\n")   # a session, no /usage
+            log("cli-20261121_000011.log", usage.format("main@example.com"))         # an earlier run
+            log("cli-20261121_003000.log", usage.format("main@example.com"))         # a later one
+            log("cli.log", usage.format("main@example.com"))
+            self.assertEqual(cli_usage.agy_account(started, started + 3, folder), cli_usage.account_key("second@example.com"))
+            log("cli-20261121_002206.log", usage.format("main@example.com"))         # two runs disagree
+            self.assertIsNone(cli_usage.agy_account(started, started + 3, folder))
+            self.assertIsNone(cli_usage.agy_account(started + 600, started + 603, folder))
+            self.assertIsNone(cli_usage.agy_account(started, started + 3, Path(folder, "missing")))
+        self.assertNotIn("example", cli_usage.account_key("main@example.com"))
+
+    def test_gemini_keeps_its_account_while_agy_swaps_logins(self):
+        hold = quota_sources.GEMINI_ACCOUNT_HOLD_SECONDS
+        def read(left, at, account):
+            pools = [{"key": "argon", "label": "Argon", "remaining_percent": left, "used_percent": 100 - left}]
+            return quota_sources.QuotaSnapshot("gemini", "Gemini · Argon", 10080, 100 - left, left, 5000, at,
+                                               False, None, pools=pools, account=account)
+        mine = read(47.0, 1000.0, "mine")
+        other = quota_sources.keep_last_good(read(100.0, 1600.0, "other"), mine)    # the other login, 10 min on
+        self.assertEqual((other.remaining_percent, other.updated_at, other.account), (47.0, 1000.0, "mine"))
+        self.assertTrue(other.stale and other.held)
+        self.assertEqual(other.error, quota_sources.GEMINI_OTHER_ACCOUNT)
+        self.assertEqual(other.pools, mine.pools)
+        again = quota_sources.keep_last_good(read(100.0, 3000.0, "other"), other)    # still set aside
+        self.assertEqual((again.remaining_percent, again.updated_at), (47.0, 1000.0))
+        back = quota_sources.keep_last_good(read(45.0, 3600.0, "mine"), again)       # the login swapped back
+        self.assertEqual((back.remaining_percent, back.stale, back.error), (45.0, False, None))
+        moved = quota_sources.keep_last_good(read(100.0, 3600.0 + hold, "other"), back)
+        self.assertEqual((moved.remaining_percent, moved.account), (100.0, "other"))  # a real switch is followed
+        unknown = quota_sources.keep_last_good(read(44.0, 3700.0, None), back)
+        self.assertEqual((unknown.remaining_percent, unknown.account), (44.0, "mine"))
+        failed = quota_sources.keep_last_good(quota_sources.placeholder("gemini", "读取失败：TimeoutExpired"), back)
+        self.assertEqual((failed.remaining_percent, failed.stale, failed.held, failed.account), (45.0, True, False, "mine"))
+        self.assertIn("Timeout", failed.error)
+        first = quota_sources.keep_last_good(read(100.0, 1600.0, "other"), read(47.0, 1000.0, None))
+        self.assertEqual(first.account, "other")                                       # no account known yet
+
+    def test_gemini_reading_for_another_account_keeps_the_usual_pace(self):
+        from refresh_scheduler import RefreshScheduler
+        held = quota_sources.QuotaSnapshot("gemini", "Gemini", 10080, 53, 47, 5000, 100, True,
+                                           quota_sources.GEMINI_OTHER_ACCOUNT, held=True, account="mine")
+        scheduler, plain = RefreshScheduler(("gemini",), 0), RefreshScheduler(("gemini",), 0)
+        fine = quota_sources.QuotaSnapshot("gemini", "Gemini", 10080, 53, 47, 5000, 100, False, None)
+        for moment in (100, 200, 300):
+            for each, snapshot in ((scheduler, held), (plain, fine)):
+                each.take_due(moment)
+                each.completed("gemini", snapshot, moment)
+            self.assertEqual(scheduler.due["gemini"], plain.due["gemini"])
+            self.assertEqual(scheduler.failures["gemini"], 0)
+
+    def test_cached_gemini_account_survives_a_restart(self):
+        snapshot = quota_sources.QuotaSnapshot("gemini", "Gemini", 10080, 53, 47, 5000, 100.0, False, None, account="mine")
+        with tempfile.TemporaryDirectory() as folder, patch.object(quota_sources, "CACHE_PATH", Path(folder, "state.json")):
+            quota_sources.save_cached_snapshots({"gemini": snapshot})
+            self.assertEqual(quota_sources.load_cached_snapshots()["gemini"].account, "mine")
+
     def sample(self, remaining=40.0, stale=False, error=None):
         return quota_sources.QuotaSnapshot(
             "sample", "Sample", 300, 100 - remaining, remaining, int(time.time()) + 100,
