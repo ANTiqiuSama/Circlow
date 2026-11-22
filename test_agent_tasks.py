@@ -447,6 +447,8 @@ class SceneTests(unittest.TestCase):
         counted = replace(model, today_tokens=1.04e9)
         self.assertEqual(counted.tokens_text, "1.04B")
         self.assertEqual(replace(model, today_tokens=987_654).tokens_text, "988K")
+        self.assertEqual(replace(counted, today_cost=97.31).tokens_text, "1.04B · $97.3")       # list-price dollars
+        self.assertEqual(replace(counted, today_cost=0.0).tokens_text, "1.04B")
         # The cached header follows the shown figure, not every token.
         self.assertEqual(counted.header, replace(model, today_tokens=1.0401e9).header)
         self.assertNotEqual(counted.header, replace(model, today_tokens=1.06e9).header)

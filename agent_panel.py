@@ -12,6 +12,7 @@ anywhere; hover_details feeds it the pointer and presents its frames.
 from __future__ import annotations
 
 import math
+import pricing
 import time
 import random
 from dataclasses import dataclass, field, replace
@@ -125,6 +126,7 @@ class PanelModel:
     hint_space: float | None = None             # the rows' height, when rebuilt from a cached header
     local_tps: float | None = None              # with multi-device sync: this device's own TPS, under the shared figure
     today_tokens: float | None = None           # tokens this device's agents of the source used today, left of the status pill
+    today_cost: float | None = None             # the same in US dollars at list prices (pricing), after the tokens
 
     def figure_of(self, slot: int) -> tuple[str, str] | None:
         return self.quota_figures[slot] if slot < len(self.quota_figures) else None
@@ -144,11 +146,14 @@ class PanelModel:
 
     @property
     def tokens_text(self) -> str:
-        """Today's tokens beside the status pill ("1.2B"); empty before any.
-        Rounded like the figures, so the cached header changes only with it."""
+        """Today's tokens and their dollars beside the status pill ("1.2B ·
+        $97.3"); empty before any. Rounded like the figures, so the cached
+        header changes only with them."""
         if not self.today_tokens or not math.isfinite(self.today_tokens) or self.today_tokens < 1:
             return ""
-        return "".join(compact_usage(self.today_tokens))
+        text = "".join(compact_usage(self.today_tokens))
+        usd = pricing.money(self.today_cost) if self.today_cost and math.isfinite(self.today_cost) else ""
+        return f"{text} · {usd}" if usd else text
 
     @property
     def tps_label(self) -> str:

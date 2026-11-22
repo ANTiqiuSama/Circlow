@@ -29,7 +29,7 @@ import providers
 import herdr_source
 import session_links
 from herdr_source import Herdr
-from usage_store import local_day
+from usage_store import ledger_counts, local_day, reply_cost
 from agent_tasks import AgentNotes, RECUR_SPREAD, clean as clean_request, read_schedules, tool_action
 
 
@@ -293,6 +293,7 @@ class TpsMonitor:
         # are not counted in added_total, so ledgers that already took them
         # (MiMo) do not take them again.
         self.store = store
+        self.ledger = None          # usage_ledger.UsageLedger (set by the tray): today's tokens from the logs
         if store is not None:
             for observation in store.restore(self.started_at):
                 self.seen.add(observation.identity)
@@ -1174,8 +1175,11 @@ class TpsMonitor:
                 # Every Antigravity reply (Gemini, Claude Opus or GPT pools alike) draws on
                 # the Gemini/Antigravity quota: its TPS, bubbles and colour belong there.
                 provider = "gemini"
+                # Usage #2 is the prompt's uncached part and #5 its cache hits
+                # (each turn's #5 is about the prompt before it).
                 self.add(Observation(identity, source, path.stem, provider, model, ended, output,
-                                     span[1] - span[0] if tps else None, basis, True, tps), now)
+                                     span[1] - span[0] if tps else None, basis, True, tps,
+                                     max(0, proto_int(usage, 2)), max(0, proto_int(usage, 5))), now)
                 if ended > now - 3:
                     self.activity[path.stem] = (provider, ended, "刚完成生成")
                 if conversation not in self.context or not self.context[conversation].get("model"):
@@ -1320,6 +1324,11 @@ class TpsMonitor:
         # Today's tokens per source (input, cache and output of every counted
         # reply since local midnight); unmatched bridge copies join below.
         midnight, today = today_start(now), dict.fromkeys(PROVIDER_NAMES, 0)
+        spent = dict.fromkeys(PROVIDER_NAMES, 0.0)          # the same replies in US dollars (pricing)
+        # Once the ledger has read the logs, the replies it counts come from
+        # it (complete, even for work done while Circlow was not running).
+        ledger = getattr(self, "ledger", None)
+        logged = ledger is not None and ledger.refreshed_at > 0
         for e in self.events:
             if e.ended_at >= cutoff:
                 window.append(e)
@@ -1328,8 +1337,13 @@ class TpsMonitor:
                 continue
             if e.source == native_source:
                 native.append(e)
-            if e.count_in_rate and e.ended_at >= midnight:
+            if e.count_in_rate and e.ended_at >= midnight and not (logged and ledger_counts(e)):
                 today[e.provider] = today.get(e.provider, 0) + reply_tokens(e)
+                spent[e.provider] = spent.get(e.provider, 0.0) + (reply_cost(e) or 0.0)
+        if logged:
+            for provider in today:
+                today[provider] += ledger.day(provider, int(midnight))
+                spent[provider] = spent.get(provider, 0.0) + ledger.cost(provider, int(midnight))
         sources: dict[str, set] = {}
         for (provider, source), newest in list(self.source_seen.items()):
             if newest < now - 86400:
@@ -1347,6 +1361,7 @@ class TpsMonitor:
                 sources.setdefault(copy.provider, set()).add(copy.source)
                 if copy.count_in_rate and copy.ended_at >= midnight:
                     today[copy.provider] = today.get(copy.provider, 0) + reply_tokens(copy)
+                    spent[copy.provider] = spent.get(copy.provider, 0.0) + (reply_cost(copy) or 0.0)
         providers = {}
         for provider, label in PROVIDER_NAMES.items():
             events = [e for e in window if e.provider == provider]
@@ -1382,7 +1397,7 @@ class TpsMonitor:
                 if held:
                     latest = max(held, key=lambda e: e.ended_at)
                     generation, basis_text = latest.native_tps, f"{latest.basis}；仍在工作，保留上次测得的速率"
-            providers[provider] = {"label": label, "active_sessions": active, "generation_tps": generation, "output_tps_60": round(output / 60, 2), "output_tokens_60": output, "generation_samples": len(samples), "basis": [basis_text] if latest else ["客户端暂未提供可核验TPS"], "models": sorted({e.model for e in samples}), "sources": sorted(sources.get(provider, ())), "last_sample_at": latest.ended_at if latest else None, "display_tps": generation, "display_model": latest.model if latest else None, "display_basis": basis_text if latest else "客户端暂未取得TPS", "today_tokens": today.get(provider, 0)}
+            providers[provider] = {"label": label, "active_sessions": active, "generation_tps": generation, "output_tps_60": round(output / 60, 2), "output_tokens_60": output, "generation_samples": len(samples), "basis": [basis_text] if latest else ["客户端暂未提供可核验TPS"], "models": sorted({e.model for e in samples}), "sources": sorted(sources.get(provider, ())), "last_sample_at": latest.ended_at if latest else None, "display_tps": generation, "display_model": latest.model if latest else None, "display_basis": basis_text if latest else "客户端暂未取得TPS", "today_tokens": today.get(provider, 0), "today_cost": round(spent.get(provider, 0.0), 4)}
         return {"generated_at": now, "window_seconds": 60, "providers": providers, "total_output_tps_60": round(sum(p["output_tokens_60"] for p in providers.values()) / 60, 2), "software": self.software, "source_health": self.health, "measurement_note": "Grok直读CLI原生TPS；Codex使用客户端真实输出token数÷首个输出项至计数完成的流式时间，含思考及工具调用输出，完成时结算。使用时显示最近完成的TPS，缺少完整计数时保留额度；不使用字符数或近似分词器。60秒输出速率为已报告输出数之和÷60，不计输入/缓存，不重复加思考token。"}
 
 

@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from forecast import Sample
@@ -13,8 +14,20 @@ import usage_store
 from usage_store import UsageStore, insights, local_day
 
 
-def reply(identity, ended, tokens, provider="codex", counted=True):
-    return Observation(identity, "Codex", "s1", provider, "gpt-5", ended, tokens, 4.0, "测试", counted, 50.0, 10, 5)
+def reply(identity, ended, tokens, provider="codex", counted=True, source="Codex"):
+    return Observation(identity, source, "s1", provider, "gpt-5", ended, tokens, 4.0, "测试", counted, 50.0, 10, 5)
+
+
+class Ledger:
+    """usage_ledger.UsageLedger's answers, for days it read."""
+    def __init__(self, totals, first):
+        self.totals, self.first, self.refreshed_at = totals, first, 1.0
+
+    def day(self, provider, midnight):
+        return self.totals.get(provider, {}).get(midnight, 0)
+
+    def covers(self, midnight, now):
+        return midnight >= self.first
 
 
 class UsageStoreTests(unittest.TestCase):
@@ -27,31 +40,54 @@ class UsageStoreTests(unittest.TestCase):
 
     def test_daily_totals_count_every_token_and_survive_a_restart(self):
         noon = local_day(time.time()) + 12 * 3600
+        today, yesterday = local_day(noon), local_day(noon - 86400)
         store = UsageStore(self.path)
-        store.days_since = local_day(noon - 86400)             # yesterday's totals were recorded in full
-        store.note(reply("a", noon - 60, 100))                   # 100 output + 10 input + 5 cache
-        store.note(reply("b", noon - 86400, 40, "claude"))       # yesterday
-        store.note(reply("c", noon - 30, 999, counted=False))    # a copy the rate leaves out
+        store.days_since = yesterday                             # yesterday's totals were recorded in full
+        store.note(reply("a", noon - 60, 100, "gemini", source="Antigravity CLI"))   # 100 output + 10 input + 5 cache
+        store.note(reply("b", noon - 86400, 40, "gemini", source="Antigravity CLI"))  # yesterday
+        store.note(reply("c", noon - 30, 999, "gemini", counted=False, source="Antigravity CLI"))  # left out of the rate
+        store.note(reply("d", noon - 20, 500))                   # Codex: the ledger reads it from the logs
         self.assertTrue(store.save(noon, force=True))
-        rows = UsageStore(self.path).daily(("codex", "claude"), noon, 3)
-        self.assertEqual([len(rows), rows[-1][1], rows[-2][1]], [3, {"codex": 115, "claude": 0}, {"codex": 0, "claude": 55}])
-        self.assertEqual([complete for _start, _tokens, complete in rows], [False, True, True])
-        self.assertEqual(rows[-1][0], local_day(noon))
+        ledger = Ledger({"codex": {today: 7000, yesterday: 3000}, "gemini": {today: 1}}, yesterday)
+        rows = UsageStore(self.path).daily(("codex", "gemini"), noon, 3, ledger)
+        self.assertEqual([len(rows), rows[-1][1], rows[-2][1]], [3, {"codex": 7000, "gemini": 116}, {"codex": 3000, "gemini": 55}])
+        self.assertEqual([complete for _start, _tokens, complete in rows], [True, True, True])   # no output stands in anywhere
+        self.assertEqual(rows[-1][0], today)
+        plain = UsageStore(self.path).daily(("codex", "gemini"), noon, 3)          # the logs not read yet
+        self.assertEqual(plain[-1], (today, {"codex": 500, "gemini": 115}, False))
 
     def test_daily_falls_back_to_output_before_the_totals_began(self):
         noon = local_day(time.time()) + 12 * 3600
+        old = local_day(noon - 3 * 86400)
         store = UsageStore(self.path)
-        store.note(reply("old", noon - 3 * 86400, 70))
+        store.note(reply("old", noon - 3 * 86400, 70, "gemini", source="Antigravity CLI"))
+        store.note(reply("older", noon - 3 * 86400, 30))
         store.save(noon, force=True)
         payload = json.loads(gzip.decompress(self.path.read_bytes()))
-        del payload["days"], payload["days_since"]                 # a file saved before the daily totals
+        del payload["other_days"], payload["other_since"]          # a file saved before these totals
+        payload["days"] = {"claude": {str(old): 999}}                 # the old totals, which held the ledger's share too
         self.path.write_bytes(gzip.compress(json.dumps(payload).encode()))
         reopened = UsageStore(self.path)
-        rows = reopened.daily(("codex",), noon, 4)
-        self.assertEqual(rows[0], (local_day(noon - 3 * 86400), {"codex": 70}, False))   # output only
+        rows = reopened.daily(("codex", "gemini"), noon, 4, Ledger({"codex": {old: 900}}, old))
+        self.assertEqual(rows[0], (old, {"codex": 900, "gemini": 70}, False))   # Gemini's output only that day
         self.assertEqual(reopened.days_since, local_day(time.time()))
+        rows = reopened.daily(("codex",), noon, 4)
+        self.assertEqual(rows[0], (old, {"codex": 30}, False))
         caption = view.daily_totals(rows)
-        self.assertEqual([c for c, _v, _w in caption], ["今日", "昨日 · 仅输出", "近 7 天 · 部分仅输出"])
+        self.assertEqual([c for c, _v, _w in caption], ["今日", "昨日", "近 7 天 · 部分仅输出"])
+        self.assertEqual(view.daily_spend([{"codex": 1.0}, {"codex": 2.0}, {"codex": 0.5, "gemini": 0.25}]), (0.75, 2.0, 3.75))
+        image = view.daily_chart(rows, {"codex": "C"}, 1, costs=[{"codex": 1.0}] * len(rows), hover=0)
+        self.assertEqual(image.size, (652, 190))
+
+    def test_the_ledger_counts_claude_codex_and_grok_from_their_logs(self):
+        self.assertTrue(usage_store.ledger_counts(reply("a", 0, 1)))
+        self.assertTrue(usage_store.ledger_counts(reply("a", 0, 1, "claude", source="Claude Code")))
+        self.assertTrue(usage_store.ledger_counts(reply("a", 0, 1, "mimo", source="Claude Code")))
+        self.assertTrue(usage_store.ledger_counts(reply("a", 0, 1, "grok", source="Grok CLI")))
+        self.assertFalse(usage_store.ledger_counts(reply("a", 0, 1, "gemini")))                    # Gemini through Codex
+        self.assertFalse(usage_store.ledger_counts(reply("a", 0, 1, "gemini", source="Codex · Gemini桥接回传")))
+        self.assertFalse(usage_store.ledger_counts(reply("a", 0, 1, "gemini", source="Antigravity CLI")))
+        self.assertFalse(usage_store.ledger_counts(reply("a", 0, 1, "mimo", source="MiMo Code")))
 
     def test_daily_board_draws_and_picks_a_day(self):
         noon = local_day(time.time()) + 12 * 3600
@@ -133,7 +169,9 @@ class UsageStoreTests(unittest.TestCase):
         samples = [Sample(day + 14 * 3600, 10.0, 99), Sample(day + 15 * 3600 + 120, 25.0, 99),
                    Sample(day + 15 * 3600 + 600, 5.0, 77)]           # a reset: not counted as use
         lines = insights(store, "codex", now, samples, "5 小时额度")
-        self.assertEqual(lines[0], "今天：15K tokens · 2 次回复")
+        self.assertEqual(lines[0], "今天：输出 15K tokens · 2 次回复")
+        priced = insights(store, "codex", now, samples, "5 小时额度", day_total=(205_600_000, 97.3))
+        self.assertEqual(priced[0], "今天：205.6M tokens（输出 15K） · 约 $97.3 · 2 次回复")
         self.assertEqual(lines[1], "比昨天此时：+50%（昨天全天 16K）")
         self.assertEqual(lines[2], "近 7 天日均：10.9K tokens（7 天有输出）")
         self.assertEqual(lines[3], "最忙时段：14:00–16:00")
@@ -298,6 +336,168 @@ class UsageStoreTests(unittest.TestCase):
         self.assertFalse(any(line.startswith("周额度") for line in insights(store, "grok", now, weekly=week_of(88))))
         self.assertTrue(insights(UsageStore(self.folder / "empty.json.gz"), "grok", now, weekly=week_of(62))[0]
                         .startswith("周额度"))                                               # even before any output record
+
+
+class PricingTests(unittest.TestCase):
+    """pricing: LiteLLM's token prices, the way ccusage applies them."""
+
+    TABLE = {
+        "claude-opus-5-5": {"input_cost_per_token": 4e-06, "output_cost_per_token": 2e-05, "cache_creation_input_token_cost": 5e-06,
+                            "cache_read_input_token_cost": 2e-07, "cache_creation_input_token_cost_above_1hr": 8e-06,
+                            "max_tokens": 128000, "litellm_provider": "anthropic"},
+        "azure/gpt-6.1-sol": {"input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05, "cache_read_input_token_cost": 1e-07,
+                              "input_cost_per_token_above_272k_tokens": 4e-06, "output_cost_per_token_above_272k_tokens": 1.5e-05,
+                              "cache_read_input_token_cost_above_272k_tokens": 2e-07, "input_cost_per_token_above_272k_tokens_flex": 9.0},
+        "xai/grok-4.7": {"input_cost_per_token": 2e-06, "output_cost_per_token": 6e-06},
+        "gemini/gemini-4-argon": {"input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05, "cache_read_input_token_cost": 1e-07},
+        "sample_spec": {"mode": "chat"},
+    }
+
+    def table(self):
+        import pricing
+        return pricing.PriceTable(pricing.slim(self.TABLE))
+
+    def test_replies_are_priced_part_by_part(self):
+        table = self.table()
+        self.assertNotIn("max_tokens", table.price("claude-opus-5-5"))                     # only token prices are kept
+        self.assertAlmostEqual(table.cost("claude-opus-5-5", 5, 1000, 100, 10_000, 50),
+                               5 * 4e-06 + 1000 * 2e-05 + 100 * 5e-06 + 10_000 * 2e-07 + 50 * 8e-06)
+        self.assertAlmostEqual(table.cost("gpt-6.1-sol", 1000, 100, 0, 9000), 1000 * 2e-06 + 100 * 1e-05 + 9000 * 1e-07)
+        long = table.cost("gpt-6.1-sol", 100_000, 100, 0, 200_000)                        # a 300K prompt: the long tier
+        self.assertAlmostEqual(long, 100_000 * 4e-06 + 100 * 1.5e-05 + 200_000 * 2e-07)
+        self.assertAlmostEqual(table.cost("grok-4.7-build", 10, 10), 10 * 2e-06 + 10 * 6e-06)   # a trailing part dropped
+        self.assertAlmostEqual(table.cost("gemini-4-argon", 0, 0, 100, 0), 100 * 2e-06)   # no write price: the input one
+        self.assertIsNone(table.cost("mimo-v2.6-pro", 10, 10))
+        self.assertIsNone(table.price("claude-opus"))                                       # a family name is too loose
+
+    def test_the_table_is_downloaded_once_a_day_and_kept_on_disk(self):
+        import pricing
+        folder = Path(tempfile.mkdtemp())
+        try:
+            path = folder / "model_prices.json"
+            big = {f"model-{index}": {"input_cost_per_token": 1e-06} for index in range(150)}
+            big.update(self.TABLE)
+            table = pricing.PriceTable()
+            calls = []
+            fetch = lambda url: calls.append(url) or json.dumps(big).encode()          # noqa: E731
+            self.assertTrue(table.refresh(1000.0, path, fetch))
+            self.assertFalse(table.refresh(2000.0, path, fetch))                         # within the day
+            self.assertEqual(len(calls), 1)
+            again = pricing.PriceTable()
+            again.load(path)
+            self.assertAlmostEqual(again.cost("claude-opus-5-5", 0, 1000), 0.02)
+            broken = pricing.PriceTable()
+            self.assertFalse(broken.refresh(1000.0, folder / "other.json", lambda url: b"{}"))   # too small: refused
+            self.assertFalse(broken)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+        self.assertEqual([pricing.money(v) for v in (0, 0.4234, 12.34, 123.4, 12_345)], ["", "$0.42", "$12.3", "$123", "$12.3K"])
+
+
+class UsageLedgerTests(unittest.TestCase):
+    """usage_ledger counts the logs the way ccusage does."""
+
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp())
+        self.claude, self.codex, self.grok = self.folder / "claude", self.folder / "codex", self.folder / "grok"
+        self.noon = local_day(time.time()) + 12 * 3600
+
+    def tearDown(self):
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def stamp(self, seconds_before_noon=0.0):
+        return datetime.fromtimestamp(self.noon - seconds_before_noon, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def write(self, path, records, mode="w"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, mode, encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def ledger(self):
+        import usage_ledger
+        return usage_ledger.UsageLedger([self.claude], [self.codex], self.grok)
+
+    def claude_reply(self, mid, request, output, *, side=False, model="claude-opus-5-5", before=60.0, read=1000):
+        usage = {"input_tokens": 5, "output_tokens": output, "cache_creation_input_tokens": 100, "cache_read_input_tokens": read}
+        return {"type": "assistant", "timestamp": self.stamp(before), "requestId": request, "isSidechain": side,
+                "sessionId": "s", "message": {"id": mid, "model": model, "usage": usage}}
+
+    def test_claude_replies_count_once_with_every_token(self):
+        today, yesterday = local_day(self.noon), local_day(self.noon - 86400)
+        session = self.claude / "proj" / "s1.jsonl"
+        self.write(session, [self.claude_reply("m1", "r1", 10), self.claude_reply("m1", "r1", 40),     # two blocks of one reply
+                             {"type": "user", "timestamp": self.stamp(50), "message": {"content": "hi"}},
+                             self.claude_reply("m2", "r2", 1, model="mimo-v2.6-pro", read=0),
+                             self.claude_reply("m3", "r3", 7, before=86400)])                         # yesterday
+        self.write(self.claude / "proj" / "s2.jsonl", [self.claude_reply("m1", "r1", 40)])           # a resumed copy
+        self.write(self.claude / "proj" / "s1" / "subagents" / "agent-a.jsonl",
+                   [self.claude_reply("m1", "r1", 45, side=True), self.claude_reply("m4", "r4", 3, side=True)])
+        ledger = self.ledger()
+        ledger.refresh(self.noon)
+        # m1 once (the main copy, 5 + 40 + 100 + 1000), m4 from the sub-agent; m2 routed to MiMo
+        self.assertEqual(ledger.day("claude", today), 1145 + 1108)
+        self.assertEqual(ledger.day("mimo", today), 106)
+        self.assertEqual(ledger.day("claude", yesterday), 1112)
+        self.assertTrue(ledger.covers(yesterday, self.noon))
+        self.assertFalse(ledger.covers(local_day(self.noon - 20 * 86400), self.noon))
+        self.write(session, [self.claude_reply("m5", "r5", 2)], mode="a")                            # the session goes on
+        ledger.refresh(self.noon)
+        self.assertEqual(ledger.day("claude", today), 1145 + 1108 + 1107)
+        self.assertGreater(ledger.files[session].offset, 0)
+
+    def test_codex_token_counts_take_each_reply_once(self):
+        today = local_day(self.noon)
+        def count(before, total, last=None):
+            info = {"total_token_usage": {"input_tokens": total, "cached_input_tokens": total // 2, "output_tokens": 0,
+                                          "total_tokens": total}}
+            if last is not None:
+                info["last_token_usage"] = {"input_tokens": last, "output_tokens": 0, "total_tokens": last}
+            return {"type": "event_msg", "timestamp": self.stamp(before), "payload": {"type": "token_count", "info": info}}
+        context = {"type": "turn_context", "timestamp": self.stamp(300), "payload": {"model": "gpt-6.2-astra"}}
+        rollout = self.codex / "sessions" / "2026" / "11" / "22" / "rollout-a.jsonl"
+        self.write(rollout, [context, count(200, 1000, 1000), count(190, 1000, 1000),   # repeated: nothing new
+                             count(100, 1600, 600), count(90, 1800)])                   # no last usage: the difference
+        fork = self.codex / "sessions" / "2026" / "11" / "22" / "rollout-b.jsonl"
+        self.write(fork, [context, count(200, 1000, 1000), count(100, 1600, 600),       # the parent's events replayed
+                          {"type": "turn_context", "timestamp": self.stamp(80), "payload": {"model": "gemini-4-argon"}},
+                          count(50, 1700, 100)])                                         # Gemini: the Antigravity side counts it
+        ledger = self.ledger()
+        ledger.refresh(self.noon)
+        self.assertEqual(ledger.day("codex", today), 1000 + 600 + 200)
+        self.assertEqual(ledger.day("gemini", today), 0)
+
+    def test_grok_turns_count_on_their_own_day(self):
+        today, yesterday = local_day(self.noon), local_day(self.noon - 86400)
+        usage = {"sessionId": "g1", "turns": [
+            {"turnNumber": 1, "endedAt": self.stamp(86400), "totalTokens": 900, "modelUsage": {"grok-4.7-build": {"totalTokens": 900}}},
+            {"turnNumber": 2, "endedAt": self.stamp(60), "inputTokens": 300, "outputTokens": 20, "primaryModelId": "grok-4.7"}]}
+        path = self.grok / "sessions" / "home" / "g1" / "usage.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(usage), encoding="utf-8")
+        ledger = self.ledger()
+        ledger.refresh(self.noon)
+        self.assertEqual((ledger.day("grok", yesterday), ledger.day("grok", today)), (900, 320))
+
+    def test_each_day_is_priced_with_grok_at_its_own_cost(self):
+        import pricing
+        from unittest.mock import patch
+        today = local_day(self.noon)
+        self.write(self.claude / "proj" / "s1.jsonl", [self.claude_reply("m1", "r1", 1000, read=10_000),
+                                                       self.claude_reply("m2", "r2", 10, model="mimo-v2.6-pro")])
+        usage = {"turns": [{"turnNumber": 1, "endedAt": self.stamp(60), "modelUsage": {
+            "grok-4.7-build": {"inputTokens": 1000, "outputTokens": 10, "cachedReadTokens": 400, "totalTokens": 1010,
+                               "costUsdTicks": 25_000_000_000}}}]}
+        path = self.grok / "sessions" / "home" / "g1" / "usage.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(usage), encoding="utf-8")
+        with patch.object(pricing, "TABLE", pricing.PriceTable(pricing.slim(PricingTests.TABLE))):
+            ledger = self.ledger()
+            ledger.refresh(self.noon)
+        self.assertAlmostEqual(ledger.cost("claude", today), 5 * 4e-06 + 1000 * 2e-05 + 100 * 5e-06 + 10_000 * 2e-07)
+        self.assertEqual(ledger.cost("grok", today), 2.5)                       # xAI's own figure, 1e-10 $ a tick
+        self.assertEqual(ledger.cost("mimo", today), 0.0)                       # no price: tokens only
+        self.assertEqual(ledger.unpriced["mimo"][today], 1115)
 
 
 if __name__ == "__main__":

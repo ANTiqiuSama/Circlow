@@ -67,6 +67,8 @@ from tray_icons import (  # noqa: F401  (re-exported for callers and tests)
     icon_windows, make_display_icon, make_provider_icon, make_tps_icon, pace_marker, quota_exhausted,
     stale_note, usable_again_at)
 from tps_sources import PERFORMANCE_PATH, TpsMonitor, performance_signature, save_performance
+import pricing
+import usage_ledger
 from usage_store import UsageStore, WeeklyLedger, insights as usage_insights
 
 
@@ -542,7 +544,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                                       quota_tones=tuple(tones), quota_figures=tuple(figures), column_iq=column_iq,
                                       hints=hints,
                                       local_tps=self.local_tps(provider, data),
-                                      today_tokens=data.get("today_tokens"))
+                                      today_tokens=data.get("today_tokens"), today_cost=data.get("today_cost"))
 
     def open_session(self, key: str) -> None:
         """A click on a bubble: open its session where the user can answer
@@ -672,8 +674,10 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
             weekly, remaining, resets_at = self.weekly_windows().get(provider, ((), None, None))
             ledger = getattr(self, "weekly", None)
             weeks = ledger.recent(weekly_series_name(snapshot) or "") if ledger is not None else []
+            live = ((getattr(self, "performance", None) or {}).get("providers") or {}).get(provider) or {}
             sections.append(("用量", usage_insights(usage, provider, time.time(), samples, f"{window}额度" if window else "",
-                                                   weekly, (remaining, resets_at), weeks)))
+                                                   weekly, (remaining, resets_at), weeks,
+                                                   (live.get("today_tokens") or 0, live.get("today_cost") or 0.0))))
 
         reads = [self.menu_updated(provider)]
         if self.scheduler:
@@ -1471,7 +1475,25 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         if reset_watch.ENABLED and "codex" in PROVIDERS:
             threading.Thread(target=self.reset_loop, name="codex-reset-watch", daemon=True).start()
         threading.Thread(target=self.iq_loop, name="model-iq", daemon=True).start()
+        threading.Thread(target=self.ledger_loop, name="usage-ledger", daemon=True).start()
         self.start_sync()
+
+    def ledger_loop(self) -> None:
+        """Daily tokens and their list-price dollars from the agents' own
+        logs (usage_ledger, pricing): read in full once, then only what
+        changed, every minute (every five on battery while nothing is looked at)."""
+        ledger = usage_ledger.UsageLedger.for_home()
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            pricing.TABLE.refresh()             # LiteLLM's prices, at most once a day
+            try:
+                ledger.refresh()
+            except Exception as error:          # a broken log must not stop the counting
+                log.info("usage ledger: %s", type(error).__name__)
+            if self.tps_monitor.ledger is None:
+                self.tps_monitor.ledger = self.usage_ledger = ledger
+                log.info("usage ledger: read %d logs in %.1fs", len(ledger.files), time.monotonic() - started)
+            self.stop_event.wait(usage_ledger.REFRESH_SECONDS * (5 if self.saving(time.time()) else 1))
 
     def run(self) -> None:
         self.start_workers()

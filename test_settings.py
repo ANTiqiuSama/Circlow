@@ -516,8 +516,8 @@ class DailyBoardTests(unittest.TestCase):
         from usage_store import local_day
         noon = local_day(time.time()) + 12 * 3600
         day = local_day(noon)
-        store = SimpleNamespace(daily=lambda keys, now, count: [(day - 86400, {k: 7 for k in keys}, False),
-                                                                (day, {k: 1 for k in keys}, True)])
+        store = SimpleNamespace(daily=lambda keys, now, count, ledger=None: [(day - 86400, {k: 7 for k in keys}, False),
+                                                                             (day, {k: 1 for k in keys}, True)])
         app = SimpleNamespace(snapshots={"codex": None, "claude": None}, usage=store,
                               performance={"providers": {"codex": {"today_tokens": 1_200_000}, "claude": {}}})
         letters, rows = settings_window.SettingsWindow.daily_rows(SimpleNamespace(app=app), noon)

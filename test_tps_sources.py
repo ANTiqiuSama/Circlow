@@ -6,6 +6,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tps_sources import JsonlReader, Observation, TpsMonitor, key, logged_model, proto_fields
@@ -164,8 +165,18 @@ class TpsTests(unittest.TestCase):
         self.assertEqual(providers["claude"]["today_tokens"], 50)
         self.assertEqual(providers["grok"]["today_tokens"], 0)
         self.assertEqual(providers["gemini"]["today_tokens"], 210 + 30)    # the matched copy once, the lone copy kept
+        # Once usage_ledger has read the logs, Claude Code, Codex and Grok CLI
+        # come from it; Antigravity and the bridge copies still from here.
+        days = {"codex": {local_day(noon): 5_000_000}, "claude": {local_day(noon): 70_000_000}, "gemini": {local_day(noon): 0}}
+        self.monitor.ledger = SimpleNamespace(refreshed_at=1.0, day=lambda provider, midnight: days.get(provider, {}).get(midnight, 0),
+                                              cost=lambda provider, midnight: 12.5 if provider == "claude" else 0.0)
+        providers = self.monitor.snapshot(noon)["providers"]
+        self.assertEqual([providers[name]["today_tokens"] for name in ("codex", "claude", "gemini")], [5_000_000, 70_000_000, 240])
+        self.assertEqual(providers["claude"]["today_cost"], 12.5)
+        self.monitor.ledger.refreshed_at = 0.0                              # not read yet: the replies seen here
+        self.assertEqual(self.monitor.snapshot(noon)["providers"]["codex"]["today_tokens"], 10100)
 
-    def make_agy_db(self, corrupt_total=False, step_type=None, total=True):
+    def make_agy_db(self, corrupt_total=False, step_type=None, total=True, prompt=False):
         folder = self.home / ".gemini/antigravity-cli/conversations"
         folder.mkdir(parents=True)
         path = folder / "a.db"
@@ -176,6 +187,7 @@ class TpsTests(unittest.TestCase):
         else:
             db.execute("CREATE TABLE steps(idx INTEGER,step_type INTEGER,status INTEGER,metadata BLOB)")
         usage = (pv(3, 51 if corrupt_total else 50) if total else b"") + pv(9, 40) + pv(10, 10) + pb(11, b"response-a")
+        usage += pv(2, 300) + pv(5, 7000) if prompt else b""       # the prompt: uncached part, cache hits
         model = pb(4, usage) + pb(11, stamp(20)) + pb(12, stamp(2)) + pb(19, b"gemini-3.8-flash")
         db.execute("INSERT INTO gen_metadata VALUES(0,?)", (pb(1, model),))
         metadata = pb(1, stamp(self.now - 3)) + pb(7, stamp(self.now - 1)) + pb(9, pb(11, b"response-a"))
@@ -299,6 +311,14 @@ class TpsTests(unittest.TestCase):
         data = self.monitor.snapshot(self.now)["providers"]["gemini"]
         self.assertIsNone(data["generation_tps"])
         self.assertEqual(data["output_tokens_60"], 50)
+        self.assertEqual((self.monitor.events[-1].input_tokens, self.monitor.events[-1].cached_tokens), (0, 0))
+
+    def test_antigravity_counts_the_prompt_and_its_cache_hits(self):
+        self.make_agy_db(prompt=True)
+        self.monitor._antigravity(self.now)
+        reply = self.monitor.events[-1]
+        self.assertEqual((reply.output_tokens, reply.input_tokens, reply.cached_tokens), (50, 300, 7000))
+        self.assertEqual(self.monitor.snapshot(self.now)["providers"]["gemini"]["output_tokens_60"], 50)
 
     def test_client_native_tps_is_copied_exactly_and_latest_value_wins(self):
         self.monitor.add(Observation("native-1", "Grok CLI 原生统计", "g", "grok", "grok", self.now - 2, 200, None, "原生", False, 110.4), self.now)
