@@ -228,6 +228,47 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.take_due(100), ["codex", "grok"])
         self.assertEqual(scheduler.take_due(100), [])  # Already running.
 
+    def test_unchanged_gemini_readings_slow_the_idle_reads_until_something_moves(self):
+        import refresh_scheduler
+        quiet, after = refresh_scheduler.QUIET["gemini"], refresh_scheduler.QUIET_AFTER
+        self.assertGreater(quiet, IDLE["gemini"])
+        self.assertIsNone(refresh_scheduler.QUIET["codex"])
+        scheduler = RefreshScheduler(("gemini",), 0)
+
+        def read(now, left=99.9, pool=99.9):
+            scheduler.take_due(now)
+            scheduler.completed("gemini", SimpleNamespace(error=None, resets_at=None, secondary_resets_at=None,
+                                                          remaining_percent=left, pools=[{"key": "argon", "remaining_percent": pool}]), now)
+            return scheduler.due["gemini"] - now, scheduler.reason["gemini"]
+        for index in range(after):
+            self.assertEqual(read(index * 120), (IDLE["gemini"], "空闲"))
+        self.assertEqual(read(after * 120, left=99.94), (quiet, "读数未变"))      # the same to a tenth
+        self.assertEqual(read(2000, pool=80.0), (IDLE["gemini"], "空闲"))         # a pool moved: back at once
+        for index in range(after + 1):                                             # 80 -> 99.9, then repeats
+            read(3000 + index * 120)
+        self.assertEqual(scheduler.reason["gemini"], "读数未变")
+        self.assertTrue(scheduler.hover("gemini", True, 3500))                   # a look still reads now
+        self.assertEqual(scheduler.due["gemini"], 3500)
+        self.assertEqual(read(3500)[0], HOVER["gemini"])
+        scheduler.hover("gemini", False, 3505)
+        scheduler.activity("gemini", True, False, 3505)                          # at work: the active pace
+        self.assertEqual(read(3510), (ACTIVE["gemini"], "使用中"))
+
+    def test_quiet_and_battery_take_the_longer_wait(self):
+        import refresh_scheduler
+        quiet, saver = refresh_scheduler.QUIET["gemini"], refresh_scheduler.BATTERY_IDLE["gemini"]
+        scheduler = RefreshScheduler(("gemini",), 0)
+        snap = SimpleNamespace(error=None, resets_at=None, secondary_resets_at=None, remaining_percent=50.0)
+        for index in range(refresh_scheduler.QUIET_AFTER + 1):
+            scheduler.take_due(index * 120)
+            scheduler.completed("gemini", snap, index * 120)
+        scheduler.set_battery(True, 1000)
+        scheduler.take_due(1000)
+        scheduler.completed("gemini", snap, 1000)
+        self.assertEqual((scheduler.due["gemini"] - 1000, scheduler.reason["gemini"]), (max(quiet, saver), "省电"))
+        scheduler.set_battery(False, 1100)                    # mains again: the quiet pace, not the plain idle one
+        self.assertEqual((scheduler.due["gemini"], scheduler.reason["gemini"]), (1000 + min(quiet, saver), "读数未变"))
+
     def test_idle_providers_wait_long_and_grok_longest(self):
         scheduler = RefreshScheduler(("codex", "grok"), 0)
         scheduler.take_due(0)

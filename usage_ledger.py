@@ -64,18 +64,38 @@ def _claude_provider(model: str) -> str:
     return "claude" if provider == "other" else provider
 
 
-class UsageLedger:
-    def __init__(self, claude_dirs, codex_homes, grok_root: Path | None, days: int = LEDGER_DAYS):
-        self.claude_dirs = [Path(path) for path in dict.fromkeys(map(str, claude_dirs))]
-        self.codex_homes = [Path(path) for path in dict.fromkeys(map(str, codex_homes))]
-        self.grok_root = Path(grok_root) if grok_root else None
+class DayTotals:
+    """Tokens and dollars per source and local day, and the questions asked of them."""
+
+    def __init__(self, days: int = LEDGER_DAYS):
         self.days = days
-        self.files: dict[Path, _File] = {}
         self.lock = threading.Lock()
         self.totals: dict[str, dict[int, int]] = {}     # provider -> local midnight -> tokens
         self.costs: dict[str, dict[int, float]] = {}    # provider -> local midnight -> US dollars
-        self.unpriced: dict[str, dict[int, int]] = {}   # tokens of models without a price
         self.refreshed_at = 0.0
+
+    def day(self, provider: str, midnight: int) -> int:
+        with self.lock:
+            return self.totals.get(provider, {}).get(midnight, 0)
+
+    def cost(self, provider: str, midnight: int) -> float:
+        """The day's US dollars at list prices (pricing); unpriced models add nothing."""
+        with self.lock:
+            return self.costs.get(provider, {}).get(midnight, 0.0)
+
+    def covers(self, midnight: int, now: float) -> bool:
+        """Whether `midnight`'s day lies within what the logs were read for."""
+        return self.refreshed_at > 0 and midnight >= local_day(now) - (self.days - 1) * 86400
+
+
+class UsageLedger(DayTotals):
+    def __init__(self, claude_dirs, codex_homes, grok_root: Path | None, days: int = LEDGER_DAYS):
+        super().__init__(days)
+        self.claude_dirs = [Path(path) for path in dict.fromkeys(map(str, claude_dirs))]
+        self.codex_homes = [Path(path) for path in dict.fromkeys(map(str, codex_homes))]
+        self.grok_root = Path(grok_root) if grok_root else None
+        self.files: dict[Path, _File] = {}
+        self.unpriced: dict[str, dict[int, int]] = {}   # tokens of models without a price
         self.grok_swept = 0.0
 
     @classmethod
@@ -309,17 +329,49 @@ class UsageLedger:
         with self.lock:
             self.totals, self.costs, self.unpriced = totals, costs, unpriced
 
-    # ----- answers -----------------------------------------------------------
+    # ----- for another process ------------------------------------------------
 
-    def day(self, provider: str, midnight: int) -> int:
+    def save(self, path: Path | None = None) -> None:
+        """The day totals and dollars, numbers only, for another process: the
+        Mac settings window (SavedLedger) rather than reading every log again."""
+        path = path or saved_path()
         with self.lock:
-            return self.totals.get(provider, {}).get(midnight, 0)
+            data = {"refreshed_at": self.refreshed_at, "days": self.days,
+                    "totals": {provider: {str(day): value for day, value in days.items()} for provider, days in self.totals.items()},
+                    "costs": {provider: {str(day): round(value, 6) for day, value in days.items()} for provider, days in self.costs.items()}}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")    # tray_app.clean_stale_temporaries' shape
+        temporary.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        os.replace(temporary, path)
 
-    def cost(self, provider: str, midnight: int) -> float:
-        """The day's US dollars at list prices (pricing); unpriced models add nothing."""
-        with self.lock:
-            return self.costs.get(provider, {}).get(midnight, 0.0)
 
-    def covers(self, midnight: int, now: float) -> bool:
-        """Whether `midnight`'s day lies within what the logs were read for."""
-        return self.refreshed_at > 0 and midnight >= local_day(now) - (self.days - 1) * 86400
+SAVED_STALE = 15 * 60       # a saved ledger older than this is not taken: no menu bar keeps it current
+
+
+def saved_path() -> Path:
+    import app_identity
+    import providers
+    return providers._local_appdata() / app_identity.APP_NAME / "usage_ledger.json"
+
+
+class SavedLedger(DayTotals):
+    """A ledger another process saved (UsageLedger.save), answering as it does."""
+
+    def __init__(self, data: dict):
+        super().__init__(int(data.get("days") or LEDGER_DAYS))
+        self.refreshed_at = float(data.get("refreshed_at") or 0.0)
+        self.totals = {str(provider): {int(day): int(value) for day, value in days.items()}
+                       for provider, days in (data.get("totals") or {}).items()}
+        self.costs = {str(provider): {int(day): float(value) for day, value in days.items()}
+                      for provider, days in (data.get("costs") or {}).items()}
+
+    @classmethod
+    def load(cls, path: Path | None = None, now: float | None = None) -> "SavedLedger | None":
+        """The saved ledger; None when there is none, it is damaged, or it is
+        older than SAVED_STALE (the menu bar is not running)."""
+        now = time.time() if now is None else now
+        try:
+            ledger = cls(json.loads((path or saved_path()).read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        return ledger if 0 <= now - ledger.refreshed_at < SAVED_STALE else None

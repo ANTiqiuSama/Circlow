@@ -143,6 +143,9 @@ class ProviderSpec:
     # On battery, the idle interval instead (None: unchanged). The last
     # minutes before a reset go back to idle_seconds (refresh_scheduler).
     battery_idle_seconds: int | None = None
+    # Idle and its readings unchanged a few times in a row (refresh_scheduler
+    # QUIET_AFTER): the idle interval instead (None: unchanged).
+    quiet_idle_seconds: int | None = None
 
     def available(self) -> bool:
         return self.default or bool(self.detect and self.detect())
@@ -164,7 +167,9 @@ SPECS: tuple[ProviderSpec, ...] = (
     ProviderSpec(
         "gemini", "G", "Gemini（5 小时）", 300, (164, 176, 245, 255), 2 * 60, 45, 8,
         ("gui", lambda: _local_appdata() / "Programs/antigravity/Antigravity.exe"), hover_seconds=10,
-        battery_idle_seconds=10 * 60,
+        # Each read starts agy's language server (~3 s); an idle account's
+        # figures sat unchanged for 500 reads a day.
+        battery_idle_seconds=10 * 60, quiet_idle_seconds=8 * 60,
         source_note="agy --print /usage（Argon > Claude/GPT > Gemini 额度池）",
     ),
     ProviderSpec(

@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import settings_mac
@@ -144,15 +145,45 @@ class SettingsTrayTest(TempData):
         self.assertEqual(settings_mac.take_commands(settings_mac.MENU), [{"name": "restart"}, {"name": "restart"}])
         self.assertFalse(tray.stop_event.is_set())                # the window stays open while the menu bar restarts
 
-    def test_the_window_reads_the_usage_ledger_itself(self):
-        # Another process than the menu bar: the daily board and today's
-        # tokens need a ledger of their own (the Windows window shares the tray's).
+    def test_the_window_takes_the_ledger_the_menu_bar_saves(self):
+        # Another process than the menu bar: rather than reading every log
+        # again, it takes the day totals the menu bar saves each minute.
+        import usage_ledger
+        from usage_store import local_day
+        now = time.time()
+        today = int(local_day(now))
+        ledger = usage_ledger.UsageLedger([], [], None)
+        ledger.totals, ledger.costs, ledger.refreshed_at = {"claude": {today: 63_200_000}}, {"claude": {today: 24.5}}, now
+        ledger.save()
         tray = self.settings_tray()
-        started = threading.Event()
-        tray.ledger_loop = started.set
-        tray.stop_event.set()
-        tray.follow()
+        tray.tps_monitor = SimpleNamespace(ledger=None)
+        tray.ledger_loop = Mock(side_effect=AssertionError("the logs are not read here"))
+        tray.take_ledger(now)
+        self.assertEqual((tray.usage_ledger.day("claude", today), tray.usage_ledger.cost("claude", today)), (63_200_000, 24.5))
+        self.assertIs(tray.tps_monitor.ledger, tray.usage_ledger)
+        self.assertTrue(tray.usage_ledger.covers(today, now))
+        ledger.totals = {"claude": {today: 64_000_000}}
+        ledger.refreshed_at = now + 60
+        ledger.save()
+        os.utime(usage_ledger.saved_path(), ns=(time.time_ns(), time.time_ns() + 1_000_000_000))
+        tray.take_ledger(now + 60)                                # rewritten: taken again
+        self.assertEqual(tray.usage_ledger.day("claude", today), 64_000_000)
+
+    def test_without_a_fresh_saved_ledger_the_window_reads_the_logs(self):
+        import usage_ledger
+        now = time.time()
+        ledger = usage_ledger.UsageLedger([], [], None)
+        ledger.refreshed_at = now - usage_ledger.SAVED_STALE - 60    # the menu bar stopped long ago
+        ledger.save()
+        tray = self.settings_tray()
+        tray.tps_monitor = SimpleNamespace(ledger=None)
+        started, calls = threading.Event(), []
+        tray.ledger_loop = lambda save=True: (calls.append(save), started.set())
+        tray.take_ledger(now)
         self.assertTrue(started.wait(2))
+        self.assertTrue(tray.own_ledger)
+        tray.take_ledger(now + 2)                                 # once only
+        self.assertEqual(calls, [False])                          # and it does not save what it read
 
     def test_the_menu_bar_choice_is_a_preference_applied_without_a_restart(self):
         import tray_app

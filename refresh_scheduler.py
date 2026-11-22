@@ -10,6 +10,8 @@ Triggers, per provider:
 * the reset time of any window passes          -> a few seconds after it
 * read failed                                  -> 30 s, 1, 2, 5 min backoff
 * otherwise idle                               -> IDLE seconds (long)
+* idle, the last QUIET_AFTER readings the same -> QUIET seconds (Gemini: each
+                                                  read starts agy's server)
 * idle on battery                              -> BATTERY_IDLE seconds (longer),
                                                   back to IDLE in the last
                                                   BATTERY_NEAR_RESET seconds
@@ -40,6 +42,8 @@ EXHAUSTED = {spec.key: spec.exhausted_seconds for spec in SPECS}
 NEAR_RESET = {spec.key: (spec.near_reset_seconds, spec.near_reset_poll) for spec in SPECS}
 GIVE_UP = {spec.key: spec.give_up_seconds for spec in SPECS}
 BATTERY_IDLE = {spec.key: spec.battery_idle_seconds for spec in SPECS}
+QUIET = {spec.key: spec.quiet_idle_seconds for spec in SPECS}
+QUIET_AFTER = 3              # readings in a row repeating the figures before them, then QUIET applies
 BATTERY_NEAR_RESET = 10 * 60  # on battery, the normal idle cadence again this long before a reset
 RETRY = (30, 60, 120, 300)
 GIVE_UP_AFTER = 3            # consecutive failures before GIVE_UP applies
@@ -99,6 +103,16 @@ def exhausted_schedule(now: float, reset: float | None, window_minutes: int | No
     return None
 
 
+def figures(snapshot: Any) -> tuple:
+    """What a reading shows, to the tenth of a percent: its windows and pools."""
+    def tenth(value):
+        return None if value is None else round(float(value), 1)
+    pools = tuple((pool.get("key") or pool.get("label"), tenth(pool.get("remaining_percent")))
+                  for pool in getattr(snapshot, "pools", None) or [] if isinstance(pool, dict))
+    return (tenth(getattr(snapshot, "remaining_percent", None)),
+            tenth(getattr(snapshot, "secondary_remaining_percent", None)), pools)
+
+
 RESET_DELAY = 5
 MAX_SLEEP = 30.0
 
@@ -120,6 +134,8 @@ class RefreshScheduler:
         self.again: set[str] = set()                           # hovered during a read: read once more
         self.battery = False                                    # battery saver (set_battery)
         self.resets: dict[str, tuple[float, ...]] = {p: () for p in self.providers}   # from the last reading
+        self.shown: dict[str, tuple | None] = {p: None for p in self.providers}     # figures of the last reading
+        self.unchanged = {p: 0 for p in self.providers}         # readings in a row with those figures
 
     def _gap(self, provider: str, interval: float) -> float:
         return max(interval, DURATION_GAP * self.duration[provider])
@@ -133,13 +149,18 @@ class RefreshScheduler:
         if self.active[provider]:
             return self._gap(provider, ACTIVE[provider]), "使用中"
         idle = self._gap(provider, IDLE[provider])
+        # Nothing changed for a while (an idle Gemini account sat at the same
+        # figures for 500 reads a day): read less often until it does. A
+        # hover, an agent at work or a reset still reads at once.
+        quiet = QUIET.get(provider) if self.unchanged[provider] >= QUIET_AFTER else None
+        base = max(quiet or 0, IDLE[provider])
         saver = BATTERY_IDLE.get(provider)
         if not (self.battery and saver):
-            return idle, "空闲"
+            return (self._gap(provider, base), "读数未变") if quiet else (idle, "空闲")
         starts = [reset - BATTERY_NEAR_RESET for reset in self.resets.get(provider, ()) if reset > now]
         if any(start <= now for start in starts):
             return idle, "临近重置"
-        interval = self._gap(provider, max(saver, IDLE[provider]))
+        interval = self._gap(provider, max(saver, base))
         if starts:
             interval = max(1.0, min(interval, min(starts) - now))
         return interval, "省电"
@@ -156,8 +177,8 @@ class RefreshScheduler:
             if not self.battery:
                 for provider in self.providers:
                     if provider not in self.running and self.reason.get(provider) == "省电":
-                        gap = self._gap(provider, IDLE[provider])
-                        moved |= self._forward(provider, max(now, self.last_done[provider] + gap), "空闲")
+                        gap, reason = self._tier(provider, now)
+                        moved |= self._forward(provider, max(now, self.last_done[provider] + gap), reason)
             return moved
 
     def _forward(self, provider: str, when: float, reason: str) -> bool:
@@ -214,6 +235,9 @@ class RefreshScheduler:
                 self.reason[provider] = reason
             else:
                 self.failures[provider] = 0
+                shown = figures(snapshot)
+                self.unchanged[provider] = self.unchanged[provider] + 1 if shown == self.shown[provider] else 0
+                self.shown[provider] = shown
                 interval, reason = self._tier(provider, now)
                 self.due[provider] = now + interval
                 self.reason[provider] = reason

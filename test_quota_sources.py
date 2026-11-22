@@ -194,6 +194,45 @@ class QuotaTests(unittest.TestCase):
             self.assertIsNone(cli_usage.agy_account(started, started + 3, Path(folder, "missing")))
         self.assertNotIn("example", cli_usage.account_key("main@example.com"))
 
+    AGY_OK = json.dumps({"status": "SUCCESS", "command": {"data": {"groups": [
+        {"name": "Gemini Models", "buckets": [{"id": "gemini-5h", "remaining_fraction": .5}]}]}}})
+
+    def test_agy_usage_logs_to_a_temporary_file_that_is_removed(self):
+        # agy's own log folder grew by ~1,000 files a day; each read now
+        # names its log itself, takes the account from it and deletes it.
+        seen = []
+
+        def agy(_exe, _env, _timeout, log_file):
+            seen.append(log_file)
+            log_file.write_text("I1122 applyAuthResult: email=Second@Example.com, authMethod=consumer\n"
+                                "I1122 Print mode: running slash command /usage\n", encoding="utf-8")
+            return subprocess.CompletedProcess([], 0, self.AGY_OK, "")
+        with tempfile.TemporaryDirectory() as folder, patch.object(cli_usage, "_agy_process", side_effect=agy), \
+                patch.object(cli_usage, "agy_account", side_effect=AssertionError("agy's folder is not searched")):
+            parsed = cli_usage.run_agy_usage("agy", log_dir=folder)
+            self.assertEqual(parsed["account"], cli_usage.account_key("second@example.com"))
+            self.assertEqual(parsed["remaining_percent"], 50.0)
+            self.assertEqual(Path(seen[0]).parent, Path(folder))
+            self.assertEqual(os.listdir(folder), [])
+
+    def test_an_agy_without_log_file_falls_back_to_its_own_folder(self):
+        calls = []
+
+        def agy(_exe, _env, _timeout, log_file):
+            calls.append(log_file)
+            if log_file is not None:
+                return subprocess.CompletedProcess([], 2, "", "flags provided but not defined: -log-file\nUsage of agy:")
+            return subprocess.CompletedProcess([], 0, self.AGY_OK, "")
+        try:
+            with tempfile.TemporaryDirectory() as folder, patch.object(cli_usage, "_agy_process", side_effect=agy), \
+                    patch.object(cli_usage, "agy_account", return_value="fromfolder"):
+                self.assertEqual(cli_usage.run_agy_usage("agy", log_dir=folder)["account"], "fromfolder")
+                self.assertEqual(os.listdir(folder), [])
+                self.assertEqual(cli_usage.run_agy_usage("agy", log_dir=folder)["account"], "fromfolder")
+            self.assertEqual(calls[1:], [None, None])     # asked once; later reads go straight to the old way
+        finally:
+            cli_usage._AGY_LOG_FLAG["known"] = True
+
     def test_gemini_keeps_its_account_while_agy_swaps_logins(self):
         hold = quota_sources.GEMINI_ACCOUNT_HOLD_SECONDS
         def read(left, at, account):

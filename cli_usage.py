@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -432,26 +433,34 @@ def agy_account(started: float, finished: float, log_dir: Path | str | None = No
                  if entry.name.startswith("cli-") and entry.name.endswith(".log") and first <= entry.name[:19] <= last]
     except OSError:
         return None
-    found = set()
-    for name in names:
-        try:
-            with open(folder / name, encoding="utf-8", errors="replace") as handle:
-                text = handle.read(1_000_000)
-        except OSError:
-            continue
-        match = AGY_ACCOUNT_RE.search(text)
-        if match and "running slash command /usage" in text:
-            found.add(account_key(match.group(1)))
+    found = {account for account in (agy_account_in(folder / name) for name in names) if account}
     return found.pop() if len(found) == 1 else None
 
 
-def run_agy_usage(executable: str, timeout: float = 10.0) -> dict[str, Any]:
-    env = os.environ.copy()
-    env["AGY_DISABLE_AUTO_UPDATE"] = "1"
+def agy_account_in(path: Path | str) -> str | None:
+    """The account (account_key) named by one /usage run's log; None when
+    the log is missing or is not of a /usage run."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read(1_000_000)
+    except OSError:
+        return None
+    match = AGY_ACCOUNT_RE.search(text)
+    return account_key(match.group(1)) if match and "running slash command /usage" in text else None
+
+
+# agy never removes the logs in AGY_LOG_DIR: a read every two minutes left
+# ~1,000 a day (12,000 files, 190 MB in two weeks). Each read now sends its
+# log to a temporary file of ours (--log-file), read for the account and
+# deleted. An agy without the flag says so at once; it then keeps its folder.
+_AGY_LOG_FLAG = {"known": True}
+
+
+def _agy_process(executable: str, env: dict, timeout: float, log_file: Path | None):
     import process_jail
-    started = time.time()
-    process = process_jail.run(
-        [executable, "--print", "/usage", "--output-format", "json"],
+    extra = ["--log-file", str(log_file)] if log_file is not None else []
+    return process_jail.run(
+        [executable, *extra, "--print", "/usage", "--output-format", "json"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -462,14 +471,39 @@ def run_agy_usage(executable: str, timeout: float = 10.0) -> dict[str, Any]:
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         env=env,
     )
-    if process.returncode != 0:
-        raise RuntimeError(process.stderr.strip() or f"agy 退出码 {process.returncode}")
-    payload = json.loads(process.stdout)
-    if payload.get("status") != "SUCCESS":
-        raise RuntimeError(str(payload.get("response") or "agy /usage 未成功"))
-    parsed = parse_agy_usage_json(payload)
-    parsed["account"] = agy_account(started, time.time())
-    return parsed
+
+
+def run_agy_usage(executable: str, timeout: float = 10.0, log_dir: Path | str | None = None) -> dict[str, Any]:
+    env = os.environ.copy()
+    env["AGY_DISABLE_AUTO_UPDATE"] = "1"
+    started = time.time()
+    log_file = None
+    if _AGY_LOG_FLAG["known"]:
+        handle, name = tempfile.mkstemp(prefix="agy-usage-", suffix=".log", dir=log_dir)
+        os.close(handle)
+        log_file = Path(name)
+    try:
+        process = _agy_process(executable, env, timeout, log_file)
+        if (log_file is not None and process.returncode != 0
+                and "not defined" in (process.stderr or "") and "log-file" in process.stderr):
+            _AGY_LOG_FLAG["known"] = False
+            log_file.unlink(missing_ok=True)
+            log_file = None
+            process = _agy_process(executable, env, timeout, None)
+        if process.returncode != 0:
+            raise RuntimeError(process.stderr.strip() or f"agy 退出码 {process.returncode}")
+        payload = json.loads(process.stdout)
+        if payload.get("status") != "SUCCESS":
+            raise RuntimeError(str(payload.get("response") or "agy /usage 未成功"))
+        parsed = parse_agy_usage_json(payload)
+        parsed["account"] = agy_account_in(log_file) if log_file is not None else agy_account(started, time.time())
+        return parsed
+    finally:
+        if log_file is not None:
+            try:
+                log_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ----- Claude Code ---------------------------------------------------------------

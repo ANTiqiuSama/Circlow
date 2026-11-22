@@ -1478,16 +1478,19 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
         threading.Thread(target=self.ledger_loop, name="usage-ledger", daemon=True).start()
         self.start_sync()
 
-    def ledger_loop(self) -> None:
+    def ledger_loop(self, save: bool = True) -> None:
         """Daily tokens and their list-price dollars from the agents' own
         logs (usage_ledger, pricing): read in full once, then only what
-        changed, every minute (every five on battery while nothing is looked at)."""
+        changed, every minute (every five on battery while nothing is looked at).
+        Each read is saved for the Mac settings window (usage_ledger.SavedLedger)."""
         ledger = usage_ledger.UsageLedger.for_home()
         while not self.stop_event.is_set():
             started = time.monotonic()
             pricing.TABLE.refresh()             # LiteLLM's prices, at most once a day
             try:
                 ledger.refresh()
+                if save:
+                    ledger.save()
             except Exception as error:          # a broken log must not stop the counting
                 log.info("usage ledger: %s", type(error).__name__)
             if self.tps_monitor.ledger is None:

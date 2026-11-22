@@ -183,20 +183,20 @@ def make_settings_tray():
     import mac_menu
     import mimo_usage
     import tray_app
+    import usage_ledger
     from quota_sources import load_cached_snapshots
 
     class SettingsTray(tray_app.QuotaTray):
         def __init__(self):
             super().__init__(icons={key: mac_menu.MacIcon(key) for key in tray_app.PROVIDERS})
             self.mimo_login_result = ""
+            self.saved_stamp = None           # the saved ledger file as last taken
+            self.own_ledger = False           # reading the logs here (no menu bar keeps one)
 
         # Live figures for the open window: cached quotas from the menu bar,
         # local TPS from this process' own monitor.
         def follow(self):
-            # The daily board and today's tokens count from the agents' own
-            # logs. On Windows the window shares the tray's ledger; here it
-            # is another process, so it reads them itself (about a second).
-            threading.Thread(target=self.ledger_loop, name="usage-ledger", daemon=True).start()
+            self.take_ledger(time.time())
             while not self.stop_event.wait(2.0):
                 try:
                     cached = load_cached_snapshots()
@@ -204,12 +204,38 @@ def make_settings_tray():
                         if cached.get(key) is not None:
                             self.snapshots[key] = cached[key]
                     now = time.time()
+                    self.take_ledger(now)
                     self.performance = self.tps_monitor.poll(now)
                     self.agents = self.tps_monitor.agents(now)
                     for key, letter in self.letters.items():
                         self.update_icon(key, letter)
                 except Exception:
                     log.exception("settings window refresh failed")
+
+        def take_ledger(self, now: float) -> None:
+            """The daily board and today's tokens count from the agents' own
+            logs. On Windows the window shares the tray's ledger; here it is
+            another process and takes the one the menu bar saves each minute
+            (usage_ledger.SavedLedger), again whenever it is rewritten. Only
+            without a fresh one (no menu bar running) does it read the logs."""
+            if self.own_ledger:
+                return
+            path = usage_ledger.saved_path()
+            try:
+                stamp = path.stat().st_mtime_ns
+            except OSError:
+                stamp = None
+            if stamp is not None and stamp != self.saved_stamp:
+                self.saved_stamp = stamp
+                saved = usage_ledger.SavedLedger.load(path, now)
+                if saved is not None:
+                    self.tps_monitor.ledger = self.usage_ledger = saved
+                    return
+            current = getattr(self, "usage_ledger", None)
+            if current is None or not 0 <= now - current.refreshed_at < usage_ledger.SAVED_STALE:
+                self.own_ledger = True
+                self.tps_monitor.ledger = self.usage_ledger = None     # ledger_loop sets its own in its place
+                threading.Thread(target=self.ledger_loop, kwargs={"save": False}, name="usage-ledger", daemon=True).start()
 
         # Actions for the running menu bar.
         def request_refresh(self, _icon=None, _item=None) -> None:
