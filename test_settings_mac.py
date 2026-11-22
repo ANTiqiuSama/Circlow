@@ -144,6 +144,16 @@ class SettingsTrayTest(TempData):
         self.assertEqual(settings_mac.take_commands(settings_mac.MENU), [{"name": "restart"}, {"name": "restart"}])
         self.assertFalse(tray.stop_event.is_set())                # the window stays open while the menu bar restarts
 
+    def test_the_window_reads_the_usage_ledger_itself(self):
+        # Another process than the menu bar: the daily board and today's
+        # tokens need a ledger of their own (the Windows window shares the tray's).
+        tray = self.settings_tray()
+        started = threading.Event()
+        tray.ledger_loop = started.set
+        tray.stop_event.set()
+        tray.follow()
+        self.assertTrue(started.wait(2))
+
     def test_the_menu_bar_choice_is_a_preference_applied_without_a_restart(self):
         import tray_app
         tray = self.settings_tray()

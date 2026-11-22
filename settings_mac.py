@@ -193,6 +193,10 @@ def make_settings_tray():
         # Live figures for the open window: cached quotas from the menu bar,
         # local TPS from this process' own monitor.
         def follow(self):
+            # The daily board and today's tokens count from the agents' own
+            # logs. On Windows the window shares the tray's ledger; here it
+            # is another process, so it reads them itself (about a second).
+            threading.Thread(target=self.ledger_loop, name="usage-ledger", daemon=True).start()
             while not self.stop_event.wait(2.0):
                 try:
                     cached = load_cached_snapshots()

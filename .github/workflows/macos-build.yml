@@ -55,6 +55,8 @@ on:
       - 'test_model_iq.py'
       - 'test_*.py'
       - 'power_source.py'
+      - 'usage_ledger.py'
+      - 'pricing.py'
       - '.github/workflows/macos-build.yml'
   pull_request:
     paths:
@@ -109,6 +111,8 @@ on:
       - 'test_model_iq.py'
       - 'test_*.py'
       - 'power_source.py'
+      - 'usage_ledger.py'
+      - 'pricing.py'
       - '.github/workflows/macos-build.yml'
   workflow_dispatch:
 
