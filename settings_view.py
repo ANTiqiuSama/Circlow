@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw
 
 from detail_card import MUTED_TEXT, SECONDARY_TEXT, TEXT, ui_font, figure_font
 from forecast import reset_distance
+from pricing import money
 from icon_art import AMBER, CLAY, PAID, UNIFORM_LETTERS, accent, ring_color, window_shade
 
 # Window palette (Tk wants hex).
@@ -691,11 +692,19 @@ def _day_label(start: float, today: bool) -> str:
     return "今天" if today else f"{local.tm_mon}/{local.tm_mday}"
 
 
+def daily_spend(costs) -> tuple[float, float, float]:
+    """US dollars of today, yesterday and the last 7 days, from daily_costs
+    (one {provider: dollars} per row of daily(), oldest first)."""
+    sums = [sum(day.values()) for day in costs or ()]
+    return sum(sums[-1:]), sum(sums[-2:-1]), sum(sums[-7:])
+
+
 def daily_chart(rows, letters: dict[str, str], scale: float = 1.0, width: int = 652, height: int = 190,
-                hover: int | None = None) -> Image.Image:
+                hover: int | None = None, costs=None) -> Image.Image:
     """Tokens per local day, stacked by source, today on the right. Each row
     is (midnight, tokens per provider, complete); a day recorded before the
-    daily totals existed has output tokens only and is drawn paler."""
+    daily totals existed has output tokens only and is drawn paler. `costs`
+    (daily_costs, one per row) adds each figure's dollars at list prices."""
     s = scale
     px = lambda value: round(value * s)  # noqa: E731
     image = _rounded((px(width), px(height)), 12, CARD_RGB, CARD_EDGE, s)
@@ -708,11 +717,17 @@ def daily_chart(rows, letters: dict[str, str], scale: float = 1.0, width: int = 
 
     # Headline: today, yesterday and the last seven days.
     x = CHART_PAD
-    for caption, value, whole in daily_totals(rows) if rows else ():
+    spend = daily_spend(costs) if costs and len(costs) == len(rows) else (0.0, 0.0, 0.0)
+    for (caption, value, whole), usd in zip(daily_totals(rows) if rows else (), spend):
         draw.text((px(x), px(14)), caption, font=label, fill=MUTED_TEXT, anchor="lt")
         text = tokens_text(value) if value else "—"
         draw.text((px(x), px(30)), text, font=big, fill=TEXT if whole else SECONDARY_TEXT, anchor="lt")
-        x += max(draw.textlength(text, font=big) / s, draw.textlength(caption, font=label) / s) + 28
+        wide = draw.textlength(text, font=big) / s
+        dollars = money(usd) if value else ""
+        if dollars:                                  # list-price dollars after the figure, on its baseline
+            draw.text((px(x + wide + 6), px(30 + 18)), dollars, font=small, fill=SECONDARY_TEXT, anchor="ls")
+            wide += 6 + draw.textlength(dollars, font=small) / s
+        x += max(wide, draw.textlength(caption, font=label) / s) + 28
 
     # Legend: the sources with any use on the board (their figures are in the
     # hover readout), right-aligned.
@@ -762,11 +777,12 @@ def daily_chart(rows, letters: dict[str, str], scale: float = 1.0, width: int = 
     if not peak:
         draw.text((px((left + right) / 2), px((top + bottom) / 2)), "还没有用量记录", font=small, fill=MUTED_TEXT, anchor="mm")
     elif hover is not None and 0 <= hover < count:
-        _daily_readout(draw, rows, letters, hover, (left, right, top, bottom, slot), s)
+        spent = costs[hover] if costs and len(costs) == len(rows) else {}
+        _daily_readout(draw, rows, letters, hover, (left, right, top, bottom, slot), s, spent)
     return image
 
 
-def _daily_readout(draw, rows, letters, index, frame, s) -> None:
+def _daily_readout(draw, rows, letters, index, frame, s, spent=None) -> None:
     px = lambda value: round(value * s)  # noqa: E731
     left, right, top, bottom, slot = frame
     bold, tiny = ui_font(px(11), "bold"), ui_font(px(10))
@@ -774,9 +790,12 @@ def _daily_readout(draw, rows, letters, index, frame, s) -> None:
     local = time.localtime(start)
     title = f"{local.tm_mon} 月 {local.tm_mday} 日" + ("（今天）" if index == len(rows) - 1 else "")
     lines = [(provider, amount) for provider, amount in tokens.items() if amount]
-    rows_text = [f"{SHORT_NAMES.get(p, p)}  {tokens_text(amount)}" for p, amount in lines]
+    spent = spent or {}
+    def with_money(text: str, usd: float) -> str:
+        return f"{text} · {money(usd)}" if money(usd) else text
+    rows_text = [with_money(f"{SHORT_NAMES.get(p, p)}  {tokens_text(amount)}", spent.get(p, 0.0)) for p, amount in lines]
     if len(lines) > 1:
-        rows_text.append(f"合计  {tokens_text(sum(tokens.values()))}")
+        rows_text.append(with_money(f"合计  {tokens_text(sum(tokens.values()))}", sum(spent.values())))
     if not rows_text:
         rows_text = ["没有用量"]
     if not complete and lines:

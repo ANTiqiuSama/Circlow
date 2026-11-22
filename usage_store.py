@@ -18,6 +18,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Iterable
 
+import pricing
 from forecast import duration_text, forecast, same_window
 
 USAGE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow" / "usage.json.gz"
@@ -29,6 +30,29 @@ VERSION = 1
 
 def _hour(stamp: float) -> int:
     return int(stamp // 3600 * 3600)
+
+
+# Sources counted mostly outside usage_ledger: this store's daily totals
+# hold their work (Antigravity, MiMo Code).
+OTHER_PROVIDERS = ("gemini", "mimo")
+PARTIAL_SHARE = 0.01        # a day is "output only" when stand-in output is more than this share of it
+
+
+def ledger_counts(observation: Any) -> bool:
+    """Whether usage_ledger counts this reply from the logs: Claude Code's,
+    Grok CLI's and Codex's (but Gemini through Codex). The daily totals here
+    keep the rest (Antigravity, MiMo Code, Gemini through Codex)."""
+    source = getattr(observation, "source", "")
+    if source in ("Claude Code", "Grok CLI", "Grok CLI 原生统计"):
+        return True
+    return source == "Codex" and getattr(observation, "provider", "") != "gemini"
+
+
+def reply_cost(observation: Any) -> float | None:
+    """A reply's US dollars at its model's list price (pricing): uncached
+    input, cache hits and output; None for a model without a price."""
+    return pricing.TABLE.cost(getattr(observation, "model", ""), max(0, observation.input_tokens or 0),
+                              max(0, observation.output_tokens), 0, max(0, observation.cached_tokens or 0))
 
 
 def local_day(stamp: float) -> int:
@@ -46,8 +70,10 @@ class UsageStore:
         # Other devices' hours from the sync hub (sync_hub), in memory only:
         # device -> (label, provider -> hour start -> [output tokens, replies]).
         self.remote: dict[str, tuple[str, dict[str, dict[int, list[int]]]]] = {}
-        # provider -> local midnight -> every token of the day's replies (this device only)
+        # provider -> local midnight -> every token of the day's replies that
+        # usage_ledger does not read from the logs (this device only)
         self.days: dict[str, dict[int, int]] = {}
+        self.costs: dict[str, dict[int, float]] = {}    # the same replies in US dollars (pricing)
         self.days_since = 0                              # the first local midnight the daily totals cover in full
         self.dirty = False
         self.saved_at = 0.0
@@ -73,15 +99,18 @@ class UsageStore:
                         if isinstance(row, list) and required <= len(row) <= width]
             self.hours = {provider: {int(hour): [int(tokens), int(replies)] for hour, (tokens, replies) in hours.items()}
                           for provider, hours in payload.get("hours", {}).items()}
-            if "days" in payload:
+            if "other_days" in payload:
                 self.days = {provider: {int(day): int(tokens) for day, tokens in days.items()}
-                             for provider, days in payload["days"].items()}
-                self.days_since = int(payload.get("days_since") or 0)
+                             for provider, days in payload["other_days"].items()}
+                self.days_since = int(payload.get("other_since") or 0)
+                self.costs = {provider: {int(day): float(usd) for day, usd in days.items()}
+                              for provider, days in (payload.get("other_costs") or {}).items()}
             else:
-                # Saved before the daily totals: the replies kept one by one
-                # cover today in full (they reach back 26 hours); earlier days
-                # keep their output totals only.
-                self.days = {}
+                # Saved before these totals (or when they still held what the
+                # ledger now reads): the replies kept one by one cover today
+                # in full (they reach back 26 hours); earlier days keep their
+                # output totals only.
+                self.days, self.costs = {}, {}
                 self.days_since = self._today()
                 for row in self.raw:
                     try:
@@ -89,7 +118,7 @@ class UsageStore:
                     except (TypeError, ValueError, OverflowError, OSError):
                         continue
         except (OSError, ValueError, TypeError, KeyError, EOFError, AttributeError):
-            self.raw, self.hours, self.days = [], {}, {}
+            self.raw, self.hours, self.days, self.costs = [], {}, {}, {}
         if not self.days_since:
             self.days_since = self._today()
 
@@ -101,7 +130,7 @@ class UsageStore:
             return 0
 
     def _count_day(self, observation: Any) -> None:
-        if not observation.count_in_rate:
+        if not observation.count_in_rate or ledger_counts(observation):
             return
         tokens = (max(0, observation.output_tokens) + max(0, observation.input_tokens or 0)
                   + max(0, observation.cached_tokens or 0))
@@ -109,6 +138,10 @@ class UsageStore:
             days = self.days.setdefault(observation.provider, {})
             day = local_day(observation.ended_at)
             days[day] = days.get(day, 0) + int(tokens)
+            usd = reply_cost(observation)
+            if usd:
+                spent = self.costs.setdefault(observation.provider, {})
+                spent[day] = spent.get(day, 0.0) + usd
 
     def note(self, observation: Any) -> None:
         """A new observation from the monitor (each identity arrives once)."""
@@ -148,12 +181,16 @@ class UsageStore:
                           for provider, hours in self.hours.items()}
             self.days = {provider: {day: value for day, value in days.items() if day >= oldest - 86400}
                          for provider, days in self.days.items()}
+            self.costs = {provider: {day: value for day, value in days.items() if day >= oldest - 86400}
+                          for provider, days in self.costs.items()}
             payload = {"version": VERSION, "raw": self.raw,
                        "hours": {provider: {str(hour): value for hour, value in sorted(hours.items())}
                                  for provider, hours in self.hours.items() if hours},
-                       "days": {provider: {str(day): value for day, value in sorted(days.items())}
+                       "other_days": {provider: {str(day): value for day, value in sorted(days.items())}
                                 for provider, days in self.days.items() if days},
-                       "days_since": self.days_since}
+                       "other_since": self.days_since,
+                       "other_costs": {provider: {str(day): round(value, 6) for day, value in sorted(days.items())}
+                                       for provider, days in self.costs.items() if days}}
             self.dirty = False
             self.saved_at = now
             try:                            # under the lock: the exit save and the reader thread's never interleave
@@ -228,11 +265,13 @@ class UsageStore:
                                for hour, (tokens, _replies) in hours.items() if hour >= since)) for label, source in rows]
         return [(label, tokens) for index, (label, tokens) in enumerate(out) if tokens or index == 0]
 
-    def daily(self, providers: Iterable[str], now: float, count: int = 14) -> list[tuple[int, dict[str, int], bool]]:
+    def daily(self, providers: Iterable[str], now: float, count: int = 14,
+              ledger: Any = None) -> list[tuple[int, dict[str, int], bool]]:
         """The last `count` local days, oldest first: (midnight, tokens per
-        provider, complete). A day with a recorded daily total counts every
-        token (input, cache hits, output); an older day without one falls back
-        to its hourly output totals, and `complete` is False for it."""
+        provider, complete). Every token counts (input, cache writes and
+        hits, output): what `ledger` (usage_ledger) read from the logs, plus
+        this store's daily totals of the rest. Where neither covers a day,
+        its hourly output totals stand in and `complete` is False."""
         keys = tuple(providers)
         today = local_day(now)
         starts = [today]
@@ -243,13 +282,42 @@ class UsageStore:
         with self.lock:
             for index, start in enumerate(starts):
                 end = starts[index + 1] if index + 1 < len(starts) else start + 86400 * 2
-                if start >= self.days_since:
-                    rows.append((start, {provider: self.days.get(provider, {}).get(start, 0) for provider in keys}, True))
-                    continue
-                output = {provider: sum(tokens for hour, (tokens, _replies) in self.hours.get(provider, {}).items()
-                                        if start <= hour < end) for provider in keys}
-                rows.append((start, output, False))
+                logged = ledger is not None and ledger.covers(start, now)
+                tokens, standin = {}, 0
+                for provider in keys:
+                    value = ledger.day(provider, start) if logged else 0
+                    if logged and provider not in OTHER_PROVIDERS:
+                        pass                                # all of it is in the logs
+                    elif start >= self.days_since and provider in OTHER_PROVIDERS:
+                        value += self.days.get(provider, {}).get(start, 0)
+                    else:
+                        output = sum(made for hour, (made, _replies) in self.hours.get(provider, {}).items()
+                                     if start <= hour < end)
+                        value += output
+                        standin += output
+                    tokens[provider] = value
+                # Output standing in for a sliver of the day (an early Gemini
+                # record beside a full day of logs) leaves the day whole.
+                rows.append((start, tokens, standin <= PARTIAL_SHARE * sum(tokens.values()) if standin else True))
         return rows
+
+    def daily_costs(self, providers: Iterable[str], now: float, count: int = 14,
+                    ledger: Any = None) -> list[dict[str, float]]:
+        """US dollars per provider for the days of daily(), in the same order:
+        what `ledger` priced plus this store's priced replies of the rest."""
+        keys = tuple(providers)
+        starts = [local_day(now)]
+        for _ in range(count - 1):
+            starts.append(local_day(starts[-1] - 43200))
+        starts.reverse()
+        out = []
+        with self.lock:
+            for start in starts:
+                logged = ledger is not None and ledger.covers(start, now)
+                out.append({provider: (ledger.cost(provider, start) if logged else 0.0)
+                            + (self.costs.get(provider, {}).get(start, 0.0) if provider in OTHER_PROVIDERS else 0.0)
+                            for provider in keys})
+        return out
 
     def hour_rows(self, providers: Iterable[str], since: float, now: float) -> list[Any]:
         """Hourly totals as chart events (one per provider and hour, at the
@@ -508,7 +576,8 @@ def weekly_line(store: UsageStore, provider: str, leftover: dict, now: float, we
 
 
 def insights(store: UsageStore, provider: str, now: float, samples: Iterable[Any] = (), window: str = "",
-             weekly: Iterable[Any] = (), weekly_quota: tuple | None = None, weeks: list[dict] = ()) -> list[str]:
+             weekly: Iterable[Any] = (), weekly_quota: tuple | None = None, weeks: list[dict] = (),
+             day_total: tuple | None = None) -> list[str]:
     """"标题：内容" lines about one provider's own output: a weekly window
     about to reset with quota to spare, or one that just reset with much of
     it unused; today against yesterday; the week's daily average and busiest
@@ -533,7 +602,13 @@ def insights(store: UsageStore, provider: str, now: float, samples: Iterable[Any
     yesterday_start = local_day(day - 3600)
     yesterday = sum(tokens for hour, tokens in hours.items() if yesterday_start <= hour < day)
     so_far = sum(tokens for hour, tokens in hours.items() if yesterday_start <= hour < now - 86400)
-    lines = head + [f"今天：{_tokens(today)} tokens · {store.replies([provider], day)} 次回复"]
+    if day_total and day_total[0]:
+        # Every token of the day (the hover card's figure) and its list-price dollars; output in brackets.
+        spent = pricing.money(day_total[1])
+        lines = head + [f"今天：{_tokens(day_total[0])} tokens（输出 {_tokens(today)}）" + (f" · 约 {spent}" if spent else "")
+                        + f" · {store.replies([provider], day)} 次回复"]
+    else:
+        lines = head + [f"今天：输出 {_tokens(today)} tokens · {store.replies([provider], day)} 次回复"]
     split = store.by_device([provider], day)
     if len(split) > 1:                              # work on other synced devices today
         lines.append("设备：" + " · ".join(f"{label} {_tokens(tokens)}" for label, tokens in split))

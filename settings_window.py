@@ -1487,7 +1487,7 @@ class SettingsWindow:
         store = getattr(self.app, "usage", None)
         if store is None or not providers:
             return providers, []
-        rows = store.daily(tuple(providers), now, view.DAILY_DAYS)
+        rows = store.daily(tuple(providers), now, view.DAILY_DAYS, getattr(self.app, "usage_ledger", None))
         performance = (getattr(self.app, "performance", None) or {}).get("providers", {})
         if rows:
             start, tokens, _complete = rows[-1]
@@ -1496,24 +1496,42 @@ class SettingsWindow:
                                 for provider in providers}, True)
         return providers, rows
 
+    def daily_spend(self, letters, now):
+        """US dollars for daily_rows' days (usage_store.daily_costs); today
+        from the live monitor, like the tokens."""
+        store = getattr(self.app, "usage", None)
+        if store is None or not letters or not hasattr(store, "daily_costs"):
+            return []
+        costs = store.daily_costs(tuple(letters), now, view.DAILY_DAYS, getattr(self.app, "usage_ledger", None))
+        performance = (getattr(self.app, "performance", None) or {}).get("providers", {})
+        if costs:
+            costs[-1] = {provider: float((performance.get(provider) or {}).get("today_cost") or 0.0)
+                         if provider in performance else costs[-1][provider] for provider in letters}
+        return costs
+
     def _paint_daily(self, fresh=False):
         daily = getattr(self, "daily", None)
         if daily is None:
             return
         if fresh or daily["rows"] is None:
-            daily["letters"], daily["rows"] = self.daily_rows(time.time())
+            moment = time.time()
+            daily["letters"], daily["rows"] = self.daily_rows(moment)
+            daily["costs"] = self.daily_spend(daily["letters"], moment)
         rows = daily["rows"]
         flow = self.card_flow
         width = min(self.page_width("overview"), max(self.CHART_MIN_W, flow.widest))
         daily["width"] = width
         partial = any(not complete and any(tokens.values()) for _start, tokens, complete in rows)
-        self.set_text(daily["note"], "输入、缓存与输出 token 合计 · 悬停查看数值" + (" · 浅色为仅输出的早期记录" if partial else ""))
-        drawn = (tuple((start, tuple(tokens.items()), complete) for start, tokens, complete in rows), round(width), daily["hover"])
+        self.set_text(daily["note"], "输入、缓存与输出 token 合计 · 美元按 LiteLLM 公开价目折算 · 悬停查看数值"
+                      + (" · 浅色为仅输出的早期记录" if partial else ""))
+        costs = daily.get("costs") or []
+        drawn = (tuple((start, tuple(tokens.items()), complete) for start, tokens, complete in rows),
+                 tuple(round(sum(day.values()), 2) for day in costs), round(width), daily["hover"])
         if daily["drawn"] == drawn:
             return
         daily["drawn"] = drawn
         image = view.daily_chart(rows, daily["letters"], self.scale * self.f, width=round(width), height=self.DAILY_H,
-                                 hover=daily["hover"])
+                                 hover=daily["hover"], costs=costs)
         widget = self.picture(daily["holder"], "chart:daily", image)
         if not widget.winfo_manager():
             widget.pack(anchor="w")
