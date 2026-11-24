@@ -6,9 +6,12 @@ import hashlib
 import os
 import re
 import signal
+import socket
 import subprocess
+import sys
 import tempfile
 import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -455,6 +458,74 @@ def agy_account_in(path: Path | str) -> str | None:
 # deleted. An agy without the flag says so at once; it then keeps its folder.
 _AGY_LOG_FLAG = {"known": True}
 
+# An `agy --print` that cannot sign in silently (no network in a dark wake, a
+# locked keychain) opens Google's sign-in page and waits for the code on its
+# own stdin: nobody can answer it, so the page asked for a sign-in that was
+# neither needed nor possible. It starts the opener found on PATH; a
+# do-nothing one ahead of it keeps a background read from showing the page.
+AGY_HOST = "oauth2.googleapis.com"
+AGY_OPENERS = {"darwin": "open", "linux": "xdg-open"}
+AGY_OFFLINE = "网络未连接"
+AGY_SIGN_IN = "登录未成功；若持续，请在终端运行 agy 登录"
+_AGY_OPENER_SCRIPT = "#!/bin/sh\n# Circlow: keeps background `agy` reads from opening a sign-in page.\nexit 0\n"
+
+
+def agy_offline() -> bool:
+    """Google's sign-in host has no address: agy could not sign in either.
+    Behind a proxy the name may only resolve there, so it is not asked."""
+    if urllib.request.getproxies():
+        return False
+    try:
+        socket.getaddrinfo(AGY_HOST, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return True
+    except OSError:
+        pass
+    return False
+
+
+def agy_quiet_folder(folder: Path | str | None = None) -> Path | None:
+    """The folder holding the do-nothing opener, made on first use."""
+    name = AGY_OPENERS.get(sys.platform)
+    if name is None:
+        return None
+    if folder is None:
+        import app_identity
+        folder = app_identity.data_dir() / "agy-quiet"
+    target = Path(folder) / name
+    try:
+        if not (os.access(target, os.X_OK) and target.read_text(encoding="utf-8") == _AGY_OPENER_SCRIPT):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fresh = target.with_name(f"{name}.{os.getpid()}.tmp")
+            fresh.write_text(_AGY_OPENER_SCRIPT, encoding="utf-8")
+            fresh.chmod(0o755)
+            os.replace(fresh, target)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return target.parent
+
+
+def agy_env(folder: Path | str | None = None) -> dict[str, str]:
+    """The environment of a background read: no self-update (one cut short by
+    our time limit fails half-way; only "true" counts) and no sign-in page."""
+    env = os.environ.copy()
+    env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
+    quiet = agy_quiet_folder(folder)
+    if quiet is not None:
+        env["PATH"] = os.pathsep.join([str(quiet), env.get("PATH") or os.defpath])
+    return env
+
+
+def agy_wants_sign_in(log_file: Path | None) -> bool:
+    """That read went on to ask for a sign-in (its log says so)."""
+    if log_file is None:
+        return False
+    try:
+        with open(log_file, encoding="utf-8", errors="replace") as handle:
+            return "triggering interactive OAuth" in handle.read(1_000_000)
+    except OSError:
+        return False
+
 
 def _agy_process(executable: str, env: dict, timeout: float, log_file: Path | None):
     import process_jail
@@ -474,8 +545,9 @@ def _agy_process(executable: str, env: dict, timeout: float, log_file: Path | No
 
 
 def run_agy_usage(executable: str, timeout: float = 10.0, log_dir: Path | str | None = None) -> dict[str, Any]:
-    env = os.environ.copy()
-    env["AGY_DISABLE_AUTO_UPDATE"] = "1"
+    if agy_offline():
+        raise RuntimeError(AGY_OFFLINE)
+    env = agy_env()
     started = time.time()
     log_file = None
     if _AGY_LOG_FLAG["known"]:
@@ -491,6 +563,8 @@ def run_agy_usage(executable: str, timeout: float = 10.0, log_dir: Path | str | 
             log_file = None
             process = _agy_process(executable, env, timeout, None)
         if process.returncode != 0:
+            if agy_wants_sign_in(log_file):
+                raise RuntimeError(AGY_SIGN_IN)
             raise RuntimeError(process.stderr.strip() or f"agy 退出码 {process.returncode}")
         payload = json.loads(process.stdout)
         if payload.get("status") != "SUCCESS":
@@ -498,6 +572,10 @@ def run_agy_usage(executable: str, timeout: float = 10.0, log_dir: Path | str | 
         parsed = parse_agy_usage_json(payload)
         parsed["account"] = agy_account_in(log_file) if log_file is not None else agy_account(started, time.time())
         return parsed
+    except subprocess.TimeoutExpired:
+        if agy_wants_sign_in(log_file):
+            raise RuntimeError(AGY_SIGN_IN) from None
+        raise
     finally:
         if log_file is not None:
             try:

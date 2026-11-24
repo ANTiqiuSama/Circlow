@@ -208,7 +208,8 @@ class QuotaTests(unittest.TestCase):
                                 "I1122 Print mode: running slash command /usage\n", encoding="utf-8")
             return subprocess.CompletedProcess([], 0, self.AGY_OK, "")
         with tempfile.TemporaryDirectory() as folder, patch.object(cli_usage, "_agy_process", side_effect=agy), \
-                patch.object(cli_usage, "agy_account", side_effect=AssertionError("agy's folder is not searched")):
+                patch.object(cli_usage, "agy_account", side_effect=AssertionError("agy's folder is not searched")), \
+                patch.object(cli_usage, "agy_offline", return_value=False), patch.object(cli_usage, "agy_env", return_value={}):
             parsed = cli_usage.run_agy_usage("agy", log_dir=folder)
             self.assertEqual(parsed["account"], cli_usage.account_key("second@example.com"))
             self.assertEqual(parsed["remaining_percent"], 50.0)
@@ -225,13 +226,62 @@ class QuotaTests(unittest.TestCase):
             return subprocess.CompletedProcess([], 0, self.AGY_OK, "")
         try:
             with tempfile.TemporaryDirectory() as folder, patch.object(cli_usage, "_agy_process", side_effect=agy), \
-                    patch.object(cli_usage, "agy_account", return_value="fromfolder"):
+                    patch.object(cli_usage, "agy_account", return_value="fromfolder"), \
+                    patch.object(cli_usage, "agy_offline", return_value=False), patch.object(cli_usage, "agy_env", return_value={}):
                 self.assertEqual(cli_usage.run_agy_usage("agy", log_dir=folder)["account"], "fromfolder")
                 self.assertEqual(os.listdir(folder), [])
                 self.assertEqual(cli_usage.run_agy_usage("agy", log_dir=folder)["account"], "fromfolder")
             self.assertEqual(calls[1:], [None, None])     # asked once; later reads go straight to the old way
         finally:
             cli_usage._AGY_LOG_FLAG["known"] = True
+
+    def test_a_background_agy_read_cannot_open_a_sign_in_page_or_update_itself(self):
+        # Silent sign-in fails without a network (a dark wake): agy then opened
+        # Google's page and waited for a code that nobody could give it.
+        with tempfile.TemporaryDirectory() as folder, patch.object(cli_usage.sys, "platform", "darwin"), \
+                patch.dict(os.environ, {"PATH": "/usr/bin"}):
+            env = cli_usage.agy_env(folder)
+            self.assertEqual(env["AGY_CLI_DISABLE_AUTO_UPDATE"], "true")      # agy ignores "1"
+            self.assertEqual(env["PATH"].split(os.pathsep), [folder, "/usr/bin"])
+            self.assertNotIn("SSH_CONNECTION", env)     # would move agy off the keychain
+            opener = Path(folder, "open")
+            if os.name == "posix":
+                self.assertEqual(subprocess.run([str(opener), "https://accounts.google.com"], timeout=5).returncode, 0)
+            opener.write_text("something else", encoding="utf-8")
+            cli_usage.agy_env(folder)
+            self.assertEqual(opener.read_text(encoding="utf-8"), cli_usage._AGY_OPENER_SCRIPT)
+            self.assertEqual(os.listdir(folder), ["open"])
+        with patch.object(cli_usage.sys, "platform", "win32"), patch.dict(os.environ, {"PATH": "C:\\Windows"}):
+            self.assertEqual(cli_usage.agy_env()["PATH"], "C:\\Windows")
+
+    def test_agy_is_not_started_without_a_network(self):
+        with patch.object(cli_usage, "agy_offline", return_value=True), \
+                patch.object(cli_usage, "_agy_process", side_effect=AssertionError("agy must not run")):
+            with self.assertRaisesRegex(RuntimeError, cli_usage.AGY_OFFLINE):
+                cli_usage.run_agy_usage("agy")
+        lookup = patch.object(cli_usage.socket, "getaddrinfo", side_effect=cli_usage.socket.gaierror(8, "no name"))
+        with lookup, patch.object(cli_usage.urllib.request, "getproxies", return_value={}):
+            self.assertTrue(cli_usage.agy_offline())
+        with lookup, patch.object(cli_usage.urllib.request, "getproxies", return_value={"https": "http://127.0.0.1:1"}):
+            self.assertFalse(cli_usage.agy_offline())       # the proxy looks the name up
+
+    def test_an_agy_waiting_for_a_sign_in_says_so_instead_of_timing_out(self):
+        def agy(text):
+            def run(_exe, _env, timeout, log_file):
+                log_file.write_text(text, encoding="utf-8")
+                raise subprocess.TimeoutExpired(["agy"], timeout)
+            return run
+        with tempfile.TemporaryDirectory() as folder, patch.object(cli_usage, "agy_offline", return_value=False), \
+                patch.object(cli_usage, "agy_env", return_value={}):
+            with patch.object(cli_usage, "_agy_process", side_effect=agy("I1124 Print mode: triggering interactive OAuth\n")):
+                with self.assertRaises(RuntimeError) as caught:
+                    cli_usage.run_agy_usage("agy", log_dir=folder)
+            self.assertEqual(str(caught.exception), cli_usage.AGY_SIGN_IN)
+            with patch.object(cli_usage, "_agy_process", side_effect=agy("I1124 Print mode: silent auth succeeded\n")), \
+                    self.assertRaises(subprocess.TimeoutExpired):
+                cli_usage.run_agy_usage("agy", log_dir=folder)
+            self.assertEqual(os.listdir(folder), [])
+        self.assertLessEqual(len(cli_usage.AGY_SIGN_IN), 24)        # the panel shows it whole
 
     def test_gemini_keeps_its_account_while_agy_swaps_logins(self):
         hold = quota_sources.GEMINI_ACCOUNT_HOLD_SECONDS
