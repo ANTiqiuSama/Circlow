@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import shutil
@@ -14,10 +15,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import accounts
 import providers
 import cli_quota
 import process_jail
 from cli_usage import run_agy_usage
+
+log = logging.getLogger("Circlow")
 
 
 CACHE_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Circlow" / "state.json"
@@ -52,8 +56,8 @@ class QuotaSnapshot:
     # 0 when unknown). None for other sources.
     changed_at: float | None = None
     secondary_changed_at: float | None = None
-    # Gemini: which Google account agy read (cli_usage.account_key, never the
-    # address); None when unknown and for other sources.
+    # Which account was read (a fingerprint, see accounts.py; never the
+    # address); None when unknown.
     account: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -439,6 +443,8 @@ def get_claude_quota() -> QuotaSnapshot:
     import claude_status
     report = claude_status.latest()
     native = _claude_native(report) if report else None
+    if native is not None and (native.updated_at or 0.0) < ACCOUNT_SINCE.get("claude", 0.0):
+        native = None                    # the account signed in to before
     watched, active = "claude" in WATCHED, "claude" in ACTIVE
     verify = _CLAUDE_PROBE.pop("verify", False)
     now = time.time()
@@ -529,41 +535,58 @@ def _usage_shows_drop(before: float, reset: int, weekly: bool) -> bool:
     return used is not None and probe_reset is not None and abs(probe_reset - reset) <= 180 and before - used >= 5
 
 
-# agy keeps one login for every session on the machine, and each session
-# refreshes its own token about hourly: a session signed in to another Google
-# account swaps that login back and forth under the reads. The account shown
-# stays while it was read this recently; past it, the other one is followed.
-GEMINI_ACCOUNT_HOLD_SECONDS = 90 * 60
-GEMINI_OTHER_ACCOUNT = "agy 当前登录的是另一个账号"
+# The account this device is signed in to is the one shown: a sign-in to
+# another is followed with its first reading. Another device's reading of
+# another account is taken only once the one shown is this old.
+OTHER_ACCOUNT_SECONDS = 90 * 60
+ACCOUNT_SINCE: dict[str, float] = {}        # when this run saw the source change accounts
 
 
-def other_gemini_account(snapshot: QuotaSnapshot, shown: QuotaSnapshot | None) -> bool:
-    """True when `snapshot` read another account than the one `shown` (a
-    known account read within GEMINI_ACCOUNT_HOLD_SECONDS of it)."""
-    if shown is None or not shown.account or not snapshot.account or snapshot.account == shown.account:
+def switched(snapshot: QuotaSnapshot | None, old: QuotaSnapshot | None) -> bool:
+    """`snapshot` is of another account than `old` (both known)."""
+    return bool(snapshot is not None and old is not None and snapshot.account and old.account
+                and snapshot.account != old.account)
+
+
+def other_account(snapshot: QuotaSnapshot, shown: QuotaSnapshot) -> bool:
+    """Another device's reading of another account than the one shown here."""
+    if not switched(snapshot, shown):
         return False
-    return (snapshot.updated_at or 0.0) - (shown.updated_at or 0.0) < GEMINI_ACCOUNT_HOLD_SECONDS
+    if accounts.key(shown.provider) == shown.account:
+        return True
+    return (snapshot.updated_at or 0.0) - (shown.updated_at or 0.0) < OTHER_ACCOUNT_SECONDS
+
+
+def follow_account(provider: str, shown: QuotaSnapshot | None, now: float | None = None) -> str | None:
+    """The account signed in to here, noting a change from the one shown:
+    what was recorded before it is the other account's."""
+    account = accounts.key(provider)
+    if account and shown is not None and shown.account and shown.account != account:
+        ACCOUNT_SINCE[provider] = time.time() if now is None else now
+        log.info("%s is signed in to another account; following it", provider)
+        if provider == "claude":
+            _CLAUDE_PROBE.clear()
+    return account
 
 
 def gemini_reading(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaSnapshot:
     """The Gemini reading to show. Once the account is known, a failed read
-    or another account's reading (other_gemini_account) keeps the last
-    figures, marked old; a reading of unknown account counts as the same
-    account. Before that a failed read keeps nothing: without the account,
-    old figures may be someone else's."""
+    keeps the last figures, marked old, and a reading of unknown account
+    counts as the same account. Before that a failed read keeps nothing:
+    without the account, old figures may be someone else's."""
     if old is None or not old.account or old.provider != "gemini" or old.used_percent is None:
         return snapshot
-    if snapshot.error or other_gemini_account(snapshot, old):
-        # Set aside, not failed: the scheduler keeps its usual pace.
-        held = not snapshot.error
-        return replace(old, stale=True, error=GEMINI_OTHER_ACCOUNT if held else snapshot.error, held=held)
+    if snapshot.error:
+        return replace(old, stale=True, error=snapshot.error, held=False)
     if not snapshot.account:
         return replace(snapshot, account=old.account)
     return snapshot
 
 
 def keep_last_good(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaSnapshot:
-    """Keep stale figures on failure, except Gemini whose CLI account may have changed."""
+    """Keep stale figures on failure, except another account's."""
+    if switched(snapshot, old):
+        return snapshot
     if snapshot.provider == "claude" and old and not snapshot.error:
         # Claude statusLine observations can come from another session whose
         # held account figures suddenly look much less used. In the same
@@ -592,6 +615,7 @@ def keep_last_good(snapshot: QuotaSnapshot, old: QuotaSnapshot | None) -> QuotaS
         snapshot.changed_at = old.changed_at
         for name in SECONDARY_FIELDS:
             setattr(snapshot, name, getattr(old, name))
+        snapshot.account = snapshot.account or old.account
         snapshot.stale = True
     return claude_live(snapshot)          # carried-over figures of a window that has since ended
 
@@ -602,6 +626,7 @@ def collect(providers, previous: dict[str, QuotaSnapshot] | None = None) -> dict
     providers = list(providers)
     if not providers:
         return {}
+    signed_in = {provider: follow_account(provider, previous.get(provider)) for provider in providers}
     with ThreadPoolExecutor(max_workers=len(providers), thread_name_prefix="quota") as pool:
         futures = {provider: pool.submit(_reader(provider)) for provider in providers}
     results = {}
@@ -610,6 +635,8 @@ def collect(providers, previous: dict[str, QuotaSnapshot] | None = None) -> dict
             snapshot = future.result()
         except Exception as exc:  # Readers already catch; this is a last resort.
             snapshot = placeholder(provider, f"读取失败：{type(exc).__name__}: {exc}")
+        if not snapshot.account and signed_in[provider]:
+            snapshot.account = signed_in[provider]
         results[provider] = keep_last_good(snapshot, previous.get(provider))
     return results
 

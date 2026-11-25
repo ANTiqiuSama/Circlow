@@ -30,6 +30,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
+import accounts
 import agent_tasks
 import settings_view as view
 import ui_motion
@@ -139,6 +140,14 @@ def bar_note(enabled: bool, shown: bool, until: float | None = None, now: float 
 
 
 _LATIN = re.compile(r"[A-Za-z0-9_./:@%+-]")
+
+
+def account_text(account, note: str = "") -> str:
+    """An agent's account on 来源: the masked address, its plan, and what is
+    under way (alone while no account is known)."""
+    if account is None:
+        return note or "未登录"
+    return " · ".join(part for part in (account.name or "已登录", account.plan, note) if part)
 
 
 def wrap_text(text: str, measure, width: int) -> str:
@@ -1677,6 +1686,8 @@ class SettingsWindow:
                 anchor="w", fill="x", pady=(0, S(10)))
         states = {state["key"]: state for state in providers.provider_states()}
         self.source_rows = {}
+        self.account_rows, self.account_names, self.account_notes = {}, {}, {}
+        self.account_busy, self.account_turns = set(), {}
         box = self.card(page)
         for index, key in enumerate(in_tray_order(states)):
             state = states[key]
@@ -1689,6 +1700,8 @@ class SettingsWindow:
             row.state = self.para(row.text, "", 9, view.INK_2)
             row.state.pack(anchor="w", fill="x", pady=(self.S(4), 0))
             self.source_rows[key] = row
+            if key in accounts.LOGIN:
+                self._account(row, key)
             if key == "mimo":
                 self._mimo(box)
         if hasattr(self.app, "menu_bar_choice"):
@@ -1696,6 +1709,81 @@ class SettingsWindow:
         self.section(page, "本机记录", "各读取器使用的本机数据")
         self.health_box = tk.Frame(page, bg=view.BG)
         self.health_box.pack(fill="x")
+
+    def _account(self, row, key):
+        """Whose quota this source shows on this device, and the agent's own
+        sign-in to change it. Nothing for an agent that is not installed."""
+        line = self.tk.Frame(row.text, bg=row.text["bg"])
+        line.name = self.label(line, "", 9, view.INK_2)
+        line.name.pack(side="left")
+        line.read = self.link(line, "读取", lambda: self.read_account(key))
+        line.read.pack(side="left", padx=(self.S(10), 0))
+        line.switch = self.link(line, "切换账号", lambda: self.switch_account(key))
+        line.switch.pack(side="left", padx=(self.S(10), 0))
+        self.account_rows[key] = line
+        self.account_notes.setdefault(key, "")
+
+    def _fill_accounts(self):
+        for key, line in self.account_rows.items():
+            found = accounts.executable(key) is not None
+            if found and not line.winfo_manager():
+                line.pack(anchor="w", fill="x", pady=(self.S(4), 0))
+            elif not found and line.winfo_manager():
+                line.pack_forget()
+            if not found:
+                continue
+            if key in accounts.FILES:
+                self.account_names[key] = accounts.current(key)
+            elif key not in self.account_names:
+                self.account_names[key] = None
+                self.read_account(key, refresh=False)       # agy is asked once a window
+            account, note = self.account_names[key], self.account_notes[key]
+            self.set_text(line.name, account_text(account, note))
+            self.set_text(line.switch, "切换账号" if account is not None else "登录")
+
+    def read_account(self, key, refresh=True):
+        """Read the account again, and its quota with it."""
+        if key in self.account_busy:
+            return
+        self.account_busy.add(key)
+        self.account_notes[key] = "正在读取账号…"
+
+        def worker():
+            try:
+                account, note = accounts.read(key), ""
+            except Exception as error:
+                logging.getLogger("Circlow").info("%s account not read: %s", key, error)
+                account, note = None, "账号读取失败"
+            self.commands.put(("account", key, account, note))
+        threading.Thread(target=worker, name=f"account-{key}", daemon=True).start()
+        if refresh and hasattr(self.app, "refresh_account"):
+            self.app.refresh_account(key)
+        self._fill_accounts()
+
+    def switch_account(self, key):
+        """The agent's own sign-in in a terminal; the new account is read when
+        it ends. The user signs in there: nothing passes through Circlow."""
+        try:
+            accounts.switch(key)
+        except OSError as error:
+            self.messagebox.showerror("未能打开登录", str(error), parent=self.root)
+            return
+        self.account_notes[key] = "请在打开的终端窗口中登录"
+        self._fill_accounts()
+        turn = self.account_turns[key] = self.account_turns.get(key, 0) + 1
+
+        def worker():
+            signed_in = accounts.wait(key, self.app.stop_event.wait)
+            if self.account_turns.get(key) == turn:          # not opened again meanwhile
+                self.commands.put(("signed-in", key, signed_in))
+        threading.Thread(target=worker, name=f"sign-in-{key}", daemon=True).start()
+
+    def account_signed_in(self, key, signed_in):
+        self.account_notes[key] = "" if signed_in else "登录未完成"
+        if signed_in:
+            self.read_account(key)
+        else:
+            self._fill_accounts()
 
     def _menu_bar(self, page, states):
         """macOS: which sources get a menu bar icon. The others are still read
@@ -2132,6 +2220,7 @@ class SettingsWindow:
 
     def _fill_sources_all(self):
         self._fill_sources()
+        self._fill_accounts()
         self._fill_mimo()
 
     # ----- staged changes ------------------------------------------------------------------------
@@ -2404,6 +2493,13 @@ class SettingsWindow:
                 elif command[0] == "grok":
                     self.grok_message.set(command[1])
                     self._fill_iq(rebuild=False)
+                elif command[0] == "account":
+                    _, key, account, note = command
+                    self.account_busy.discard(key)
+                    self.account_names[key], self.account_notes[key] = account, note
+                    self._fill_accounts()
+                elif command[0] == "signed-in":
+                    self.account_signed_in(command[1], command[2])
             self.ticks += 1
             if self.ticks % 20 == 0:          # live figures every 2 s
                 self.refresh_live()

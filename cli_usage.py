@@ -425,6 +425,15 @@ def account_key(email: str) -> str:
     return hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:12]
 
 
+def mask_email(email: str) -> str:
+    """The address as the settings window shows it, enough to tell accounts
+    apart: abc•••yz@example.com."""
+    name, at, domain = email.strip().partition("@")
+    if not at:
+        return ""
+    return f"{name[:3]}•••{name[-2:]}@{domain}" if len(name) > 6 else f"{name[:1]}•••@{domain}"
+
+
 def agy_account(started: float, finished: float, log_dir: Path | str | None = None) -> str | None:
     """The account (account_key) an `agy --print /usage` run between
     `started` and `finished` used, from that run's log. None when no log of
@@ -443,13 +452,18 @@ def agy_account(started: float, finished: float, log_dir: Path | str | None = No
 def agy_account_in(path: Path | str) -> str | None:
     """The account (account_key) named by one /usage run's log; None when
     the log is missing or is not of a /usage run."""
+    email = agy_email_in(path)
+    return account_key(email) if email else None
+
+
+def agy_email_in(path: Path | str) -> str | None:
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
             text = handle.read(1_000_000)
     except OSError:
         return None
     match = AGY_ACCOUNT_RE.search(text)
-    return account_key(match.group(1)) if match and "running slash command /usage" in text else None
+    return match.group(1) if match and "running slash command /usage" in text else None
 
 
 # agy never removes the logs in AGY_LOG_DIR: a read every two minutes left
@@ -570,7 +584,10 @@ def run_agy_usage(executable: str, timeout: float = 10.0, log_dir: Path | str | 
         if payload.get("status") != "SUCCESS":
             raise RuntimeError(str(payload.get("response") or "agy /usage 未成功"))
         parsed = parse_agy_usage_json(payload)
-        parsed["account"] = agy_account_in(log_file) if log_file is not None else agy_account(started, time.time())
+        email = agy_email_in(log_file) if log_file is not None else None
+        parsed["account"] = account_key(email) if email else (
+            agy_account(started, time.time()) if log_file is None else None)
+        parsed["account_name"] = mask_email(email or "")
         return parsed
     except subprocess.TimeoutExpired:
         if agy_wants_sign_in(log_file):

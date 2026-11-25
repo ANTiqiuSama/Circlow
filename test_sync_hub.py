@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -152,6 +153,22 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual([(p, s.account) for p, s in taken], [("gemini", "mine")])
         payloads = {"mac": record({"snapshots": {"gemini": gemini(1300.0, "mine").to_dict()}})}
         self.assertEqual(len(sync_hub.merge_snapshots(payloads, "me", dict(current), lambda *a: True)), 1)
+
+    def test_readings_of_another_account_wait_until_this_one_is_old(self):
+        import quota_sources
+        def codex(at, account):
+            return QuotaSnapshot("codex", "Codex", 300, 10.0, 90.0, 9000, at, False, None, account=account)
+        def merged(at, account, local=None):
+            payloads = {"mac": record({"snapshots": {"codex": codex(at, account).to_dict()}})}
+            with patch.object(quota_sources.accounts, "key", return_value=local):
+                return [s.account for _, s in sync_hub.merge_snapshots(payloads, "me", {"codex": codex(1000.0, "mine")}, lambda *a: True)]
+        late = 1000.0 + quota_sources.OTHER_ACCOUNT_SECONDS
+        self.assertEqual(merged(1200.0, "other"), [])
+        self.assertEqual(merged(late, "other"), ["other"])
+        self.assertEqual(merged(late, "other", local="mine"), [])        # signed in here: always this account
+        with patch.dict(quota_sources.ACCOUNT_SINCE, {"codex": 900.0}, clear=True):
+            self.assertEqual(merged(1200.0, None), [])                   # an older build, maybe still on the other
+            self.assertEqual(merged(1200.0, "mine"), ["mine"])
 
     def test_a_reading_passed_on_does_not_come_back(self):
         mine = reading(at=3000)

@@ -241,6 +241,9 @@ def make_settings_tray():
         def request_refresh(self, _icon=None, _item=None) -> None:
             send_command(MENU, "refresh")
 
+        def refresh_account(self, provider: str) -> None:
+            send_command(MENU, "refresh", providers=[provider])
+
         def save_preferences(self, prefs: dict) -> None:
             super().save_preferences(prefs)
             send_command(MENU, "reload")

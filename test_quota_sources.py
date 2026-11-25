@@ -283,36 +283,52 @@ class QuotaTests(unittest.TestCase):
             self.assertEqual(os.listdir(folder), [])
         self.assertLessEqual(len(cli_usage.AGY_SIGN_IN), 24)        # the panel shows it whole
 
-    def test_gemini_keeps_its_account_while_agy_swaps_logins(self):
-        hold = quota_sources.GEMINI_ACCOUNT_HOLD_SECONDS
+    def test_a_sign_in_to_another_gemini_account_is_followed_at_once(self):
         def read(left, at, account):
             pools = [{"key": "argon", "label": "Argon", "remaining_percent": left, "used_percent": 100 - left}]
             return quota_sources.QuotaSnapshot("gemini", "Gemini · Argon", 10080, 100 - left, left, 5000, at,
                                                False, None, pools=pools, account=account)
         mine = read(47.0, 1000.0, "mine")
-        other = quota_sources.keep_last_good(read(100.0, 1600.0, "other"), mine)    # the other login, 10 min on
-        self.assertEqual((other.remaining_percent, other.updated_at, other.account), (47.0, 1000.0, "mine"))
-        self.assertTrue(other.stale and other.held)
-        self.assertEqual(other.error, quota_sources.GEMINI_OTHER_ACCOUNT)
-        self.assertEqual(other.pools, mine.pools)
-        again = quota_sources.keep_last_good(read(100.0, 3000.0, "other"), other)    # still set aside
-        self.assertEqual((again.remaining_percent, again.updated_at), (47.0, 1000.0))
-        back = quota_sources.keep_last_good(read(45.0, 3600.0, "mine"), again)       # the login swapped back
-        self.assertEqual((back.remaining_percent, back.stale, back.error), (45.0, False, None))
-        moved = quota_sources.keep_last_good(read(100.0, 3600.0 + hold, "other"), back)
-        self.assertEqual((moved.remaining_percent, moved.account), (100.0, "other"))  # a real switch is followed
-        unknown = quota_sources.keep_last_good(read(44.0, 3700.0, None), back)
+        moved = quota_sources.keep_last_good(read(100.0, 1060.0, "other"), mine)
+        self.assertEqual((moved.remaining_percent, moved.account, moved.stale, moved.error), (100.0, "other", False, None))
+        unknown = quota_sources.keep_last_good(read(44.0, 1100.0, None), mine)
         self.assertEqual((unknown.remaining_percent, unknown.account), (44.0, "mine"))
-        failed = quota_sources.keep_last_good(quota_sources.placeholder("gemini", "读取失败：TimeoutExpired"), back)
-        self.assertEqual((failed.remaining_percent, failed.stale, failed.held, failed.account), (45.0, True, False, "mine"))
+        failed = quota_sources.keep_last_good(quota_sources.placeholder("gemini", "读取失败：TimeoutExpired"), mine)
+        self.assertEqual((failed.remaining_percent, failed.stale, failed.held, failed.account), (47.0, True, False, "mine"))
         self.assertIn("Timeout", failed.error)
-        first = quota_sources.keep_last_good(read(100.0, 1600.0, "other"), read(47.0, 1000.0, None))
-        self.assertEqual(first.account, "other")                                       # no account known yet
 
-    def test_gemini_reading_for_another_account_keeps_the_usual_pace(self):
+    def test_a_sign_in_to_another_account_drops_the_figures_of_the_one_before(self):
+        def read(provider, used, at, account, error=None):
+            return quota_sources.QuotaSnapshot(provider, provider, 300, None if error else used, None if error else 100 - used,
+                                               9000, at, False, error, account=account)
+        with patch.dict(quota_sources.ACCOUNT_SINCE, clear=True), \
+                patch.object(quota_sources.accounts, "key", side_effect=lambda provider: {"codex": "new", "claude": "new"}.get(provider)), \
+                patch.object(quota_sources, "_reader", side_effect=lambda provider: lambda: {
+                    "codex": read("codex", 0, 1, None, "读取失败：OSError: x"), "claude": read("claude", 1, 9, None),
+                    "grok": read("grok", 2, 9, None, "坏了")}[provider]):
+            old = {"codex": read("codex", 60, 5, "old"), "claude": read("claude", 60, 5, "old"), "grok": read("grok", 60, 5, "old")}
+            quota_sources._CLAUDE_PROBE.update(snapshot=old["claude"], at=5.0)
+            got = quota_sources.collect(("codex", "claude", "grok"), old)
+            self.assertEqual(quota_sources._CLAUDE_PROBE, {})                      # the old account's /usage is gone
+            self.assertEqual(set(quota_sources.ACCOUNT_SINCE), {"codex", "claude"})
+        self.assertEqual((got["codex"].used_percent, got["codex"].account), (None, "new"))     # failed: not the old account's
+        self.assertEqual((got["claude"].used_percent, got["claude"].account, got["claude"].held), (1, "new", False))
+        self.assertEqual((got["grok"].used_percent, got["grok"].account, got["grok"].stale), (60, "old", True))   # signed out
+
+    def test_claude_status_line_from_before_the_switch_is_not_read(self):
+        import claude_status
+        now = time.time()
+        report = {"updated_at": now, "observed_at": now - 60,
+                  "rate_limits": {"five_hour": {"used_percentage": 80, "resets_at": now + 900}}}
+        probe = quota_sources.QuotaSnapshot("claude", "Claude Code", 300, 3, 97, now + 9000, now, False, None)
+        with patch.object(claude_status, "latest", return_value=report), patch.dict(quota_sources._CLAUDE_PROBE, clear=True), \
+                patch.object(quota_sources, "_claude_probe", return_value=probe), \
+                patch.dict(quota_sources.ACCOUNT_SINCE, {"claude": now - 5}, clear=True):
+            self.assertEqual(quota_sources.get_claude_quota().used_percent, 3)
+
+    def test_a_reading_set_aside_keeps_the_usual_pace(self):
         from refresh_scheduler import RefreshScheduler
-        held = quota_sources.QuotaSnapshot("gemini", "Gemini", 10080, 53, 47, 5000, 100, True,
-                                           quota_sources.GEMINI_OTHER_ACCOUNT, held=True, account="mine")
+        held = quota_sources.QuotaSnapshot("gemini", "Gemini", 10080, 53, 47, 5000, 100, True, "核对中", held=True, account="mine")
         scheduler, plain = RefreshScheduler(("gemini",), 0), RefreshScheduler(("gemini",), 0)
         fine = quota_sources.QuotaSnapshot("gemini", "Gemini", 10080, 53, 47, 5000, 100, False, None)
         for moment in (100, 200, 300):

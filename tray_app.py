@@ -768,7 +768,10 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                         if self.history is not None:
                             self.history.clear(provider)
                         log.info("gemini quota pools changed: %s", [p.get("key") for p in snapshot.pools or []])
-                self.announce_resets(provider, self.snapshots.get(provider), snapshot, now)
+                if quota_sources.switched(snapshot, old):
+                    self.account_changed(provider, old, snapshot)
+                else:
+                    self.announce_resets(provider, self.snapshots.get(provider), snapshot, now)
             for provider, snapshot in results.items():
                 self.accept_snapshot(provider, snapshot, "refresh")
             if self.history is not None:
@@ -786,6 +789,12 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
     def refresh(self) -> None:
         """Synchronous refresh of every provider (used by checks and tests)."""
         self.refresh_providers(PROVIDERS)
+
+    def refresh_account(self, provider: str) -> None:
+        """Settings: read a source again (its account may have changed)."""
+        if self.scheduler is not None:
+            self.scheduler.request([provider], time.time(), "账号")
+            self.wake.set()
 
     def request_refresh(self, _icon=None, _item=None) -> None:
         if self.scheduler is None:
@@ -905,6 +914,7 @@ class QuotaTray(ChartData, LocalSync, IconSlots):
                         self.update_codex_locally(now)
                     if "claude" in PROVIDERS:
                         self.update_claude_locally(now)
+                self.follow_accounts(now)
                 if now - getattr(self, "weeks_noted_at", 0.0) >= 60:
                     self.weeks_noted_at = now
                     self.note_weeks()

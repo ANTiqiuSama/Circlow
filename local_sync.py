@@ -7,6 +7,7 @@ from __future__ import annotations
 import itertools
 import logging
 
+import accounts
 import quota_sources
 from quota_charts import weekly_series_name
 from quota_sources import mimo_snapshot, mimo_tracker, parse_codex_session_limits
@@ -14,6 +15,7 @@ from tps_sources import performance_signature, save_performance
 
 log = logging.getLogger("Circlow")
 PERFORMANCE_SAVE_SECONDS = 60
+ACCOUNT_CHECK_SECONDS = 5
 
 
 class LocalSync:
@@ -60,16 +62,45 @@ class LocalSync:
         save_performance(performance)
         self.saved_signature, self.saved_at = signature, now
 
+    def follow_accounts(self, now: float) -> None:
+        """A sign-in to another account is read at once, not at the next
+        scheduled read (Gemini's shows only in its reads)."""
+        if now - getattr(self, "accounts_checked_at", 0.0) < ACCOUNT_CHECK_SECONDS or self.scheduler is None:
+            return
+        self.accounts_checked_at = now
+        asked = self.__dict__.setdefault("accounts_asked", {})
+        for provider in accounts.FILES:
+            shown = self.snapshots.get(provider)
+            account = accounts.key(provider) if shown is not None and shown.account else None
+            if account is None or account == shown.account:
+                asked.pop(provider, None)
+            elif asked.get(provider) != account:
+                asked[provider] = account
+                self.scheduler.request([provider], now, "账号已切换")
+                self.wake.set()
+
+    def account_changed(self, provider: str, old, fresh) -> None:
+        """Figures of the account before are no trend of this one's."""
+        if not quota_sources.switched(fresh, old):
+            return
+        log.info("%s now shows another account", provider)
+        if provider == "gemini":
+            quota_sources.ACCOUNT_SINCE[provider] = fresh.updated_at or 0.0
+        if self.history is not None:
+            self.history.clear(provider)
+
     def update_claude_locally(self, now: float) -> None:
         import claude_status
         record = claude_status.latest(now)
         old = self.snapshots.get("claude")
         seen = record.get("observed_at", record["updated_at"]) if record else 0
-        if record and old is not None and seen > max(old.updated_at or 0, getattr(self, "claude_rejected_seen", 0)):
+        if record and old is not None and seen > max(old.updated_at or 0, getattr(self, "claude_rejected_seen", 0),
+                                                     quota_sources.ACCOUNT_SINCE.get("claude", 0.0)):
             # The status line only, never /usage: this runs on the 1 s TPS loop.
             # A reading behind what is shown (another session's older figure,
             # or less than the last /usage check) is not taken.
             native = quota_sources.native_claude_quota(record)
+            native.account = old.account
             if not old.stale and quota_sources.claude_newer(native, old) is old:
                 return
             fresh = quota_sources.keep_last_good(native, old)
@@ -95,7 +126,8 @@ class LocalSync:
         current = self.snapshots.get("codex")
         if record and current is not None and record[0] > (current.updated_at or 0) and record[0] > now - 6 * 3600:
             fresh = parse_codex_session_limits(record[1], record[0])
-            if fresh is not None:
+            if fresh is not None and self.codex_record_is_ours(fresh, current):
+                fresh.account = current.account
                 # Session records carry no free-reset count (and older ones no balance).
                 if not current.stale:
                     fresh.reset_credits = current.reset_credits
@@ -115,6 +147,17 @@ class LocalSync:
                 self.scheduler.request(["codex"], now + 3, "额度用尽")
                 self.wake.set()
             log.info("codex usage-limit error recorded at %s; refreshing", hit)
+
+    @staticmethod
+    def codex_record_is_ours(fresh, current) -> bool:
+        """After a switch, a session begun before it still records the other
+        account's limits: those end their week at another time."""
+        if "codex" not in quota_sources.ACCOUNT_SINCE:
+            return True
+        if (fresh.updated_at or 0.0) <= quota_sources.ACCOUNT_SINCE["codex"]:
+            return False
+        mine, theirs = current.secondary_resets_at, fresh.secondary_resets_at
+        return not mine or not theirs or abs(mine - theirs) <= 3600
 
     def update_mimo_locally(self, now: float) -> None:
         """Fold new local MiMo token records into the Credits view (no network)."""
