@@ -267,9 +267,21 @@ class BubbleOpenMacTests(unittest.TestCase):
         raised.assert_called_once()
         opened.assert_not_called()
 
-    def test_codex_opens_its_desktop_app(self):
+    def test_codex_cli_only_brings_herdr_forward(self):
         tray, tray_app = self.tray("codex")
         with patch.object(tray_app.session_links, "open_session", return_value=None), \
+                patch.object(tray_app.launchers.providers, "find_codex", return_value="/x/codex"), \
+                patch.object(tray_app.herdr_source, "raise_client") as raised, \
+                patch.object(tray_app.launchers, "open_mac") as opened, \
+                patch.dict(tray_app.PROVIDERS, {"codex": "C"}):
+            tray.open_session("k")
+        raised.assert_called_once()
+        opened.assert_not_called()
+
+    def test_codex_without_a_cli_opens_its_desktop_app(self):
+        tray, tray_app = self.tray("codex")
+        with patch.object(tray_app.session_links, "open_session", return_value=None), \
+                patch.object(tray_app.launchers.providers, "find_codex", return_value=None), \
                 patch.object(tray_app.herdr_source, "raise_client") as raised, \
                 patch.object(tray_app.launchers, "open_mac") as opened, \
                 patch.dict(tray_app.PROVIDERS, {"codex": "C"}):

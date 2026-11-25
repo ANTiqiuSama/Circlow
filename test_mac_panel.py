@@ -215,13 +215,50 @@ class MenuBarStandInTest(unittest.TestCase):
 
 
 class ClickRoutingTest(unittest.TestCase):
-    """macOS clicks: desktop clients for Codex / Gemini / Claude, Grok in Herdr."""
+    """macOS clicks: desktop clients for Gemini / Claude, Codex and Grok in Herdr."""
 
-    def ways(self, herdr="/opt/homebrew/bin/herdr", apps=True):
+    def ways(self, herdr="/opt/homebrew/bin/herdr", apps=True, codex=None):
         import herdr_source
         import launchers
+        found = patch.object(launchers.providers, "find_codex", return_value=codex)
+        found.start()
+        self.addCleanup(found.stop)
         return (patch.object(herdr_source, "find_exe", return_value=herdr),
                 patch.object(launchers, "mac_app_installed", return_value=apps))
+
+    def test_codex_opens_as_its_cli_in_ghostty(self):
+        import herdr_source
+        import launchers
+        import mac_menu
+        from pathlib import Path
+        herdr, apps = self.ways(codex=Path("/x/codex"))
+        state, popen, run = Mock(), Mock(), Mock(return_value=Mock(returncode=0))
+        with herdr, apps, patch.object(launchers.shutil, "which", return_value="/x/codex"):
+            self.assertEqual(mac_menu.open_source("codex", state, popen, run), "herdr")
+        state.open_in_herdr.assert_called_once_with("codex")
+        ghostty = patch.object(herdr_source, "ghostty_app", return_value="/Applications/Ghostty.app")
+        # Only inside its desktop app: Herdr could not start it by name.
+        with herdr, apps, ghostty, patch.object(launchers.shutil, "which", return_value=None):
+            self.assertEqual(mac_menu.open_source("codex", state, popen, run), "cli")
+        args = popen.call_args.args[0]
+        self.assertEqual((args[:3], args[-2:]), (["open", "-na", "/Applications/Ghostty.app"], ["-e", str(Path("/x/codex"))]))
+        state.open_in_herdr.assert_called_once()
+        run.assert_not_called()
+
+    def test_codex_cli_is_found_inside_its_desktop_app(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        import providers
+        with tempfile.TemporaryDirectory() as home, patch.object(providers.sys, "platform", "darwin"), \
+                patch.object(providers.shutil, "which", return_value=None), patch.dict(os.environ, {"CIRCLOW_CODEX_EXE": ""}), \
+                patch.object(providers.Path, "home", return_value=Path(home)):
+            bundled = Path(home, "Applications", providers.MAC_CODEX)
+            bundled.parent.mkdir(parents=True)
+            bundled.touch()
+            self.assertIn(providers.find_codex(), (Path("/Applications") / providers.MAC_CODEX, bundled))
+            with patch.object(providers.shutil, "which", return_value="/x/codex"):
+                self.assertEqual(providers.find_codex(), Path("/x/codex"))
 
     def test_clients_open_by_bundle_id(self):
         import mac_menu

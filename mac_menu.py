@@ -192,8 +192,8 @@ def bar_shown(chosen: list[str], snapshots: dict, now: float) -> tuple[list[str]
 
 def open_source(key: str, state, popen=subprocess.Popen, run=subprocess.run) -> str | None:
     """A click on the source's icon (or "打开来源"): the first of
-    launchers.ways that works here. Codex, Gemini and Claude open their
-    desktop clients; Grok starts in a new Herdr workspace (Herdr in Ghostty).
+    launchers.ways that works here. Gemini and Claude open their desktop
+    clients; Codex and Grok start in a new Herdr workspace (Herdr in Ghostty).
     Returns the kind that was used, None when nothing could be opened."""
     for way in launchers.ways(key, "darwin"):
         if way.kind in ("url", "mac-app"):
@@ -209,9 +209,10 @@ def open_source(key: str, state, popen=subprocess.Popen, run=subprocess.run) -> 
 
 
 def open_cli(key: str, popen=subprocess.Popen) -> bool:
-    """Claude Code / Grok without Herdr: the CLI itself in a new Ghostty
-    (else Terminal) window."""
-    path = providers.find_claude() if key == "claude" else shutil.which("grok")
+    """Claude Code / Codex / Grok without Herdr: the CLI itself in a new
+    Ghostty (else Terminal) window."""
+    find = {"claude": providers.find_claude, "codex": providers.find_codex}.get(key, lambda: shutil.which("grok"))
+    path = find()
     if not path:
         return False
     popen(herdr_source.mac_terminal([str(path)], str(Path.home())), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -279,7 +280,7 @@ class MenuState:
             self.wake.set()
 
     def open_in_herdr(self, provider: str, start=None) -> bool:
-        """Claude Code / Grok in a new focused Herdr workspace; returns False
+        """Claude Code / Codex / Grok in a new focused Herdr workspace; returns False
         when a click for this source is already being handled."""
         with self.lock:
             if provider in self.herdr_opening:

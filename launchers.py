@@ -8,6 +8,7 @@ tried on this machine, and each front end only knows how to carry out a way
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 import sys
 import webbrowser
@@ -46,7 +47,9 @@ def ways(provider: str, platform: str = sys.platform) -> list[Way]:
     """The ways to open `provider` here, best first. Claude's desktop app
     comes before Claude Code; Claude Code and Grok go to a Herdr workspace
     when Herdr is installed, else their CLI; the rest open their own app or
-    page as the provider registry says."""
+    page as the provider registry says. On macOS Codex opens as its CLI (Herdr
+    starts it by name, so it must be on PATH there), its desktop app only
+    without one."""
     spec = providers.get(provider)
     kind, resolve = spec.launch
     out: list[Way] = []
@@ -60,6 +63,10 @@ def ways(provider: str, platform: str = sys.platform) -> list[Way]:
     if provider in HERDR_AGENTS and herdr_source.find_exe():
         out.append(Way("herdr", provider))
     if platform == "darwin":
+        if provider == "codex" and providers.find_codex():
+            if herdr_source.find_exe() and shutil.which("codex"):
+                out.append(Way("herdr", provider))
+            out.append(Way("cli", provider, fallback=True))
         if provider in MAC_APPS and provider != "claude":
             out.append(Way("mac-app", MAC_APPS[provider]))
         elif kind == "url":

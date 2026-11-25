@@ -95,15 +95,8 @@ def _unknown(provider: str, label: str, window_minutes: int | None, error: str) 
 
 
 def _codex_executable() -> str | None:
-    configured = os.environ.get("CIRCLOW_CODEX_EXE")
-    if configured and Path(configured).is_file():
-        return configured
-    found = shutil.which("codex")
-    if found:
-        return found
-    root = Path.home() / "AppData/Local/OpenAI/Codex/bin"
-    candidates = sorted(root.glob("*/codex.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return str(candidates[0]) if candidates else None
+    found = providers.find_codex()
+    return str(found) if found else None
 
 
 class _JsonRpcProcess:

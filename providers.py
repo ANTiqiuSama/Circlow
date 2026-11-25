@@ -77,6 +77,27 @@ def claude_home() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 
 
+# The CLI shipped inside the Codex desktop app. Its own link in ~/.local/bin
+# points into a folder the app empties when it updates.
+MAC_CODEX = "ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+
+
+def find_codex() -> Path | None:
+    """Codex CLI: an explicit override, PATH, or the copy its desktop app brings."""
+    override = os.environ.get("CIRCLOW_CODEX_EXE")
+    if override and Path(override).is_file():
+        return Path(override)
+    found = shutil.which("codex")
+    if found:
+        return Path(found)
+    if sys.platform == "darwin":
+        bundled = (root / MAC_CODEX for root in (Path("/Applications"), Path.home() / "Applications"))
+        return next((path for path in bundled if path.is_file()), None)
+    root = Path.home() / "AppData/Local/OpenAI/Codex/bin"
+    candidates = sorted(root.glob("*/codex.exe"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
 def find_claude() -> Path | None:
     """Claude Code: native installer, npm shim, or an explicit override."""
     override = os.environ.get("CIRCLOW_CLAUDE_EXE")
